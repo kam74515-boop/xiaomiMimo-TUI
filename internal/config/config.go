@@ -25,11 +25,13 @@ type RuntimeConfig struct {
 }
 
 func Default() Config {
+	baseURL := envOrDefault("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
+	model := envOrDefault("MIMO_MODEL", "mimo-v2.5-pro[1m]")
 	return Config{
 		Provider: ProviderConfig{
-			BaseURL: "https://api.xiaomimimo.com/v1",
+			BaseURL: baseURL,
 			APIKey:  os.Getenv("MIMO_API_KEY"),
-			Model:   "mimo-v2.5-pro[1m]",
+			Model:   model,
 			Mock:    os.Getenv("MIMO_API_KEY") == "",
 		},
 		Runtime: RuntimeConfig{
@@ -37,6 +39,13 @@ func Default() Config {
 			ContextWindow: 1_000_000,
 		},
 	}
+}
+
+func envOrDefault(name string, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func Load() (Config, error) {
