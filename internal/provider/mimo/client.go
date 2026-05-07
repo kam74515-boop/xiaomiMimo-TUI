@@ -186,6 +186,7 @@ func readEventStream(ctx context.Context, r io.Reader, out chan<- core.ModelEven
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 	var dataLines []string
+	toolCalls := newToolCallAccumulator()
 	done := false
 	flush := func() bool {
 		if len(dataLines) == 0 {
@@ -193,7 +194,7 @@ func readEventStream(ctx context.Context, r io.Reader, out chan<- core.ModelEven
 		}
 		data := strings.Join(dataLines, "\n")
 		dataLines = nil
-		return handleSSEData(ctx, data, out)
+		return handleSSEData(ctx, data, out, toolCalls)
 	}
 
 	for scanner.Scan() {
@@ -224,7 +225,7 @@ func readEventStream(ctx context.Context, r io.Reader, out chan<- core.ModelEven
 	}
 }
 
-func handleSSEData(ctx context.Context, data string, out chan<- core.ModelEvent) bool {
+func handleSSEData(ctx context.Context, data string, out chan<- core.ModelEvent, toolCalls *toolCallAccumulator) bool {
 	if strings.TrimSpace(data) == "[DONE]" {
 		sendModelEvent(ctx, out, core.ModelEvent{Done: true})
 		return true
@@ -240,8 +241,12 @@ func handleSSEData(ctx context.Context, data string, out chan<- core.ModelEvent)
 		return true
 	}
 	for _, choice := range chunk.Choices {
-		if choice.Delta.Content != "" {
-			sendModelEvent(ctx, out, core.ModelEvent{Delta: choice.Delta.Content})
+		event := core.ModelEvent{Delta: choice.Delta.Content}
+		if toolCalls != nil {
+			event.ToolCalls = toolCalls.apply(choice.Delta.ToolCalls)
+		}
+		if event.Delta != "" || len(event.ToolCalls) > 0 {
+			sendModelEvent(ctx, out, event)
 		}
 	}
 	if chunk.Usage != nil {
@@ -261,7 +266,79 @@ type streamChoice struct {
 }
 
 type streamDelta struct {
-	Content string `json:"content"`
+	Content   string                `json:"content"`
+	ToolCalls []streamToolCallDelta `json:"tool_calls"`
+}
+
+type streamToolCallDelta struct {
+	Index    int                     `json:"index"`
+	ID       string                  `json:"id"`
+	Type     string                  `json:"type"`
+	Function streamToolFunctionDelta `json:"function"`
+}
+
+type streamToolFunctionDelta struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type toolCallAccumulator struct {
+	calls map[int]*toolCallState
+}
+
+type toolCallState struct {
+	id        string
+	name      string
+	arguments string
+}
+
+func newToolCallAccumulator() *toolCallAccumulator {
+	return &toolCallAccumulator{calls: make(map[int]*toolCallState)}
+}
+
+func (a *toolCallAccumulator) apply(deltas []streamToolCallDelta) []core.ToolCall {
+	if len(deltas) == 0 {
+		return nil
+	}
+	out := make([]core.ToolCall, 0, len(deltas))
+	for _, delta := range deltas {
+		state := a.calls[delta.Index]
+		if state == nil {
+			state = &toolCallState{}
+			a.calls[delta.Index] = state
+		}
+		if delta.ID != "" {
+			state.id = delta.ID
+		}
+		if delta.Function.Name != "" {
+			state.name += delta.Function.Name
+		}
+		if delta.Function.Arguments != "" {
+			state.arguments += delta.Function.Arguments
+		}
+		out = append(out, state.toolCall())
+	}
+	return out
+}
+
+func (s toolCallState) toolCall() core.ToolCall {
+	return core.ToolCall{
+		ID:    s.id,
+		Name:  s.name,
+		Input: parseToolInput(s.arguments),
+		Raw:   s.arguments,
+	}
+}
+
+func parseToolInput(raw string) core.ToolInput {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var input core.ToolInput
+	if err := json.Unmarshal([]byte(raw), &input); err != nil {
+		return nil
+	}
+	return input
 }
 
 type streamUsage struct {

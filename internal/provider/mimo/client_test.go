@@ -85,6 +85,90 @@ func TestChatStreamParsesOpenAISSE(t *testing.T) {
 	}
 }
 
+func TestChatStreamParsesToolCallDeltas(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeSSEChunk(t, w, map[string]any{
+			"choices": []any{
+				map[string]any{
+					"delta": map[string]any{
+						"tool_calls": []any{
+							map[string]any{
+								"index": 0,
+								"id":    "call_1",
+								"type":  "function",
+								"function": map[string]any{
+									"name":      "read_",
+									"arguments": `{"pa`,
+								},
+							},
+						},
+					},
+				},
+			},
+		})
+		writeSSEChunk(t, w, map[string]any{
+			"choices": []any{
+				map[string]any{
+					"delta": map[string]any{
+						"tool_calls": []any{
+							map[string]any{
+								"index": 0,
+								"function": map[string]any{
+									"name":      "file",
+									"arguments": `th":"README.md"}`,
+								},
+							},
+						},
+					},
+				},
+			},
+		})
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	client := New(config.ProviderConfig{
+		BaseURL: server.URL,
+		APIKey:  "secret",
+		Model:   "mimo-test",
+	})
+
+	events, err := client.ChatStream(context.Background(), core.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatStream returned error: %v", err)
+	}
+
+	var calls []core.ToolCall
+	done := false
+	for _, event := range collectModelEvents(t, events) {
+		if event.Err != nil {
+			t.Fatalf("unexpected model error: %v", event.Err)
+		}
+		calls = append(calls, event.ToolCalls...)
+		if event.Done {
+			done = true
+		}
+	}
+
+	if len(calls) != 2 {
+		t.Fatalf("tool calls = %#v, want two accumulated snapshots", calls)
+	}
+	if calls[0].ID != "call_1" || calls[0].Name != "read_" || calls[0].Raw != `{"pa` || calls[0].Input != nil {
+		t.Fatalf("first tool call = %#v, want partial accumulated call", calls[0])
+	}
+	last := calls[len(calls)-1]
+	if last.ID != "call_1" || last.Name != "read_file" || last.Raw != `{"path":"README.md"}` {
+		t.Fatalf("last tool call = %#v, want accumulated name and raw args", last)
+	}
+	if last.Input == nil || last.Input["path"] != "README.md" {
+		t.Fatalf("last input = %#v, want parsed path", last.Input)
+	}
+	if !done {
+		t.Fatal("missing done event")
+	}
+}
+
 func TestChatStreamEmitsStreamError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -151,6 +235,15 @@ func TestChatStreamUsesMockFallbackWithoutAPIKey(t *testing.T) {
 	if !done {
 		t.Fatal("missing done event")
 	}
+}
+
+func writeSSEChunk(t *testing.T, w http.ResponseWriter, chunk any) {
+	t.Helper()
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		t.Fatalf("marshal SSE chunk: %v", err)
+	}
+	fmt.Fprintf(w, "data: %s\n\n", data)
 }
 
 func collectModelEvents(t *testing.T, events <-chan core.ModelEvent) []core.ModelEvent {
