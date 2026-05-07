@@ -16,6 +16,12 @@ The first build focuses on:
 go run ./cmd/mimo
 ```
 
+Headless smoke mode:
+
+```sh
+MIMO_MOCK=1 go run ./cmd/mimo -smoke
+```
+
 With MiMo Token Plan credentials:
 
 ```sh

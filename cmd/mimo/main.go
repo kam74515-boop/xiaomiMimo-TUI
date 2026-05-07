@@ -1,137 +1,166 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"time"
 
+	"mimo-tui/internal/agent"
 	"mimo-tui/internal/config"
+	contextmap "mimo-tui/internal/context"
 	"mimo-tui/internal/core"
+	"mimo-tui/internal/provider/mimo"
+	"mimo-tui/internal/replay"
+	"mimo-tui/internal/tools"
 	"mimo-tui/internal/tui"
 )
 
 func main() {
+	smoke := flag.Bool("smoke", false, "run the event pipeline without starting the full-screen TUI")
+	flag.Parse()
+
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
 		os.Exit(1)
 	}
 
-	if err := tui.Run(demoEvents(cfg)); err != nil {
+	events := liveEvents(context.Background(), cfg, promptFromArgs())
+	if *smoke {
+		if err := runSmoke(os.Stdout, events, 10*time.Second); err != nil {
+			fmt.Fprintf(os.Stderr, "smoke: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if err := tui.Run(events); err != nil {
 		fmt.Fprintf(os.Stderr, "run tui: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func demoEvents(cfg config.Config) <-chan core.AgentEvent {
-	events := make(chan core.AgentEvent, 16)
+func promptFromArgs() string {
+	prompt := strings.TrimSpace(strings.Join(flag.Args(), " "))
+	if prompt == "" {
+		return "Give a concise MiMo Value Amplifier status report and explain the current tool/context architecture."
+	}
+	return prompt
+}
+
+func runSmoke(w io.Writer, events <-chan core.AgentEvent, timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	counts := map[core.EventType]int{}
+	for {
+		select {
+		case <-timer.C:
+			return errors.New("timed out waiting for event_done")
+		case event := <-events:
+			counts[event.Type]++
+			if event.Type == core.EventDone {
+				fmt.Fprintf(w, "smoke ok: events=%d message_delta=%d context_update=%d trace_update=%d tool_result=%d observation=%d\n",
+					totalCounts(counts),
+					counts[core.EventMessageDelta],
+					counts[core.EventContextUpdate],
+					counts[core.EventTraceUpdate],
+					counts[core.EventToolResult],
+					counts[core.EventObservation],
+				)
+				return nil
+			}
+		}
+	}
+}
+
+func totalCounts(counts map[core.EventType]int) int {
+	total := 0
+	for _, count := range counts {
+		total += count
+	}
+	return total
+}
+
+func liveEvents(ctx context.Context, cfg config.Config, prompt string) <-chan core.AgentEvent {
+	bus := core.NewBus()
+	uiEvents := bus.Subscribe(256)
+
+	go persistEvents(ctx, cfg.Runtime.Workspace, bus.Subscribe(256))
 	go func() {
-		defer close(events)
-
-		publish := func(event core.AgentEvent, delay time.Duration) {
-			time.Sleep(delay)
-			events <- event
+		publishInitialContext(cfg, bus)
+		publishToolSmoke(ctx, cfg, bus)
+		client := mimo.New(cfg.Provider)
+		if err := agent.RunOnce(ctx, prompt, client, bus); err != nil {
+			return
 		}
-
-		contextEvent := core.NewEvent(core.EventContextUpdate)
-		contextEvent.Context = &core.ContextSnapshot{
-			WindowTokens:  cfg.Runtime.ContextWindow,
-			UsedTokens:    43600,
-			PollutionRisk: "low",
-			Items: []core.ContextItem{
-				{
-					ID:            "repo-contracts",
-					Tier:          core.TierAnchor,
-					Title:         "internal/core event contracts",
-					Source:        "internal/core/types.go",
-					TokenEstimate: 2100,
-					Pinned:        true,
-					Reason:        "AgentEvent drives the shell panels.",
-				},
-				{
-					ID:            "runtime-config",
-					Tier:          core.TierNear,
-					Title:         "loaded MiMo config",
-					Source:        ".mimo/config.toml",
-					TokenEstimate: 800,
-					Reason:        "Demo source uses the configured model and context window.",
-				},
-				{
-					ID:            "tui-shell",
-					Tier:          core.TierArtifact,
-					Title:         "Bubble Tea four-panel shell",
-					Source:        "internal/tui",
-					TokenEstimate: 1200,
-					Reason:        "Runnable stand-in until the real agent event source is wired.",
-				},
-			},
-		}
-		publish(contextEvent, 150*time.Millisecond)
-
-		traceEvent := core.NewEvent(core.EventTraceUpdate)
-		traceEvent.Trace = &core.TraceStep{
-			ID:     "bootstrap",
-			Goal:   "Boot a MiMo-first TUI shell",
-			Plan:   "Load config, attach an event source, and render operational panels.",
-			Action: "Start Bubble Tea with demo AgentEvent messages.",
-			Risk:   "Demo events are not a live agent integration yet.",
-			Status: core.TraceRunning,
-		}
-		publish(traceEvent, 350*time.Millisecond)
-
-		messageEvent := core.NewEvent(core.EventMessageDelta)
-		messageEvent.Message = fmt.Sprintf("Loaded model %s for workspace %s.\n", cfg.Provider.Model, cfg.Runtime.Workspace)
-		publish(messageEvent, 300*time.Millisecond)
-
-		toolStart := core.NewEvent(core.EventToolStart)
-		toolStart.ToolName = "workspace.scan"
-		toolStart.Message = "Checking core/config contracts and TUI startup path."
-		publish(toolStart, 300*time.Millisecond)
-
-		toolResult := core.NewEvent(core.EventToolResult)
-		toolResult.ToolName = "workspace.scan"
-		toolResult.Message = "Found AgentEvent, ContextSnapshot, TraceStep, and config.Load."
-		publish(toolResult, 550*time.Millisecond)
-
-		observationEvent := core.NewEvent(core.EventObservation)
-		observationEvent.Observation = &core.Observation{
-			Summary:          "The TUI can run against any channel of core.AgentEvent values.",
-			StateDelta:       "Demo source is active.",
-			RiskDelta:        "Real agent wiring remains future work.",
-			NextAffordances:  []string{"Connect internal/agent publisher", "Stream tool permissions"},
-			ContextPlacement: core.TierAnchor,
-		}
-		publish(observationEvent, 350*time.Millisecond)
-
-		traceDone := core.NewEvent(core.EventTraceUpdate)
-		traceDone.Trace = &core.TraceStep{
-			ID:          "bootstrap",
-			Goal:        "Boot a MiMo-first TUI shell",
-			Plan:        "Load config, attach an event source, and render operational panels.",
-			Action:      "Start Bubble Tea with demo AgentEvent messages.",
-			Observation: "Four panels are receiving and rendering events.",
-			Risk:        "Demo events are not a live agent integration yet.",
-			Status:      core.TraceDone,
-			EndedAt:     time.Now(),
-		}
-		publish(traceDone, 250*time.Millisecond)
-
-		costEvent := core.NewEvent(core.EventCostUpdate)
-		costEvent.Cost = &core.CostUpdate{
-			InputTokens:  18400,
-			OutputTokens: 920,
-			TotalTokens:  19320,
-			EstimatedUSD: 0.0386,
-		}
-		publish(costEvent, 250*time.Millisecond)
-
-		finalMessage := core.NewEvent(core.EventMessageDelta)
-		finalMessage.Message = "Demo stream complete. Press tab to move focus or q to quit.\n"
-		publish(finalMessage, 250*time.Millisecond)
-
-		done := core.NewEvent(core.EventDone)
-		done.Message = "demo event source complete"
-		publish(done, 150*time.Millisecond)
 	}()
-	return events
+
+	return uiEvents
+}
+
+func persistEvents(ctx context.Context, workspace string, events <-chan core.AgentEvent) {
+	writer, err := replay.NewWriter(workspace, time.Now().Format("20060102T150405"))
+	if err != nil {
+		return
+	}
+	defer writer.Close()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event := <-events:
+			_ = writer.Write(event)
+		}
+	}
+}
+
+func publishInitialContext(cfg config.Config, bus *core.Bus) {
+	manager := contextmap.NewSeeded(
+		cfg.Runtime.ContextWindow,
+		"MiMo Value Amplifier Go workspace: cmd/mimo, internal/core, provider, agent, tools, context, replay, tui.",
+		"Build a MiMo-first TUI that makes context, trace, tools, artifacts, and streaming visible.",
+	)
+	snapshot, _ := manager.Upsert(core.ContextItem{
+		ID:            "near:runtime-config",
+		Tier:          core.TierNear,
+		Title:         "Runtime configuration",
+		Source:        "environment + config files",
+		TokenEstimate: 320,
+		Reason:        fmt.Sprintf("model=%s base_url=%s mock=%t", cfg.Provider.Model, cfg.Provider.BaseURL, cfg.Provider.Mock),
+	})
+
+	event := core.NewEvent(core.EventContextUpdate)
+	event.Context = &snapshot
+	bus.Publish(event)
+}
+
+func publishToolSmoke(ctx context.Context, cfg config.Config, bus *core.Bus) {
+	registry := tools.NewDefaultRegistry(cfg.Runtime.Workspace)
+	tool, ok := registry.Get("git_status")
+	if !ok {
+		return
+	}
+
+	start := core.NewEvent(core.EventToolStart)
+	start.ToolName = tool.Name()
+	start.Message = "Reading repository status into an artifact-backed observation."
+	bus.Publish(start)
+
+	result := tool.Run(ctx, core.ToolInput{})
+	done := core.NewEvent(core.EventToolResult)
+	done.ToolName = tool.Name()
+	done.Message = result.Content
+	done.Err = result.Error
+	bus.Publish(done)
+
+	observation := tool.Summarize(result)
+	obsEvent := core.NewEvent(core.EventObservation)
+	obsEvent.Observation = &observation
+	bus.Publish(obsEvent)
 }

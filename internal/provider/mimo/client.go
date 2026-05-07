@@ -80,6 +80,7 @@ func (c *Client) ChatStream(ctx context.Context, req core.ChatRequest) (<-chan c
 	httpReq.Header.Set("Content-Type", "application/json")
 	if c.apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+		httpReq.Header.Set("api-key", c.apiKey)
 	}
 
 	out := make(chan core.ModelEvent, 8)

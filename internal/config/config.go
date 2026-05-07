@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -32,7 +33,7 @@ func Default() Config {
 			BaseURL: baseURL,
 			APIKey:  os.Getenv("MIMO_API_KEY"),
 			Model:   model,
-			Mock:    os.Getenv("MIMO_API_KEY") == "",
+			Mock:    envBool("MIMO_MOCK") || os.Getenv("MIMO_API_KEY") == "",
 		},
 		Runtime: RuntimeConfig{
 			Workspace:     ".",
@@ -48,6 +49,15 @@ func envOrDefault(name string, fallback string) string {
 	return fallback
 }
 
+func envBool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 func Load() (Config, error) {
 	cfg := Default()
 	for _, path := range candidatePaths() {
@@ -59,6 +69,7 @@ func Load() (Config, error) {
 			return cfg, err
 		}
 	}
+	applyEnvOverrides(&cfg)
 	if cfg.Provider.APIKey == "" {
 		cfg.Provider.APIKey = os.Getenv("MIMO_API_KEY")
 	}
@@ -66,6 +77,21 @@ func Load() (Config, error) {
 		cfg.Provider.Mock = true
 	}
 	return cfg, nil
+}
+
+func applyEnvOverrides(cfg *Config) {
+	if value := os.Getenv("MIMO_BASE_URL"); value != "" {
+		cfg.Provider.BaseURL = value
+	}
+	if value := os.Getenv("MIMO_MODEL"); value != "" {
+		cfg.Provider.Model = value
+	}
+	if value := os.Getenv("MIMO_API_KEY"); value != "" {
+		cfg.Provider.APIKey = value
+	}
+	if envBool("MIMO_MOCK") {
+		cfg.Provider.Mock = true
+	}
 }
 
 func candidatePaths() []string {
