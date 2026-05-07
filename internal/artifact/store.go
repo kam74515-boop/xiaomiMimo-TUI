@@ -52,6 +52,11 @@ type Record struct {
 	Metadata Metadata
 }
 
+type PayloadRecord struct {
+	Metadata FileMetadata
+	Data     []byte
+}
+
 func NewStore(workspace string) *Store {
 	if workspace == "" {
 		workspace = "."
@@ -139,6 +144,39 @@ func (s *Store) ReadMetadata(id string) (Metadata, error) {
 		return Metadata{}, err
 	}
 	return meta, nil
+}
+
+func (s *Store) ReadPayloads(id string) ([]PayloadRecord, error) {
+	meta, err := s.ReadMetadata(id)
+	if err != nil {
+		return nil, err
+	}
+
+	records := make([]PayloadRecord, 0, len(meta.Files))
+	for _, file := range meta.Files {
+		path, err := s.payloadPath(id, file)
+		if err != nil {
+			return nil, err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, PayloadRecord{Metadata: file, Data: data})
+	}
+	return records, nil
+}
+
+func (s *Store) payloadPath(id string, file FileMetadata) (string, error) {
+	cleaned := filepath.Clean(filepath.FromSlash(file.Path))
+	if filepath.IsAbs(cleaned) || cleaned == "." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("invalid artifact payload path")
+	}
+	prefix := filepath.Clean(id) + string(filepath.Separator)
+	if !strings.HasPrefix(cleaned, prefix) {
+		return "", fmt.Errorf("artifact payload path escapes artifact")
+	}
+	return filepath.Join(s.root, cleaned), nil
 }
 
 func newID() string {

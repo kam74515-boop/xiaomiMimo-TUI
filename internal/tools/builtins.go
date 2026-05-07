@@ -457,11 +457,18 @@ func summarizeResult(name string, result core.ToolResult, placement core.Context
 	}
 	return core.Observation{
 		Summary:          summary,
-		StateDelta:       "raw output stored as artifact " + result.ArtifactID,
+		StateDelta:       artifactStateDelta(result.ArtifactID),
 		RiskDelta:        risk,
 		ContextPlacement: placement,
 		ArtifactID:       result.ArtifactID,
 	}
+}
+
+func artifactStateDelta(artifactID string) string {
+	if artifactID == "" {
+		return "no artifact was written"
+	}
+	return "raw output stored as artifact " + artifactID
 }
 
 func exitCode(err error) int {
