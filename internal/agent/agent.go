@@ -54,7 +54,9 @@ func BuildSystemPrompt() string {
 	return strings.Join([]string{
 		"You are MiMo inside a developer TUI coding agent.",
 		"Act as a careful coding collaborator: explain assumptions, stream useful progress, and keep the trace honest.",
-		"Tool hooks are extensible, but this loop does not execute tools yet.",
+		"Emit structured tool calls only when tools are explicitly available in the request; otherwise answer directly.",
+		"Tool hooks are extensible, but this loop only surfaces tool calls and does not execute tools yet.",
+		"Keep raw tool output out of context; summarize results into observations before using them.",
 		DefaultCriticalThinkingPolicy.String(),
 	}, "\n\n")
 }
@@ -135,6 +137,13 @@ func RunOnce(ctx context.Context, prompt string, client core.ModelClient, bus *c
 			if event.Delta != "" {
 				publishMessageDelta(bus, event.Delta)
 			}
+			for _, toolCall := range event.ToolCalls {
+				publishToolStart(bus, toolCall)
+				step.Action = "tool_call.requested"
+				step.Observation = fmt.Sprintf("Model requested tool call %s; execution is not enabled in this loop.", toolCallLabel(toolCall))
+				step.Risk = "Tool call was surfaced to the trace; no tool execution occurred."
+				publishTrace(bus, step)
+			}
 			if event.Usage != nil {
 				publishCost(bus, event.Usage)
 			}
@@ -163,6 +172,14 @@ func publishMessageDelta(bus *core.Bus, delta string) {
 	bus.Publish(event)
 }
 
+func publishToolStart(bus *core.Bus, call core.ToolCall) {
+	event := core.NewEvent(core.EventToolStart)
+	toolCall := call
+	event.ToolCall = &toolCall
+	event.ToolName = call.Name
+	bus.Publish(event)
+}
+
 func publishCost(bus *core.Bus, cost *core.CostUpdate) {
 	event := core.NewEvent(core.EventCostUpdate)
 	event.Cost = cost
@@ -179,4 +196,14 @@ func publishError(bus *core.Bus, err error) {
 
 func publishDone(bus *core.Bus) {
 	bus.Publish(core.NewEvent(core.EventDone))
+}
+
+func toolCallLabel(call core.ToolCall) string {
+	if strings.TrimSpace(call.Name) != "" {
+		return call.Name
+	}
+	if strings.TrimSpace(call.ID) != "" {
+		return call.ID
+	}
+	return "unknown"
 }
