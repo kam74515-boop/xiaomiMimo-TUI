@@ -83,6 +83,7 @@ type AgentEvent struct {
 	Time        time.Time        `json:"time"`
 	Message     string           `json:"message,omitempty"`
 	ToolName    string           `json:"tool_name,omitempty"`
+	ToolCall    *ToolCall        `json:"tool_call,omitempty"`
 	Trace       *TraceStep       `json:"trace,omitempty"`
 	Context     *ContextSnapshot `json:"context,omitempty"`
 	Observation *Observation     `json:"observation,omitempty"`
@@ -103,18 +104,39 @@ type Message struct {
 }
 
 type ChatRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Stream      bool      `json:"stream"`
-	Temperature float64   `json:"temperature,omitempty"`
-	TopP        float64   `json:"top_p,omitempty"`
+	Model       string     `json:"model"`
+	Messages    []Message  `json:"messages"`
+	Stream      bool       `json:"stream"`
+	Temperature float64    `json:"temperature,omitempty"`
+	TopP        float64    `json:"top_p,omitempty"`
+	Tools       []ToolSpec `json:"tools,omitempty"`
+	ToolChoice  any        `json:"tool_choice,omitempty"`
 }
 
 type ModelEvent struct {
-	Delta string
-	Usage *CostUpdate
-	Done  bool
-	Err   error
+	Delta     string
+	ToolCalls []ToolCall
+	Usage     *CostUpdate
+	Done      bool
+	Err       error
+}
+
+type ToolCall struct {
+	ID    string    `json:"id,omitempty"`
+	Name  string    `json:"name"`
+	Input ToolInput `json:"input,omitempty"`
+	Raw   string    `json:"raw,omitempty"`
+}
+
+type ToolSpec struct {
+	Type     string           `json:"type"`
+	Function ToolFunctionSpec `json:"function"`
+}
+
+type ToolFunctionSpec struct {
+	Name        string     `json:"name"`
+	Description string     `json:"description,omitempty"`
+	Parameters  JSONSchema `json:"parameters,omitempty"`
 }
 
 type ModelClient interface {
