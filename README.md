@@ -19,8 +19,14 @@ go run ./cmd/mimo
 Headless smoke mode:
 
 ```sh
-MIMO_MOCK=1 go run ./cmd/mimo -smoke
+MIMO_MOCK=1 go run ./cmd/mimo -smoke -session smoke-local
 ```
+
+Useful flags:
+
+- `-workspace <dir>`: run against a workspace other than the configured default.
+- `-session <id>`: choose the `.mimo/sessions/<id>.jsonl` event log name.
+- `-smoke-timeout <duration>`: override the headless validation timeout.
 
 With MiMo Token Plan credentials:
 

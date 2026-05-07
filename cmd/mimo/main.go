@@ -21,18 +21,23 @@ import (
 )
 
 func main() {
-	smoke := flag.Bool("smoke", false, "run the event pipeline without starting the full-screen TUI")
-	flag.Parse()
+	opts := parseFlags()
 
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
 		os.Exit(1)
 	}
+	if opts.workspace != "" {
+		cfg.Runtime.Workspace = opts.workspace
+	}
+	if opts.sessionID == "" {
+		opts.sessionID = newSessionID()
+	}
 
-	events := liveEvents(context.Background(), cfg, promptFromArgs())
-	if *smoke {
-		if err := runSmoke(os.Stdout, events, 10*time.Second); err != nil {
+	events := liveEvents(context.Background(), cfg, promptFromArgs(), opts.sessionID)
+	if opts.smoke {
+		if err := runSmoke(os.Stdout, events, opts.smokeTimeout); err != nil {
 			fmt.Fprintf(os.Stderr, "smoke: %v\n", err)
 			os.Exit(1)
 		}
@@ -43,6 +48,27 @@ func main() {
 		fmt.Fprintf(os.Stderr, "run tui: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+type cliOptions struct {
+	smoke        bool
+	smokeTimeout time.Duration
+	workspace    string
+	sessionID    string
+}
+
+func parseFlags() cliOptions {
+	var opts cliOptions
+	flag.BoolVar(&opts.smoke, "smoke", false, "run the event pipeline without starting the full-screen TUI")
+	flag.DurationVar(&opts.smokeTimeout, "smoke-timeout", 10*time.Second, "maximum time to wait in smoke mode")
+	flag.StringVar(&opts.workspace, "workspace", "", "workspace directory; defaults to config runtime.workspace")
+	flag.StringVar(&opts.sessionID, "session", "", "session id for .mimo/sessions event log")
+	flag.Parse()
+	return opts
+}
+
+func newSessionID() string {
+	return time.Now().Format("20060102T150405")
 }
 
 func promptFromArgs() string {
@@ -58,13 +84,26 @@ func runSmoke(w io.Writer, events <-chan core.AgentEvent, timeout time.Duration)
 	defer timer.Stop()
 
 	counts := map[core.EventType]int{}
+	var lastErr string
 	for {
 		select {
 		case <-timer.C:
 			return errors.New("timed out waiting for event_done")
-		case event := <-events:
+		case event, ok := <-events:
+			if !ok {
+				return errors.New("event source closed before event_done")
+			}
 			counts[event.Type]++
+			if event.Type == core.EventError {
+				lastErr = firstNonEmpty(event.Err, event.Message)
+			}
 			if event.Type == core.EventDone {
+				if lastErr != "" {
+					return fmt.Errorf("agent emitted error: %s", lastErr)
+				}
+				if err := validateSmokeCounts(counts); err != nil {
+					return err
+				}
 				fmt.Fprintf(w, "smoke ok: events=%d message_delta=%d context_update=%d trace_update=%d tool_result=%d observation=%d\n",
 					totalCounts(counts),
 					counts[core.EventMessageDelta],
@@ -79,6 +118,26 @@ func runSmoke(w io.Writer, events <-chan core.AgentEvent, timeout time.Duration)
 	}
 }
 
+func validateSmokeCounts(counts map[core.EventType]int) error {
+	required := []core.EventType{
+		core.EventMessageDelta,
+		core.EventContextUpdate,
+		core.EventTraceUpdate,
+		core.EventToolResult,
+		core.EventObservation,
+	}
+	var missing []string
+	for _, eventType := range required {
+		if counts[eventType] == 0 {
+			missing = append(missing, string(eventType))
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required smoke events: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
 func totalCounts(counts map[core.EventType]int) int {
 	total := 0
 	for _, count := range counts {
@@ -87,11 +146,20 @@ func totalCounts(counts map[core.EventType]int) int {
 	return total
 }
 
-func liveEvents(ctx context.Context, cfg config.Config, prompt string) <-chan core.AgentEvent {
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func liveEvents(ctx context.Context, cfg config.Config, prompt, sessionID string) <-chan core.AgentEvent {
 	bus := core.NewBus()
 	uiEvents := bus.Subscribe(256)
 
-	go persistEvents(ctx, cfg.Runtime.Workspace, bus.Subscribe(256))
+	go persistEvents(ctx, cfg.Runtime.Workspace, sessionID, bus.Subscribe(256))
 	go func() {
 		publishInitialContext(cfg, bus)
 		publishToolSmoke(ctx, cfg, bus)
@@ -104,8 +172,8 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string) <-chan co
 	return uiEvents
 }
 
-func persistEvents(ctx context.Context, workspace string, events <-chan core.AgentEvent) {
-	writer, err := replay.NewWriter(workspace, time.Now().Format("20060102T150405"))
+func persistEvents(ctx context.Context, workspace, sessionID string, events <-chan core.AgentEvent) {
+	writer, err := replay.NewWriter(workspace, sessionID)
 	if err != nil {
 		return
 	}
