@@ -128,7 +128,7 @@ All environment variables override config file values:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MIMO_BASE_URL` | `https://api.xiaomimimo.com/v1` | MiMo API endpoint |
+| `MIMO_BASE_URL` | `https://token-plan-cn.xiaomimimo.com/v1` | MiMo API endpoint |
 | `MIMO_API_KEY` | (empty) | API key; if empty, mock mode activates |
 | `MIMO_MODEL` | `mimo-v2.5-pro` | Model ID |
 | `MIMO_MOCK` | (unset) | Set to `1`/`true`/`yes` to force mock mode |
