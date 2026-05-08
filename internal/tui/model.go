@@ -68,6 +68,14 @@ type Model struct {
 	sourceClosed bool
 	showHelp     bool
 
+	running   bool
+	lastError string
+
+	chatAutoScroll bool
+
+	modelName string
+	mockMode  bool
+
 	bus *core.Bus
 
 	inputMode       InputMode
@@ -94,11 +102,15 @@ func NewModel(events <-chan core.AgentEvent, bus *core.Bus) Model {
 		selectedContextItem: -1,
 		traceIndex:          make(map[string]int),
 		status:              "waiting for agent events",
+		chatAutoScroll:      true,
 	}
 }
 
-func Run(events <-chan core.AgentEvent, bus *core.Bus) error {
-	_, err := tea.NewProgram(NewModel(events, bus), tea.WithAltScreen()).Run()
+func Run(events <-chan core.AgentEvent, bus *core.Bus, modelName string, mockMode bool) error {
+	m := NewModel(events, bus)
+	m.modelName = modelName
+	m.mockMode = mockMode
+	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	return err
 }
 
@@ -148,11 +160,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						event.Message = m.textInput
 						m.bus.Publish(event)
 					}
+					m.running = true
+					m.lastError = ""
+					m.status = "agent processing..."
+				} else {
+					m.status = "prompt submitted (empty)"
 				}
 				m.textInput = ""
 				m.cursorPos = 0
 				m.inputMode = InputNone
-				m.status = "prompt submitted to agent"
 				return m, nil
 			case tea.KeyEsc:
 				m.textInput = ""
@@ -288,7 +304,7 @@ func (m Model) View() string {
 	height := maxInt(m.height, 20)
 
 	header := renderHeader(width, m.status, m.sourceClosed, panelNames[m.focus], "")
-	footer := renderFooter(width, m.showHelp)
+	footer := m.renderFooter(width)
 	inputBar := m.renderInputBar(width)
 	inputBarHeight := 0
 	if m.inputMode != InputNone {
@@ -333,9 +349,13 @@ func (m Model) renderInputBar(width int) string {
 	case InputPrompt:
 		prefix = "PROMPT> "
 	case InputApprove:
-		prefix = "APPROVE? "
+		prefix = "APPROVE? (30s) "
 		if m.pendingApproval.ToolCall.Name != "" {
-			prefix += m.pendingApproval.ToolCall.Name + " - Allow? [y/n] "
+			prefix += m.pendingApproval.ToolCall.Name
+			if m.pendingApproval.Permission.Reason != "" {
+				prefix += ": " + m.pendingApproval.Permission.Reason
+			}
+			prefix += " [y/n] "
 		} else {
 			prefix += "Allow? [y/n] "
 		}
@@ -382,6 +402,9 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 	case core.EventMessageDelta:
 		m.chat += event.Message
 		m.status = "receiving assistant output"
+		if m.chatAutoScroll {
+			m.scroll[chatPanel] = m.maxPanelScroll(chatPanel)
+		}
 	case core.EventContextUpdate:
 		if event.Context != nil {
 			m.context = *event.Context
@@ -419,10 +442,13 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 		m.status = fallback(event.Message, "risk updated")
 	case core.EventError:
 		msg := fallback(event.Err, event.Message)
+		m.lastError = msg
 		m.notes = append(m.notes, "error: "+msg)
+		m.running = false
 		m.status = "error: " + msg
 	case core.EventDone:
-		m.status = fallback(event.Message, "agent run complete")
+		m.running = false
+		m.status = fallback(event.Message, "agent complete")
 	case core.EventApprovalNeeded:
 		if event.Approval != nil {
 			m.inputMode = InputApprove
@@ -551,6 +577,15 @@ func (m *Model) scrollFocused(key string) {
 	page := maxInt(viewportHeight-1, 1)
 	maxScroll := m.maxPanelScroll(panel)
 
+	if panel == chatPanel {
+		switch key {
+		case "up", "pgup", "home":
+			m.chatAutoScroll = false
+		case "end":
+			m.chatAutoScroll = true
+		}
+	}
+
 	switch key {
 	case "up":
 		m.scroll[panel]--
@@ -591,7 +626,7 @@ func (m Model) panelSize(panel focusPanel) (int, int) {
 	height := maxInt(m.height, 20)
 
 	header := renderHeader(width, m.status, m.sourceClosed, panelNames[m.focus], "")
-	footer := renderFooter(width, m.showHelp)
+	footer := m.renderFooter(width)
 	inputBarHeight := 0
 	if m.inputMode != InputNone {
 		inputBarHeight = 1
@@ -641,7 +676,7 @@ func (m Model) panelContent(panel focusPanel) string {
 		if strings.TrimSpace(m.chat) == "" {
 			return "waiting for message_delta events"
 		}
-		return "assistant> " + strings.TrimRight(m.chat, "\n")
+		return strings.TrimRight(m.chat, "\n")
 	case tracePanel:
 		return m.traceContent()
 	case toolPanel:
@@ -658,8 +693,11 @@ func (m Model) contextContent() string {
 
 	used := m.context.UsedTokens
 	window := maxInt(m.context.WindowTokens, 1)
+	pct := used * 100 / window
 	var b strings.Builder
-	fmt.Fprintf(&b, "tokens: %d / %d (%d%%)\n", used, window, used*100/window)
+
+	tokenStyle := tokenBudgetStyle(pct)
+	fmt.Fprintf(&b, "%s\n", tokenStyle.Render(fmt.Sprintf("tokens: %d / %d (%d%%)", used, window, pct)))
 	fmt.Fprintf(&b, "pollution risk: %s\n", fallback(m.context.PollutionRisk, "unknown"))
 
 	for _, tier := range []core.ContextTier{core.TierNear, core.TierAnchor, core.TierArtifact} {
@@ -677,6 +715,9 @@ func (m Model) contextContent() string {
 			fmt.Fprintf(&b, "%s %5d %s\n", pin, item.TokenEstimate, fallback(item.Title, item.ID))
 			if item.Reason != "" {
 				fmt.Fprintf(&b, "  %s\n", item.Reason)
+			}
+			if item.SelectionReason != "" {
+				fmt.Fprintf(&b, "  (selected: %s)\n", item.SelectionReason)
 			}
 		}
 		if count == 0 {
@@ -759,11 +800,33 @@ func renderHeader(width int, status string, closed bool, focusName, scroll strin
 		Render(truncate(line, width))
 }
 
-func renderFooter(width int, showHelp bool) string {
-	line := "tab focus | i prompt | ? help | up/down scroll | pgup/pgdn | home/end | q quit"
-	if showHelp {
-		line = "? close help | esc close | q quit"
+func (m Model) renderFooter(width int) string {
+	mode := "real"
+	if m.mockMode {
+		mode = "mock"
 	}
+	modelInfo := fmt.Sprintf("model: %s (%s)", m.modelName, mode)
+
+	var controls string
+	if m.showHelp {
+		controls = "? close help | esc close | q quit"
+	} else {
+		controls = "tab focus | i prompt | ? help | up/down scroll | pgup/pgdn | home/end | q quit"
+	}
+
+	left := modelInfo + " | "
+	right := ""
+	if m.lastError != "" {
+		errText := "ERR: " + m.lastError
+		right = " | " + lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render(errText)
+	}
+
+	avail := width - lipgloss.Width(left) - lipgloss.Width(right)
+	if avail < 10 {
+		avail = 10
+	}
+	line := left + truncate(controls, avail) + right
+
 	return lipgloss.NewStyle().
 		Width(width).
 		Foreground(lipgloss.Color("248")).
@@ -803,6 +866,17 @@ Panels
   Agent Trace: plan, action, risk, revision, and evidence notes
   Tool Cockpit: tool runs, timing, and cost
 `)
+}
+
+func tokenBudgetStyle(pct int) lipgloss.Style {
+	switch {
+	case pct < 70:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	case pct < 90:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
+	default:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	}
 }
 
 func fitText(text string, width, height int) string {

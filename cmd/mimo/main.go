@@ -88,7 +88,7 @@ func main() {
 		return
 	}
 
-	if err := tui.Run(events, ctxBus); err != nil {
+	if err := tui.Run(events, ctxBus, cfg.Provider.Model, cfg.Provider.Mock); err != nil {
 		fmt.Fprintf(os.Stderr, "run tui: %v\n", err)
 		os.Exit(1)
 	}
@@ -308,7 +308,10 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 			}
 		}()
 
-		runBootstrapTools(ctx, executor, manager, bus)
+		bootstrapObservations := runBootstrapTools(ctx, executor, manager, bus)
+
+		// Run oracle review after bootstrap tools to re-evaluate context placement.
+		contextmap.RunOracleStep(manager, prompt, bootstrapObservations, bus)
 
 		client := mimo.New(cfg.Provider)
 		if info, ok := registry.Get(cfg.Provider.Model); ok {
@@ -411,15 +414,18 @@ func publishResumeSummary(cfg config.Config, manager *contextmap.Manager, bus *c
 	publishContextSnapshot(snapshot, bus)
 }
 
-func runBootstrapTools(ctx context.Context, executor *tools.Executor, manager *contextmap.Manager, bus *core.Bus) {
+func runBootstrapTools(ctx context.Context, executor *tools.Executor, manager *contextmap.Manager, bus *core.Bus) []core.Observation {
+	var observations []core.Observation
 	for index, call := range []core.ToolCall{
 		{Name: "list_dir", Input: core.ToolInput{"path": ".", "max_entries": 80}},
 		{Name: "git_status", Input: core.ToolInput{}},
 	} {
 		_, observation := executor.Execute(ctx, call)
+		observations = append(observations, observation)
 		snapshot, _ := manager.Upsert(contextmap.PromoteObservation(fmt.Sprintf("artifact:%s:%d", call.Name, index), observation))
 		publishContextSnapshot(snapshot, bus)
 	}
+	return observations
 }
 
 func publishObservation(observation core.Observation, bus *core.Bus) {

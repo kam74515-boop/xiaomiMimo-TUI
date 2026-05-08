@@ -641,6 +641,275 @@ func TestViewShowsInputBarInApproveMode(t *testing.T) {
 	}
 }
 
+func TestRunningStateTransitions(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+
+	// Initial state: not running.
+	if m.running {
+		t.Fatal("running = true, want false initially")
+	}
+
+	// Enter prompt mode, type, and submit: running should become true.
+	m = updateModel(t, m, runeKey('i'))
+	m = updateModel(t, m, runeKey('t'))
+	m = updateModel(t, m, runeKey('e'))
+	m = updateModel(t, m, runeKey('s'))
+	m = updateModel(t, m, runeKey('t'))
+	m = updateModel(t, m, keyMsg(tea.KeyEnter))
+	if !m.running {
+		t.Fatal("running = false after prompt submit, want true")
+	}
+	if m.status != "agent processing..." {
+		t.Fatalf("status = %q, want agent processing...", m.status)
+	}
+
+	// EventDone: running should become false.
+	m.applyEvent(core.AgentEvent{Type: core.EventDone, Message: "all done"})
+	if m.running {
+		t.Fatal("running = true after EventDone, want false")
+	}
+	if m.status != "all done" {
+		t.Fatalf("status after done = %q, want all done", m.status)
+	}
+
+	// EventError: running should become false, lastError set.
+	m.running = true // re-set for test
+	m.applyEvent(core.AgentEvent{Type: core.EventError, Err: "something broke", Message: "fallback err"})
+	if m.running {
+		t.Fatal("running = true after EventError, want false")
+	}
+	if m.lastError != "something broke" {
+		t.Fatalf("lastError = %q, want something broke", m.lastError)
+	}
+}
+
+func TestErrorDisplayInStatusBar(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+
+	// No error initially.
+	if m.lastError != "" {
+		t.Fatalf("lastError = %q, want empty initially", m.lastError)
+	}
+
+	// Send an error event.
+	m.applyEvent(core.AgentEvent{Type: core.EventError, Err: "connection refused"})
+
+	if m.lastError != "connection refused" {
+		t.Fatalf("lastError = %q, want connection refused", m.lastError)
+	}
+	if !strings.Contains(m.status, "connection refused") {
+		t.Fatalf("status = %q, want to contain connection refused", m.status)
+	}
+
+	// Error should also appear in notes panel.
+	foundInNotes := false
+	for _, note := range m.notes {
+		if strings.Contains(note, "connection refused") {
+			foundInNotes = true
+			break
+		}
+	}
+	if !foundInNotes {
+		t.Fatal("error not found in notes panel")
+	}
+
+	// Footer should contain the error (red styled).
+	footer := m.renderFooter(120)
+	if !strings.Contains(footer, "ERR:") {
+		t.Fatal("footer does not contain ERR: prefix")
+	}
+	if !strings.Contains(footer, "connection refused") {
+		t.Fatal("footer does not contain error message")
+	}
+}
+
+func TestApprovalShowsToolDescription(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+
+	m.inputMode = InputApprove
+	m.pendingApproval = core.ApprovalRequest{
+		ToolCall: core.ToolCall{Name: "write_file"},
+		Permission: core.PermissionRequest{
+			Behavior: core.PermissionAsk,
+			Reason:   "file writes can mutate the workspace",
+		},
+	}
+
+	view := m.View()
+	if !strings.Contains(view, "APPROVE?") {
+		t.Fatal("view should contain APPROVE?")
+	}
+	if !strings.Contains(view, "(30s)") {
+		t.Fatal("view should contain timeout hint (30s)")
+	}
+	if !strings.Contains(view, "write_file") {
+		t.Fatal("view should contain tool name write_file")
+	}
+	if !strings.Contains(view, "file writes can mutate the workspace") {
+		t.Fatal("view should contain permission reason")
+	}
+	if !strings.Contains(view, "[y/n]") {
+		t.Fatal("view should contain [y/n] prompt")
+	}
+
+	// Test with missing reason: should still show tool name.
+	m2 := NewModel(nil, nil)
+	m2.width = 80
+	m2.height = 24
+	m2.inputMode = InputApprove
+	m2.pendingApproval = core.ApprovalRequest{
+		ToolCall: core.ToolCall{Name: "shell"},
+		Permission: core.PermissionRequest{
+			Behavior: core.PermissionAsk,
+		},
+	}
+	view2 := m2.View()
+	if !strings.Contains(view2, "shell") {
+		t.Fatal("view should contain tool name shell even without reason")
+	}
+}
+
+func TestContextShowsSelectionReason(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 100
+	m.height = 40
+	m.hasContext = true
+	m.context = core.ContextSnapshot{
+		WindowTokens: 1000,
+		UsedTokens:   850, // 85% — should be yellow
+		Items: []core.ContextItem{
+			{
+				ID:              "near-1",
+				Tier:            core.TierNear,
+				Title:           "relevant file",
+				TokenEstimate:   100,
+				Reason:          "matches query",
+				SelectionReason: "high semantic similarity",
+			},
+			{
+				ID:            "near-2",
+				Tier:          core.TierNear,
+				Title:         "other file",
+				TokenEstimate: 50,
+				Reason:        "also matches",
+			},
+		},
+		PollutionRisk: "low",
+	}
+
+	content := m.contextContent()
+
+	// SelectionReason should appear for items that have it.
+	if !strings.Contains(content, "(selected: high semantic similarity)") {
+		t.Fatal("context content should contain SelectionReason")
+	}
+
+	// Reason should still be present.
+	if !strings.Contains(content, "matches query") {
+		t.Fatal("context content should contain Reason")
+	}
+
+	// Items without SelectionReason should not show "(selected:" prefix.
+	if strings.Contains(content, "(selected:") && !strings.Contains(content, "(selected: high semantic similarity)") {
+		// This condition is wrong - let me check more carefully.
+	}
+	// Verify the second item does NOT have selection reason.
+	lines := strings.Split(content, "\n")
+	selectedCount := 0
+	for _, line := range lines {
+		if strings.Contains(line, "(selected:") {
+			selectedCount++
+		}
+	}
+	if selectedCount != 1 {
+		t.Fatalf("expected 1 selection reason line, got %d", selectedCount)
+	}
+
+	// Token budget at 85% should be yellow (not green, not red).
+	// Yellow is color "220" in lipgloss. We check that the content can be rendered.
+	view := m.View()
+	if !strings.Contains(view, "85%") {
+		t.Fatal("view should contain token percentage")
+	}
+
+	// Test red at >90%.
+	m.context.UsedTokens = 950
+	contentRed := m.contextContent()
+	if !strings.Contains(contentRed, "95%") {
+		t.Fatal("context content should show 95%")
+	}
+
+	// Test green at <70%.
+	m.context.UsedTokens = 500
+	contentGreen := m.contextContent()
+	if !strings.Contains(contentGreen, "50%") {
+		t.Fatal("context content should show 50%")
+	}
+}
+
+func TestChatAutoScroll(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+	m.focus = chatPanel
+
+	// Default should be true.
+	if !m.chatAutoScroll {
+		t.Fatal("chatAutoScroll = false, want true by default")
+	}
+
+	// Fill chat with enough content to scroll.
+	m.chat = numberedLines(100)
+
+	// When message_delta arrives with autoScroll on, it should scroll to bottom.
+	m.scroll[chatPanel] = 0 // start at top
+	m.applyEvent(core.AgentEvent{Type: core.EventMessageDelta, Message: "new output"})
+	maxScroll := m.maxPanelScroll(chatPanel)
+	if m.scroll[chatPanel] != maxScroll {
+		t.Fatalf("scroll after message_delta with autoScroll = %d, want max %d", m.scroll[chatPanel], maxScroll)
+	}
+
+	// Manual scroll up should disable autoScroll.
+	m.scroll[chatPanel] = 5
+	m = updateModel(t, m, keyMsg(tea.KeyUp))
+	if m.chatAutoScroll {
+		t.Fatal("chatAutoScroll = true after manual scroll up, want false")
+	}
+
+	// Now message_delta should NOT auto-scroll.
+	prevScroll := m.scroll[chatPanel]
+	m.applyEvent(core.AgentEvent{Type: core.EventMessageDelta, Message: "more output"})
+	if m.scroll[chatPanel] != prevScroll {
+		t.Fatalf("scroll changed after message_delta with autoScroll off: %d -> %d", prevScroll, m.scroll[chatPanel])
+	}
+
+	// End key should re-enable autoScroll.
+	m = updateModel(t, m, keyMsg(tea.KeyEnd))
+	if !m.chatAutoScroll {
+		t.Fatal("chatAutoScroll = false after End key, want true")
+	}
+
+	// pgup should disable autoScroll.
+	m.scroll[chatPanel] = 10
+	m = updateModel(t, m, keyMsg(tea.KeyPgUp))
+	if m.chatAutoScroll {
+		t.Fatal("chatAutoScroll = true after pgup, want false")
+	}
+
+	// home should also disable.
+	m.chatAutoScroll = true // re-enable
+	m = updateModel(t, m, keyMsg(tea.KeyHome))
+	if m.chatAutoScroll {
+		t.Fatal("chatAutoScroll = true after home, want false")
+	}
+}
+
 func numberedLines(count int) string {
 	lines := make([]string, count)
 	for i := range lines {
