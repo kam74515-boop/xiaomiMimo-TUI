@@ -14,6 +14,11 @@ Full development and architecture guide:
 
 - [docs/FULL_DEVELOPMENT_GUIDE.md](docs/FULL_DEVELOPMENT_GUIDE.md)
 
+The guide includes the clean-room reference analysis for DeepSeek-TUI,
+Claude Code snapshot, RTK, Hermes, and MiMo V2.5-Pro, plus the MiMo-specific
+optimization plan for 1M context, SWA/GA, HySparse-inspired context selection,
+MTP streaming, agentic traces, voice/multimodal Labs, and model update gates.
+
 ## Local Run
 
 ```sh
