@@ -26,6 +26,7 @@ Useful flags:
 
 - `-workspace <dir>`: run against a workspace other than the configured default.
 - `-session <id>`: choose the `.mimo/sessions/<id>.jsonl` event log name.
+- `-resume-latest`: add a compact summary of the latest usable session to the startup Context Map.
 - `-smoke-timeout <duration>`: override the headless validation timeout.
 
 With MiMo Token Plan credentials:
@@ -33,7 +34,7 @@ With MiMo Token Plan credentials:
 ```sh
 export MIMO_BASE_URL="https://token-plan-cn.xiaomimimo.com/v1"
 export MIMO_API_KEY="..."
-export MIMO_MODEL="mimo-v2.5-pro[1m]"
+export MIMO_MODEL="mimo-v2.5-pro"
 go run ./cmd/mimo
 ```
 

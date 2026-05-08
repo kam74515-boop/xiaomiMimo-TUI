@@ -16,6 +16,7 @@ import (
 	"mimo-tui/internal/core"
 	"mimo-tui/internal/provider/mimo"
 	"mimo-tui/internal/replay"
+	sessionlog "mimo-tui/internal/session"
 	"mimo-tui/internal/tools"
 	"mimo-tui/internal/tui"
 )
@@ -35,7 +36,7 @@ func main() {
 		opts.sessionID = newSessionID()
 	}
 
-	events := liveEvents(context.Background(), cfg, promptFromArgs(), opts.sessionID)
+	events := liveEvents(context.Background(), cfg, promptFromArgs(), opts)
 	if opts.smoke {
 		if err := runSmoke(os.Stdout, events, opts.smokeTimeout); err != nil {
 			fmt.Fprintf(os.Stderr, "smoke: %v\n", err)
@@ -55,6 +56,7 @@ type cliOptions struct {
 	smokeTimeout time.Duration
 	workspace    string
 	sessionID    string
+	resumeLatest bool
 }
 
 func parseFlags() cliOptions {
@@ -63,6 +65,7 @@ func parseFlags() cliOptions {
 	flag.DurationVar(&opts.smokeTimeout, "smoke-timeout", 10*time.Second, "maximum time to wait in smoke mode")
 	flag.StringVar(&opts.workspace, "workspace", "", "workspace directory; defaults to config runtime.workspace")
 	flag.StringVar(&opts.sessionID, "session", "", "session id for .mimo/sessions event log")
+	flag.BoolVar(&opts.resumeLatest, "resume-latest", false, "load a compact summary of the latest usable session into the startup Context Map")
 	flag.Parse()
 	return opts
 }
@@ -155,14 +158,18 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func liveEvents(ctx context.Context, cfg config.Config, prompt, sessionID string) <-chan core.AgentEvent {
+func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliOptions) <-chan core.AgentEvent {
 	bus := core.NewBus()
 	uiEvents := bus.Subscribe(256)
 
-	go persistEvents(ctx, cfg.Runtime.Workspace, sessionID, bus.Subscribe(256))
+	go persistEvents(ctx, cfg.Runtime.Workspace, opts.sessionID, bus.Subscribe(256))
 	go func() {
-		publishInitialContext(cfg, bus)
-		publishToolSmoke(ctx, cfg, bus)
+		manager := newContextManager(cfg)
+		publishContextSnapshot(manager.Snapshot(), bus)
+		if opts.resumeLatest {
+			publishResumeSummary(cfg, manager, bus)
+		}
+		runBootstrapTools(ctx, cfg, manager, bus)
 		client := mimo.New(cfg.Provider)
 		if err := agent.RunOnce(ctx, prompt, client, bus); err != nil {
 			return
@@ -188,13 +195,13 @@ func persistEvents(ctx context.Context, workspace, sessionID string, events <-ch
 	}
 }
 
-func publishInitialContext(cfg config.Config, bus *core.Bus) {
+func newContextManager(cfg config.Config) *contextmap.Manager {
 	manager := contextmap.NewSeeded(
 		cfg.Runtime.ContextWindow,
 		"MiMo Value Amplifier Go workspace: cmd/mimo, internal/core, provider, agent, tools, context, replay, tui.",
 		"Build a MiMo-first TUI that makes context, trace, tools, artifacts, and streaming visible.",
 	)
-	snapshot, _ := manager.Upsert(core.ContextItem{
+	_, _ = manager.Upsert(core.ContextItem{
 		ID:            "near:runtime-config",
 		Tier:          core.TierNear,
 		Title:         "Runtime configuration",
@@ -202,33 +209,51 @@ func publishInitialContext(cfg config.Config, bus *core.Bus) {
 		TokenEstimate: 320,
 		Reason:        fmt.Sprintf("model=%s base_url=%s mock=%t", cfg.Provider.Model, cfg.Provider.BaseURL, cfg.Provider.Mock),
 	})
+	return manager
+}
 
+func publishContextSnapshot(snapshot core.ContextSnapshot, bus *core.Bus) {
 	event := core.NewEvent(core.EventContextUpdate)
 	event.Context = &snapshot
 	bus.Publish(event)
 }
 
-func publishToolSmoke(ctx context.Context, cfg config.Config, bus *core.Bus) {
-	registry := tools.NewDefaultRegistry(cfg.Runtime.Workspace)
-	tool, ok := registry.Get("git_status")
-	if !ok {
+func publishResumeSummary(cfg config.Config, manager *contextmap.Manager, bus *core.Bus) {
+	latest, err := replay.LatestSession(cfg.Runtime.Workspace)
+	if err != nil {
 		return
 	}
+	events, err := replay.ReadFile(latest.Path)
+	if err != nil {
+		return
+	}
+	summary := sessionlog.BuildResumeSummary(events)
+	observation := core.Observation{
+		Summary:          fmt.Sprintf("Latest session %s has %d events; last status: %s", latest.ID, latest.EventCount, firstNonEmpty(summary.LastStatus, "unknown")),
+		StateDelta:       fmt.Sprintf("resume skeleton includes %d recent trace updates and %d artifact references", len(summary.RecentTraceUpdates), len(summary.ArtifactIDs)),
+		RiskDelta:        firstNonEmpty(summary.LastError, "no resume error recorded"),
+		ContextPlacement: core.TierAnchor,
+	}
+	publishObservation(observation, bus)
+	snapshot, _ := manager.Upsert(contextmap.PromoteObservation("anchor:resume:"+latest.ID, observation))
+	publishContextSnapshot(snapshot, bus)
+}
 
-	start := core.NewEvent(core.EventToolStart)
-	start.ToolName = tool.Name()
-	start.Message = "Reading repository status into an artifact-backed observation."
-	bus.Publish(start)
+func runBootstrapTools(ctx context.Context, cfg config.Config, manager *contextmap.Manager, bus *core.Bus) {
+	registry := tools.NewDefaultRegistry(cfg.Runtime.Workspace)
+	executor := tools.NewExecutor(registry, bus)
+	for index, call := range []core.ToolCall{
+		{Name: "list_dir", Input: core.ToolInput{"path": ".", "max_entries": 80}},
+		{Name: "git_status", Input: core.ToolInput{}},
+	} {
+		_, observation := executor.Execute(ctx, call)
+		snapshot, _ := manager.Upsert(contextmap.PromoteObservation(fmt.Sprintf("artifact:%s:%d", call.Name, index), observation))
+		publishContextSnapshot(snapshot, bus)
+	}
+}
 
-	result := tool.Run(ctx, core.ToolInput{})
-	done := core.NewEvent(core.EventToolResult)
-	done.ToolName = tool.Name()
-	done.Message = result.Content
-	done.Err = result.Error
-	bus.Publish(done)
-
-	observation := tool.Summarize(result)
-	obsEvent := core.NewEvent(core.EventObservation)
-	obsEvent.Observation = &observation
-	bus.Publish(obsEvent)
+func publishObservation(observation core.Observation, bus *core.Bus) {
+	event := core.NewEvent(core.EventObservation)
+	event.Observation = &observation
+	bus.Publish(event)
 }

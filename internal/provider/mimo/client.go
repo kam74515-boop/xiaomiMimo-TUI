@@ -17,7 +17,7 @@ import (
 
 const (
 	DefaultBaseURL = "https://api.xiaomimimo.com/v1"
-	DefaultModel   = "mimo-v2.5-pro[1m]"
+	DefaultModel   = "mimo-v2.5-pro"
 )
 
 type Client struct {

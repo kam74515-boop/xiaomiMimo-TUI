@@ -27,7 +27,7 @@ type RuntimeConfig struct {
 
 func Default() Config {
 	baseURL := envOrDefault("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
-	model := envOrDefault("MIMO_MODEL", "mimo-v2.5-pro[1m]")
+	model := envOrDefault("MIMO_MODEL", "mimo-v2.5-pro")
 	return Config{
 		Provider: ProviderConfig{
 			BaseURL: baseURL,
