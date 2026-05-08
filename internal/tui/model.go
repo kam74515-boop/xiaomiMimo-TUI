@@ -42,6 +42,7 @@ type Model struct {
 	width  int
 	height int
 	focus  focusPanel
+	scroll [panelCount]int
 
 	context    core.ContextSnapshot
 	hasContext bool
@@ -56,6 +57,7 @@ type Model struct {
 
 	status       string
 	sourceClosed bool
+	showHelp     bool
 }
 
 type agentEventMsg core.AgentEvent
@@ -89,20 +91,45 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		switch msg.String() {
+		key := msg.String()
+		switch key {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+		case "?":
+			m.showHelp = !m.showHelp
+			if m.showHelp {
+				m.status = "help opened"
+			} else {
+				m.status = "help closed"
+			}
+			return m, nil
+		case "esc":
+			if m.showHelp {
+				m.showHelp = false
+				m.status = "help closed"
+				return m, nil
+			}
+		}
+		if m.showHelp {
+			return m, nil
+		}
+		switch key {
 		case "tab":
 			m.focus = (m.focus + 1) % panelCount
 			m.status = "focused " + panelNames[m.focus]
+			return m, nil
+		case "up", "down", "pgup", "pgdown", "home", "end":
+			m.scrollFocused(key)
 			return m, nil
 		}
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.clampAllScrolls()
 		return m, nil
 	case agentEventMsg:
 		m.applyEvent(core.AgentEvent(msg))
+		m.clampAllScrolls()
 		return m, waitForEvent(m.events)
 	case eventSourceClosedMsg:
 		m.sourceClosed = true
@@ -118,9 +145,13 @@ func (m Model) View() string {
 	width := maxInt(m.width, 60)
 	height := maxInt(m.height, 20)
 
-	header := renderHeader(width, m.status, m.sourceClosed)
-	footer := renderFooter(width)
+	header := renderHeader(width, m.status, m.sourceClosed, panelNames[m.focus], m.scrollPosition(m.focus))
+	footer := renderFooter(width, m.showHelp)
 	bodyHeight := maxInt(height-lipgloss.Height(header)-lipgloss.Height(footer), 12)
+
+	if m.showHelp {
+		return lipgloss.JoinVertical(lipgloss.Left, header, renderHelp(width, bodyHeight), footer)
+	}
 
 	leftWidth := width / 2
 	rightWidth := width - leftWidth
@@ -238,6 +269,7 @@ func (m Model) renderPanel(panel focusPanel, width, height int) string {
 	title := panelNames[panel]
 	contentWidth := maxInt(width-2, 18)
 	contentHeight := maxInt(height-2, 4)
+	viewportHeight := maxInt(contentHeight-1, 1)
 
 	borderColor := lipgloss.Color("240")
 	titleColor := lipgloss.Color("250")
@@ -246,8 +278,10 @@ func (m Model) renderPanel(panel focusPanel, width, height int) string {
 		titleColor = lipgloss.Color("15")
 	}
 
+	lines := m.panelLines(panel, contentWidth)
+	offset := clampInt(m.scroll[panel], 0, maxScrollForLines(len(lines), viewportHeight))
 	body := lipgloss.NewStyle().Bold(true).Foreground(titleColor).Render(title) + "\n" +
-		fitText(m.panelContent(panel), contentWidth, contentHeight-1)
+		scrollText(lines, offset, viewportHeight)
 
 	return lipgloss.NewStyle().
 		Width(contentWidth).
@@ -256,6 +290,87 @@ func (m Model) renderPanel(panel focusPanel, width, height int) string {
 		BorderForeground(borderColor).
 		Foreground(lipgloss.Color("252")).
 		Render(body)
+}
+
+func (m *Model) scrollFocused(key string) {
+	panel := m.focus
+	_, viewportHeight := m.panelViewport(panel)
+	page := maxInt(viewportHeight-1, 1)
+	maxScroll := m.maxPanelScroll(panel)
+
+	switch key {
+	case "up":
+		m.scroll[panel]--
+	case "down":
+		m.scroll[panel]++
+	case "pgup":
+		m.scroll[panel] -= page
+	case "pgdown":
+		m.scroll[panel] += page
+	case "home":
+		m.scroll[panel] = 0
+	case "end":
+		m.scroll[panel] = maxScroll
+	}
+	m.scroll[panel] = clampInt(m.scroll[panel], 0, maxScroll)
+}
+
+func (m *Model) clampAllScrolls() {
+	for panel := focusPanel(0); panel < panelCount; panel++ {
+		m.scroll[panel] = clampInt(m.scroll[panel], 0, m.maxPanelScroll(panel))
+	}
+}
+
+func (m Model) maxPanelScroll(panel focusPanel) int {
+	width, height := m.panelViewport(panel)
+	return maxScrollForLines(len(m.panelLines(panel, width)), height)
+}
+
+func (m Model) panelViewport(panel focusPanel) (int, int) {
+	panelWidth, panelHeight := m.panelSize(panel)
+	contentWidth := maxInt(panelWidth-2, 18)
+	contentHeight := maxInt(panelHeight-2, 4)
+	return contentWidth, maxInt(contentHeight-1, 1)
+}
+
+func (m Model) panelSize(panel focusPanel) (int, int) {
+	width := maxInt(m.width, 60)
+	height := maxInt(m.height, 20)
+	bodyHeight := maxInt(height-2, 12)
+
+	leftWidth := width / 2
+	rightWidth := width - leftWidth
+	topHeight := bodyHeight / 2
+	bottomHeight := bodyHeight - topHeight
+
+	switch panel {
+	case contextPanel:
+		return leftWidth, topHeight
+	case chatPanel:
+		return rightWidth, topHeight
+	case tracePanel:
+		return leftWidth, bottomHeight
+	case toolPanel:
+		return rightWidth, bottomHeight
+	default:
+		return leftWidth, topHeight
+	}
+}
+
+func (m Model) scrollPosition(panel focusPanel) string {
+	width, height := m.panelViewport(panel)
+	total := maxInt(len(m.panelLines(panel, width)), 1)
+	offset := clampInt(m.scroll[panel], 0, maxScrollForLines(total, height))
+	bottom := minInt(offset+height, total)
+	return fmt.Sprintf("%d-%d/%d", offset+1, bottom, total)
+}
+
+func (m Model) panelLines(panel focusPanel, width int) []string {
+	lines := wrapText(m.panelContent(panel), width)
+	if len(lines) == 0 {
+		return []string{""}
+	}
+	return lines
 }
 
 func (m Model) panelContent(panel focusPanel) string {
@@ -371,12 +486,12 @@ func (m Model) toolContent() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func renderHeader(width int, status string, closed bool) string {
+func renderHeader(width int, status string, closed bool, focusName, scroll string) string {
 	state := "live"
 	if closed {
 		state = "closed"
 	}
-	line := fmt.Sprintf("MiMo Value Amplifier TUI | %s | %s", state, fallback(status, "ready"))
+	line := fmt.Sprintf("MiMo Value Amplifier TUI | source %s | focus %s | scroll %s | %s", state, focusName, scroll, fallback(status, "ready"))
 	return lipgloss.NewStyle().
 		Width(width).
 		Foreground(lipgloss.Color("15")).
@@ -384,11 +499,45 @@ func renderHeader(width int, status string, closed bool) string {
 		Render(truncate(line, width))
 }
 
-func renderFooter(width int) string {
+func renderFooter(width int, showHelp bool) string {
+	line := "tab focus | ? help | up/down scroll | pgup/pgdn | home/end | q quit"
+	if showHelp {
+		line = "? close help | esc close | q quit"
+	}
 	return lipgloss.NewStyle().
 		Width(width).
 		Foreground(lipgloss.Color("248")).
-		Render(truncate("tab focus | q/ctrl+c quit", width))
+		Render(truncate(line, width))
+}
+
+func renderHelp(width, height int) string {
+	content := lipgloss.NewStyle().
+		Width(maxInt(width-4, 20)).
+		Height(maxInt(height-2, 8)).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("39")).
+		Foreground(lipgloss.Color("252")).
+		Render(fitText(helpContent(), maxInt(width-6, 18), maxInt(height-4, 6)))
+
+	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, content)
+}
+
+func helpContent() string {
+	return strings.TrimSpace(`
+Controls
+  tab: focus next panel
+  up/down: scroll focused panel
+  pgup/pgdn: scroll focused panel by page
+  home/end: jump focused panel
+  ?: toggle help
+  q or ctrl+c: quit
+
+Panels
+  Context Map: evidence and context budget by tier
+  Chat Stream: assistant output deltas
+  Agent Trace: plan, action, risk, revision, and evidence notes
+  Tool Cockpit: tool runs, timing, and cost
+`)
 }
 
 func fitText(text string, width, height int) string {
@@ -400,6 +549,22 @@ func fitText(text string, width, height int) string {
 		lines = append(lines, "")
 	}
 	return strings.Join(lines, "\n")
+}
+
+func scrollText(lines []string, offset, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	if len(lines) == 0 {
+		lines = []string{""}
+	}
+	offset = clampInt(offset, 0, maxScrollForLines(len(lines), height))
+	end := minInt(offset+height, len(lines))
+	visible := append([]string{}, lines[offset:end]...)
+	for len(visible) < height {
+		visible = append(visible, "")
+	}
+	return strings.Join(visible, "\n")
 }
 
 func wrapText(text string, width int) []string {
@@ -516,4 +681,31 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func clampInt(value, minValue, maxValue int) int {
+	if maxValue < minValue {
+		return minValue
+	}
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
+}
+
+func maxScrollForLines(lineCount, viewportHeight int) int {
+	if lineCount <= viewportHeight {
+		return 0
+	}
+	return lineCount - viewportHeight
 }
