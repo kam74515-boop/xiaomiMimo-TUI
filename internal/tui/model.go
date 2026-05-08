@@ -37,11 +37,12 @@ const (
 )
 
 type toolRun struct {
-	Name      string
-	Status    string
-	Detail    string
-	StartedAt time.Time
-	EndedAt   time.Time
+	Name               string
+	Status             string
+	Detail             string
+	StartedAt          time.Time
+	EndedAt            time.Time
+	RollbackArtifactID string
 }
 
 type Model struct {
@@ -83,12 +84,21 @@ type Model struct {
 	cursorPos       int
 	pendingApproval core.ApprovalRequest
 
+	approvalCountdown    int
+	approvalCountdownMax int
+
 	promptQueue []string
+
+	totalSteps int
 }
 
 type agentEventMsg core.AgentEvent
 
+type tickMsg struct{}
+
 type eventSourceClosedMsg struct{}
+
+const approvalCountdownSeconds = 10
 
 func NewModel(events <-chan core.AgentEvent, bus *core.Bus) Model {
 	if events == nil {
@@ -317,7 +327,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case agentEventMsg:
 		m.applyEvent(core.AgentEvent(msg))
 		m.clampAllScrolls()
-		return m, waitForEvent(m.events)
+		cmds := []tea.Cmd{waitForEvent(m.events)}
+		if m.approvalCountdown > 0 {
+			cmds = append(cmds, approvalTick())
+		}
+		return m, tea.Batch(cmds...)
+
+	case tickMsg:
+		if m.inputMode != InputApprove || m.approvalCountdown <= 0 {
+			return m, nil
+		}
+		m.approvalCountdown--
+		if m.approvalCountdown <= 0 {
+			if m.pendingApproval.Response != nil {
+				m.pendingApproval.Response <- core.ApprovalDecision{
+					Allowed: false,
+					Reason:  "approval timed out after countdown",
+				}
+			}
+			m.inputMode = InputNone
+			m.pendingApproval = core.ApprovalRequest{}
+			m.status = "approval timed out (auto-denied)"
+			return m, nil
+		}
+		m.status = fmt.Sprintf("APPROVE? tool '%s' requires approval [y/n] (%ds)", m.pendingApproval.ToolCall.Name, m.approvalCountdown)
+		return m, approvalTick()
 
 	case eventSourceClosedMsg:
 		m.sourceClosed = true
@@ -334,16 +368,26 @@ func (m Model) View() string {
 	height := maxInt(m.height, 20)
 
 	header := renderHeader(width, m.status, m.sourceClosed, panelNames[m.focus], "")
+	statusLine := m.renderStatusLine(width)
 	footer := m.renderFooter(width)
 	inputBar := m.renderInputBar(width)
 	inputBarHeight := 0
 	if m.inputMode != InputNone {
 		inputBarHeight = lipgloss.Height(inputBar)
 	}
-	bodyHeight := maxInt(height-lipgloss.Height(header)-lipgloss.Height(footer)-inputBarHeight, 12)
+	statusLineHeight := lipgloss.Height(statusLine)
+	bodyHeight := maxInt(height-lipgloss.Height(header)-statusLineHeight-lipgloss.Height(footer)-inputBarHeight, 12)
 
 	if m.showHelp {
-		return lipgloss.JoinVertical(lipgloss.Left, header, renderHelp(width, bodyHeight), footer)
+		return lipgloss.JoinVertical(lipgloss.Left, header, statusLine, renderHelp(width, bodyHeight), footer)
+	}
+
+	if m.inputMode == InputApprove {
+		approvalPanel := m.renderApprovalPanel(width, bodyHeight)
+		if m.inputMode != InputNone {
+			return lipgloss.JoinVertical(lipgloss.Left, header, statusLine, approvalPanel, inputBar, footer)
+		}
+		return lipgloss.JoinVertical(lipgloss.Left, header, statusLine, approvalPanel, footer)
 	}
 
 	leftWidth := width / 2
@@ -363,9 +407,9 @@ func (m Model) View() string {
 	)
 
 	if m.inputMode != InputNone {
-		return lipgloss.JoinVertical(lipgloss.Left, header, top, bottom, inputBar, footer)
+		return lipgloss.JoinVertical(lipgloss.Left, header, statusLine, top, bottom, inputBar, footer)
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, header, top, bottom, footer)
+	return lipgloss.JoinVertical(lipgloss.Left, header, statusLine, top, bottom, footer)
 }
 
 func (m Model) renderInputBar(width int) string {
@@ -379,7 +423,11 @@ func (m Model) renderInputBar(width int) string {
 	case InputPrompt:
 		prefix = "PROMPT> "
 	case InputApprove:
-		prefix = "APPROVE? (30s) "
+		countdown := m.approvalCountdown
+		if countdown <= 0 {
+			countdown = approvalCountdownSeconds
+		}
+		prefix = fmt.Sprintf("APPROVE? (%ds) ", countdown)
 		if m.pendingApproval.ToolCall.Name != "" {
 			prefix += m.pendingApproval.ToolCall.Name
 			if m.pendingApproval.Permission.Reason != "" {
@@ -417,6 +465,187 @@ func (m Model) renderInputBar(width int) string {
 		Render(truncate(display, width))
 }
 
+func approvalTick() tea.Cmd {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
+		return tickMsg{}
+	})
+}
+
+func (m Model) renderApprovalPanel(width, height int) string {
+	w := maxInt(width-4, 40)
+	h := maxInt(height-4, 8)
+
+	var b strings.Builder
+
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220")).Width(w)
+	b.WriteString(titleStyle.Render("TOOL APPROVAL REQUIRED"))
+	b.WriteString("\n\n")
+
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Render("Tool: "))
+	b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")).Render(m.pendingApproval.ToolCall.Name))
+	b.WriteString("\n")
+
+	gradeDisplay, gradeColor := inferApprovalSafety(m.pendingApproval)
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Render("Safety: "))
+	b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(gradeColor).Render(gradeDisplay))
+	b.WriteString("\n")
+
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Render("Reason: "))
+	reason := m.pendingApproval.Permission.Reason
+	if reason == "" {
+		reason = "tool requires explicit permission"
+	}
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render(reason))
+	b.WriteString("\n")
+
+	inputSummary := approvalInputSummary(m.pendingApproval.ToolCall.Input)
+	if inputSummary != "" {
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Render("Input:  "))
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("248")).Render(truncate(inputSummary, w-8)))
+		b.WriteString("\n")
+	}
+
+	paths := extractPaths(m.pendingApproval.ToolCall.Input, m.pendingApproval.ToolCall.Name)
+	if len(paths) > 0 {
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Render("Paths:  "))
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("248")).Render(strings.Join(paths, ", ")))
+		b.WriteString("\n")
+	}
+
+	rollbackInfo := m.findRollbackArtifact(m.pendingApproval.ToolCall.Name)
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Render("Rollback: "))
+	if rollbackInfo != "" {
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Render(rollbackInfo))
+	} else {
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("will be captured pre-execution"))
+	}
+	b.WriteString("\n")
+
+	countdown := m.approvalCountdown
+	if countdown <= 0 {
+		countdown = approvalCountdownSeconds
+	}
+	countdownStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
+	if countdown <= 3 {
+		countdownStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	}
+	b.WriteString("\n")
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Render("Timeout: "))
+	b.WriteString(countdownStyle.Render(fmt.Sprintf("%ds (default: deny)", countdown)))
+	b.WriteString("\n")
+
+	b.WriteString("\n")
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true).Render("  [y] Approve    "))
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true).Render("[n] Deny    "))
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("[esc] Cancel"))
+	b.WriteString("\n")
+
+	content := b.String()
+	return lipgloss.NewStyle().
+		Width(w).
+		Height(h).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("220")).
+		Foreground(lipgloss.Color("252")).
+		Render(fitText(content, maxInt(w-4, 20), maxInt(h-2, 6)))
+}
+
+func inferApprovalSafety(req core.ApprovalRequest) (string, lipgloss.Color) {
+	reason := strings.ToLower(req.Permission.Reason)
+	toolName := req.ToolCall.Name
+
+	if strings.Contains(reason, "destructive") || strings.Contains(reason, "rm ") || strings.Contains(reason, "sudo") {
+		return string(core.SafetyDestructive), lipgloss.Color("196")
+	}
+	if toolName == "shell" || toolName == "run_test" {
+		return string(core.SafetyShellMutation), lipgloss.Color("220")
+	}
+	if toolName == "write_file" || toolName == "apply_patch" {
+		return string(core.SafetyWorkspaceMutation), lipgloss.Color("220")
+	}
+	if toolName == "rg" || toolName == "read_file" || toolName == "git_status" {
+		return string(core.SafetyReadOnly), lipgloss.Color("42")
+	}
+	switch req.Permission.Behavior {
+	case core.PermissionAllow:
+		return string(core.SafetyReadOnly), lipgloss.Color("42")
+	case core.PermissionDeny:
+		return string(core.SafetyDestructive), lipgloss.Color("196")
+	default:
+		return string(core.SafetyShellMutation), lipgloss.Color("220")
+	}
+}
+
+func approvalInputSummary(input core.ToolInput) string {
+	if input == nil || len(input) == 0 {
+		return ""
+	}
+	var parts []string
+	if cmd, ok := input["command"]; ok {
+		parts = append(parts, fmt.Sprintf("command=%q", truncateAny(cmd, 60)))
+	}
+	if path, ok := input["path"]; ok {
+		parts = append(parts, fmt.Sprintf("path=%q", truncateAny(path, 40)))
+	}
+	if patch, ok := input["patch"]; ok {
+		parts = append(parts, fmt.Sprintf("patch=%d bytes", len(fmt.Sprint(patch))))
+	}
+	if content, ok := input["content"]; ok {
+		parts = append(parts, fmt.Sprintf("content=%d bytes", len(fmt.Sprint(content))))
+	}
+	if pattern, ok := input["pattern"]; ok {
+		parts = append(parts, fmt.Sprintf("pattern=%q", truncateAny(pattern, 40)))
+	}
+	if len(parts) == 0 {
+		count := 0
+		for k, v := range input {
+			if count >= 3 {
+				break
+			}
+			parts = append(parts, fmt.Sprintf("%s=%q", k, truncateAny(v, 30)))
+			count++
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func extractPaths(input core.ToolInput, toolName string) []string {
+	if input == nil {
+		return nil
+	}
+	var paths []string
+	if p, ok := input["path"]; ok {
+		paths = append(paths, fmt.Sprint(p))
+	}
+	if toolName == "shell" {
+		if cmd, ok := input["command"]; ok {
+			for _, part := range strings.Fields(fmt.Sprint(cmd)) {
+				if strings.Contains(part, "/") && !strings.HasPrefix(part, "-") {
+					paths = append(paths, part)
+				}
+			}
+		}
+	}
+	return paths
+}
+
+func (m Model) findRollbackArtifact(toolName string) string {
+	for i := len(m.tools) - 1; i >= 0; i-- {
+		if m.tools[i].Name == toolName && m.tools[i].RollbackArtifactID != "" {
+			return m.tools[i].RollbackArtifactID
+		}
+	}
+	return ""
+}
+
+func truncateAny(v any, max int) string {
+	s := fmt.Sprint(v)
+	if len(s) > max {
+		return s[:max] + "..."
+	}
+	return s
+}
+
 func waitForEvent(events <-chan core.AgentEvent) tea.Cmd {
 	return func() tea.Msg {
 		event, ok := <-events
@@ -428,6 +657,10 @@ func waitForEvent(events <-chan core.AgentEvent) tea.Cmd {
 }
 
 func (m *Model) applyEvent(event core.AgentEvent) {
+	// Clear last error on any successful (non-error) event.
+	if event.Type != core.EventError {
+		m.lastError = ""
+	}
 	switch event.Type {
 	case core.EventMessageDelta:
 		m.chat += event.Message
@@ -461,6 +694,15 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 		if event.Observation != nil {
 			m.notes = append(m.notes, event.Observation.Summary)
 			m.status = "observation recorded"
+			if event.Observation.RollbackArtifactID != "" {
+				toolName := fallback(event.ToolName, "tool")
+				for i := len(m.tools) - 1; i >= 0; i-- {
+					if m.tools[i].Name == toolName {
+						m.tools[i].RollbackArtifactID = event.Observation.RollbackArtifactID
+						break
+					}
+				}
+			}
 		}
 	case core.EventCostUpdate:
 		if event.Cost != nil {
@@ -473,7 +715,12 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 	case core.EventError:
 		msg := fallback(event.Err, event.Message)
 		m.lastError = msg
-		m.notes = append(m.notes, "error: "+msg)
+		recovery := errorRecoveryAction(msg)
+		note := "error: " + msg
+		if recovery != "" {
+			note += " — " + recovery
+		}
+		m.notes = append(m.notes, note)
 		m.running = false
 		m.status = "error: " + msg
 	case core.EventAgentStarted:
@@ -500,7 +747,9 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 			m.pendingApproval = *event.Approval
 			m.textInput = ""
 			m.cursorPos = 0
-			m.status = fmt.Sprintf("APPROVE? tool '%s' requires approval [y/n]", event.Approval.ToolCall.Name)
+			m.approvalCountdown = approvalCountdownSeconds
+			m.approvalCountdownMax = approvalCountdownSeconds
+			m.status = fmt.Sprintf("APPROVE? tool '%s' requires approval [y/n] (%ds)", event.Approval.ToolCall.Name, approvalCountdownSeconds)
 		}
 	default:
 		if event.Message != "" {
@@ -671,12 +920,13 @@ func (m Model) panelSize(panel focusPanel) (int, int) {
 	height := maxInt(m.height, 20)
 
 	header := renderHeader(width, m.status, m.sourceClosed, panelNames[m.focus], "")
+	statusLine := m.renderStatusLine(width)
 	footer := m.renderFooter(width)
 	inputBarHeight := 0
 	if m.inputMode != InputNone {
 		inputBarHeight = 1
 	}
-	bodyHeight := maxInt(height-lipgloss.Height(header)-lipgloss.Height(footer)-inputBarHeight, 12)
+	bodyHeight := maxInt(height-lipgloss.Height(header)-lipgloss.Height(statusLine)-lipgloss.Height(footer)-inputBarHeight, 12)
 
 	leftWidth := width / 2
 	rightWidth := width - leftWidth
@@ -758,6 +1008,9 @@ func (m Model) contextContent() string {
 				pin = "*"
 			}
 			fmt.Fprintf(&b, "%s %5d %s\n", pin, item.TokenEstimate, fallback(item.Title, item.ID))
+			if item.ReplacedBy != "" {
+				fmt.Fprintf(&b, "  (replaced by: %s)\n", item.ReplacedBy)
+			}
 			if item.Reason != "" {
 				fmt.Fprintf(&b, "  %s\n", item.Reason)
 			}
@@ -769,6 +1022,49 @@ func (m Model) contextContent() string {
 			b.WriteString("  empty\n")
 		}
 	}
+
+	// Compression lineage.
+	if len(m.context.CompressionRecords) > 0 {
+		fmt.Fprintf(&b, "\n%s\n", "COMPRESSION LINEAGE")
+		for _, rec := range m.context.CompressionRecords {
+			saved := rec.TokensBefore - rec.TokensAfter
+			if saved < 0 {
+				saved = 0
+			}
+			fmt.Fprintf(&b, "[%s]\n", rec.ID)
+			fmt.Fprintf(&b, "  compressed from: %s\n", strings.Join(rec.SourceIDs, ", "))
+			fmt.Fprintf(&b, "  summary: %s\n", rec.Summary)
+			fmt.Fprintf(&b, "  tokens saved: %d (%d -> %d)\n", saved, rec.TokensBefore, rec.TokensAfter)
+			if rec.Reason != "" {
+				fmt.Fprintf(&b, "  reason: %s\n", rec.Reason)
+			}
+		}
+	}
+
+	// Context focus summary with selection evidence.
+	if len(m.context.Items) > 0 {
+		fmt.Fprintf(&b, "\n%s\n", "CONTEXT FOCUS")
+		for _, item := range m.context.Items {
+			pin := " "
+			if item.Pinned {
+				pin = "[P]"
+			}
+			fmt.Fprintf(&b, "%s %s (%s) %d tok", pin, fallback(item.Title, item.ID), item.Tier, item.TokenEstimate)
+			if item.SelectionReason != "" {
+				fmt.Fprintf(&b, " — %s", item.SelectionReason)
+			}
+			b.WriteString("\n")
+			if item.ReplacedBy != "" {
+				fmt.Fprintf(&b, "    replaced by: %s\n", item.ReplacedBy)
+			}
+			// Show evidence reason for why this item was selected.
+			evidenceReason := m.contextItemEvidence(item)
+			if evidenceReason != "" {
+				fmt.Fprintf(&b, "    %s\n", evidenceReason)
+			}
+		}
+	}
+
 	return strings.TrimRight(b.String(), "\n")
 }
 
@@ -778,6 +1074,33 @@ func (m Model) traceContent() string {
 	}
 
 	var b strings.Builder
+
+	// Current goal display: show the latest trace step's Goal as cyan text.
+	if len(m.trace) > 0 {
+		latest := m.trace[len(m.trace)-1]
+		if latest.Goal != "" {
+			goalStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
+			fmt.Fprintf(&b, "%s\n", goalStyle.Render("Goal: "+latest.Goal))
+			b.WriteString("\n")
+		}
+	}
+
+	// Current plan display: extract plan steps with Stage="plan" and show as numbered list.
+	var planSteps []string
+	for _, step := range m.trace {
+		if step.Stage == core.StagePlan && step.Plan != "" {
+			planSteps = append(planSteps, step.Plan)
+		}
+	}
+	if len(planSteps) > 0 {
+		planStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
+		fmt.Fprintf(&b, "%s\n", planStyle.Render("Plan:"))
+		for i, ps := range planSteps {
+			fmt.Fprintf(&b, "  %d. %s\n", i+1, ps)
+		}
+		b.WriteString("\n")
+	}
+
 	for i, step := range m.trace {
 		if i > 0 {
 			b.WriteString("\n")
@@ -828,8 +1151,98 @@ func (m Model) toolContent() string {
 		if tool.Detail != "" {
 			fmt.Fprintf(&b, "%s\n", tool.Detail)
 		}
+
+		// Verification status: show pass/fail for run_test, written/applied for mutation tools.
+		if tool.Status == "done" {
+			verificationLine := verificationStatus(tool.Name, tool.Detail)
+			if verificationLine != "" {
+				fmt.Fprintf(&b, "%s\n", verificationLine)
+			}
+		}
+
+		// Rollback availability: show "[rollback available]" if RollbackArtifactID is set.
+		if tool.RollbackArtifactID != "" {
+			rollbackStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+			fmt.Fprintf(&b, "%s\n", rollbackStyle.Render("[rollback available]"))
+			fmt.Fprintf(&b, "rollback: %s\n", tool.RollbackArtifactID)
+		}
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// verificationStatus returns a colored verification line for a completed tool run.
+func verificationStatus(toolName, detail string) string {
+	lower := strings.ToLower(detail)
+	switch toolName {
+	case "run_test":
+		if strings.Contains(lower, "fail") || strings.Contains(lower, "error") || strings.Contains(lower, "exit code") {
+			failStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+			return failStyle.Render("verification: FAIL")
+		}
+		passStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
+		return passStyle.Render("verification: PASS")
+	case "write_file":
+		if !strings.Contains(lower, "error") {
+			statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+			return statusStyle.Render("status: written")
+		}
+		failStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+		return failStyle.Render("status: write failed")
+	case "apply_patch":
+		if !strings.Contains(lower, "error") && !strings.Contains(lower, "fail") {
+			statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+			return statusStyle.Render("status: applied")
+		}
+		failStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+		return failStyle.Render("status: patch failed")
+	}
+	return ""
+}
+
+// errorRecoveryAction returns a recovery suggestion for a given error message.
+func errorRecoveryAction(errMsg string) string {
+	lower := strings.ToLower(errMsg)
+	switch {
+	case strings.Contains(lower, "permission denied"):
+		return "Check policy.toml or approve the tool"
+	case strings.Contains(lower, "tool not found"):
+		return "Check tool name"
+	case strings.Contains(lower, "max steps reached"):
+		return "Try: increase MIMO_MAX_STEPS or simplify the task"
+	case strings.Contains(lower, "approval timed out"):
+		return "Respond faster or increase timeout"
+	}
+	return ""
+}
+
+// contextItemEvidence returns a reason string explaining why a context item
+// is in the current context (e.g., referenced by a tool, pinned, oracle promoted, or compressed).
+func (m Model) contextItemEvidence(item core.ContextItem) string {
+	if item.Pinned {
+		return "evidence: pinned"
+	}
+	if item.SelectionReason != "" {
+		return "evidence: " + item.SelectionReason
+	}
+	// Check if item is referenced by a recent observation (tool name in notes).
+	for i := len(m.notes) - 1; i >= 0 && i >= len(m.notes)-5; i-- {
+		if strings.Contains(m.notes[i], item.ID) || strings.Contains(m.notes[i], fallback(item.Title, "")) {
+			return "evidence: referenced by recent observation"
+		}
+	}
+	// Check if item came from compression.
+	for _, rec := range m.context.CompressionRecords {
+		for _, srcID := range rec.SourceIDs {
+			if srcID == item.ID {
+				return fmt.Sprintf("evidence: compressed from: %d items", len(rec.SourceIDs))
+			}
+		}
+	}
+	// Check if item source is oracle.
+	if strings.Contains(strings.ToLower(item.Source), "oracle") {
+		return "evidence: oracle promoted"
+	}
+	return ""
 }
 
 func renderHeader(width int, status string, closed bool, focusName, scroll string) string {
@@ -852,6 +1265,20 @@ func (m Model) renderFooter(width int) string {
 	}
 	modelInfo := fmt.Sprintf("model: %s (%s)", m.modelName, mode)
 
+	totalTokens := 0
+	if m.hasCost {
+		totalTokens = m.cost.TotalTokens
+	}
+	stepInfo := fmt.Sprintf("Step %d", len(m.trace))
+	if m.totalSteps > 0 {
+		stepInfo = fmt.Sprintf("Step %d/%d", len(m.trace), m.totalSteps)
+	}
+	tokenInfo := fmt.Sprintf("Tokens: ~%s | %s", formatNumber(totalTokens), stepInfo)
+
+	// Risk level display.
+	riskLabel, riskColor := m.riskLevel()
+	riskDisplay := lipgloss.NewStyle().Foreground(riskColor).Render("Risk: " + riskLabel)
+
 	var controls string
 	if m.showHelp {
 		controls = "? close help | esc close | q quit"
@@ -859,11 +1286,11 @@ func (m Model) renderFooter(width int) string {
 		controls = "tab focus | i/ prompt | ctrl+l clear | ctrl+r oracle | ? help | up/down scroll | pgup/pgdn | home/end | q quit"
 	}
 
-	left := modelInfo + " | "
-	right := ""
+	left := modelInfo + " | " + tokenInfo + " | "
+	right := " | " + riskDisplay
 	if m.lastError != "" {
 		errText := "ERR: " + m.lastError
-		right = " | " + lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render(errText)
+		right += " | " + lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render(errText)
 	}
 
 	avail := width - lipgloss.Width(left) - lipgloss.Width(right)
@@ -876,6 +1303,95 @@ func (m Model) renderFooter(width int) string {
 		Width(width).
 		Foreground(lipgloss.Color("248")).
 		Render(truncate(line, width))
+}
+
+// riskLevel calculates the current risk level from context pollution,
+// pending approvals, and recent errors. Returns label and color.
+func (m Model) riskLevel() (string, lipgloss.Color) {
+	score := 0
+
+	// Context pollution level contributes to risk.
+	switch strings.ToLower(m.context.PollutionRisk) {
+	case "high":
+		score += 3
+	case "medium":
+		score += 2
+	case "low", "unknown":
+		score += 0
+	}
+
+	// Pending approval contributes to risk.
+	if m.inputMode == InputApprove {
+		score += 2
+	}
+
+	// Recent error contributes to risk.
+	if m.lastError != "" {
+		score += 2
+	}
+
+	// Recent failed tools contribute to risk.
+	for i := len(m.tools) - 1; i >= 0 && i >= len(m.tools)-3; i-- {
+		if m.tools[i].Status == "failed" {
+			score += 1
+		}
+	}
+
+	switch {
+	case score >= 4:
+		return "high", lipgloss.Color("196")
+	case score >= 2:
+		return "medium", lipgloss.Color("220")
+	default:
+		return "low", lipgloss.Color("42")
+	}
+}
+
+func (m Model) renderStatusLine(width int) string {
+	modelName := fallback(m.modelName, "mimo-v2.5-pro")
+
+	stepInfo := fmt.Sprintf("Step %d", len(m.trace))
+	if m.totalSteps > 0 {
+		stepInfo = fmt.Sprintf("Step %d/%d", len(m.trace), m.totalSteps)
+	}
+
+	var state string
+	switch {
+	case m.running:
+		state = "running"
+	case m.sourceClosed:
+		state = "closed"
+	default:
+		state = "idle"
+	}
+
+	totalTokens := 0
+	if m.hasCost {
+		totalTokens = m.cost.TotalTokens
+	}
+
+	line := fmt.Sprintf("%s | %s | %s | Tokens: ~%s", modelName, stepInfo, state, formatNumber(totalTokens))
+
+	return lipgloss.NewStyle().
+		Width(width).
+		Foreground(lipgloss.Color("15")).
+		Background(lipgloss.Color("238")).
+		Render(truncate(line, width))
+}
+
+func formatNumber(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	s := fmt.Sprintf("%d", n)
+	var result []rune
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			result = append(result, ',')
+		}
+		result = append(result, c)
+	}
+	return string(result)
 }
 
 func renderHelp(width, height int) string {
@@ -892,20 +1408,33 @@ func renderHelp(width, height int) string {
 
 func helpContent() string {
 	return strings.TrimSpace(`
-Controls
+Navigation
   tab: focus next panel
-  i or /: enter prompt input mode
-  ctrl+l: clear chat display
-  ctrl+r: request context oracle review
+  j/k: move context selection (context panel)
   up/down: scroll focused panel
   pgup/pgdn: scroll focused panel by page
   home/end: jump focused panel
-  ?: toggle help
-  q or ctrl+c: quit
 
-Input Modes
-  Prompt (i or /): type a message, Enter to submit, Esc to cancel
-  Approve (auto): y to allow tool, n to deny, Esc to cancel
+Input
+  i or /: enter prompt input mode
+  Enter: submit prompt
+  Esc: cancel input / close help
+
+Context
+  p: toggle pin on selected context item
+  d: delete selected context item
+  ctrl+r: request context oracle review
+
+Approval
+  y: approve tool execution
+  n: deny tool execution
+  esc: cancel approval
+
+Control
+  ctrl+c or q: quit
+  ctrl+g: interrupt running agent
+  ctrl+l: clear chat display
+  ?: toggle help
 
 Panels
   Context Map: evidence and context budget by tier

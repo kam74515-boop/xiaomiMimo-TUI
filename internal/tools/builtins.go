@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -24,6 +25,10 @@ type baseTool struct {
 
 func (t baseTool) Name() string {
 	return t.name
+}
+
+func (t baseTool) Safety(input core.ToolInput) core.SafetyGrade {
+	return core.SafetyReadOnly
 }
 
 func (t baseTool) path(input core.ToolInput) (string, error) {
@@ -62,7 +67,19 @@ func (t shellTool) Schema() core.JSONSchema {
 	})
 }
 
+func (t shellTool) Safety(input core.ToolInput) core.SafetyGrade {
+	command := strings.TrimSpace(stringInput(input, "command"))
+	if command == "" {
+		return core.SafetyShellMutation
+	}
+	return detectShellRisk(command)
+}
+
 func (t shellTool) Permission(input core.ToolInput) core.PermissionRequest {
+	command := strings.TrimSpace(stringInput(input, "command"))
+	if command != "" && detectShellRisk(command) == core.SafetyDestructive {
+		return core.PermissionRequest{Behavior: core.PermissionAsk, Reason: "DESTRUCTIVE: " + command + " - requires explicit approval"}
+	}
 	return core.PermissionRequest{Behavior: core.PermissionAsk, Reason: "shell commands can mutate the workspace"}
 }
 
@@ -94,21 +111,39 @@ func (t shellTool) runCommand(ctx context.Context, toolName, command string, arg
 	err := cmd.Run()
 	exitCode := exitCode(err)
 
+	// Redact secrets from output before storing as artifact.
+	redactedStdout := redactSecrets(stdout.Bytes())
+	redactedStderr := redactSecrets(stderr.Bytes())
+
 	artifactID, artifactErr := t.writeArtifact(artifact.WriteRequest{
 		Tool:     toolName,
 		Kind:     "command",
 		ExitCode: exitCode,
 		Inputs:   redactInput(input),
 		Payloads: []artifact.Payload{
-			{Name: "stdout.txt", Data: stdout.Bytes()},
-			{Name: "stderr.txt", Data: stderr.Bytes()},
+			{Name: "stdout.txt", Data: redactedStdout},
+			{Name: "stderr.txt", Data: redactedStderr},
 		},
 	})
 	if artifactErr != nil {
 		return core.ToolResult{ExitCode: exitCode, Error: artifactErr.Error()}
 	}
 
-	content := fmt.Sprintf("%s exited %d; stdout=%d bytes, stderr=%d bytes; artifact=%s", command, exitCode, stdout.Len(), stderr.Len(), artifactID)
+	var content string
+	if toolName == "run_test" {
+		passed, failed := parseTestResults(stdout.String())
+		if passed > 0 || failed > 0 {
+			content = fmt.Sprintf("Tests: %d passed, %d failed (exit %d)", passed, failed, exitCode)
+		} else {
+			lines := countNonEmptyLines(stdout.String())
+			content = fmt.Sprintf("Tests (exit %d, %d lines output)", exitCode, lines)
+		}
+	} else {
+		lines := countNonEmptyLines(stdout.String())
+		risk := detectShellRisk(command)
+		riskLabel := riskLevelLabel(risk)
+		content = fmt.Sprintf("Shell: %s (exit %d, %d lines output) [risk: %s]", command, exitCode, lines, riskLabel)
+	}
 	if err != nil {
 		return core.ToolResult{Content: content, ExitCode: exitCode, ArtifactID: artifactID, Error: err.Error()}
 	}
@@ -222,8 +257,9 @@ func (t readFileTool) Run(ctx context.Context, input core.ToolInput) core.ToolRe
 	if artifactErr != nil {
 		return core.ToolResult{ExitCode: 1, Error: artifactErr.Error()}
 	}
+	lineCount := strings.Count(string(data), "\n")
 	return core.ToolResult{
-		Content:    fmt.Sprintf("read %d bytes from %s; artifact=%s", len(data), displayPath(t.workspace, path), artifactID),
+		Content:    fmt.Sprintf("Read %s (%d lines, %d bytes)", displayPath(t.workspace, path), lineCount, len(data)),
 		ExitCode:   0,
 		ArtifactID: artifactID,
 	}
@@ -246,6 +282,10 @@ type writeFileTool struct {
 
 func NewWriteFileTool(workspace string, store *artifact.Store, s Summarizer) core.Tool {
 	return writeFileTool{baseTool: newBase("write_file", workspace, store, s)}
+}
+
+func (t writeFileTool) Safety(input core.ToolInput) core.SafetyGrade {
+	return core.SafetyWorkspaceMutation
 }
 
 func (t writeFileTool) Schema() core.JSONSchema {
@@ -282,7 +322,7 @@ func (t writeFileTool) Run(ctx context.Context, input core.ToolInput) core.ToolR
 		return core.ToolResult{ExitCode: 1, Error: artifactErr.Error()}
 	}
 	return core.ToolResult{
-		Content:    fmt.Sprintf("wrote %d bytes to %s; artifact=%s", len(content), displayPath(t.workspace, path), artifactID),
+		Content:    fmt.Sprintf("Wrote %s (%d bytes)", displayPath(t.workspace, path), len(content)),
 		ExitCode:   0,
 		ArtifactID: artifactID,
 	}
@@ -305,6 +345,10 @@ type applyPatchTool struct {
 
 func NewApplyPatchTool(workspace string, store *artifact.Store, s Summarizer) core.Tool {
 	return applyPatchTool{baseTool: newBase("apply_patch", workspace, store, s)}
+}
+
+func (t applyPatchTool) Safety(input core.ToolInput) core.SafetyGrade {
+	return core.SafetyWorkspaceMutation
 }
 
 func (t applyPatchTool) Schema() core.JSONSchema {
@@ -347,7 +391,8 @@ func (t applyPatchTool) Run(ctx context.Context, input core.ToolInput) core.Tool
 		return core.ToolResult{ExitCode: code, Error: artifactErr.Error()}
 	}
 
-	content := fmt.Sprintf("git apply exited %d; artifact=%s", code, artifactID)
+	filesChanged, additions, removals := parseUnifiedDiff(patch)
+	content := fmt.Sprintf("Applied patch: %d files changed, +%d -%d", filesChanged, additions, removals)
 	if err != nil {
 		return core.ToolResult{Content: content, ExitCode: code, ArtifactID: artifactID, Error: err.Error()}
 	}
@@ -431,9 +476,13 @@ func NewRunTestTool(workspace string, store *artifact.Store, s Summarizer) core.
 	return runTestTool{baseTool: newBase("run_test", workspace, store, s)}
 }
 
+func (t runTestTool) Safety(input core.ToolInput) core.SafetyGrade {
+	return core.SafetyShellMutation
+}
+
 func (t runTestTool) Schema() core.JSONSchema {
 	return objectSchema("Run a test command.", map[string]any{
-		"command": stringSchema("Optional test command. Defaults to go test ./..."),
+		"command": stringSchema("Optional test command. Defaults to auto-detected based on project type."),
 	})
 }
 
@@ -444,7 +493,7 @@ func (t runTestTool) Permission(input core.ToolInput) core.PermissionRequest {
 func (t runTestTool) Run(ctx context.Context, input core.ToolInput) core.ToolResult {
 	command := strings.TrimSpace(stringInput(input, "command"))
 	if command == "" {
-		command = "go test ./..."
+		command = defaultTestCommand(t.workspace)
 	}
 	return shellTool{baseTool: t.baseTool}.runCommand(ctx, t.Name(), command, []string{"sh", "-c", command}, input)
 }
@@ -574,4 +623,187 @@ func displayPath(workspace, path string) string {
 		return rel
 	}
 	return path
+}
+
+func detectShellRisk(command string) core.SafetyGrade {
+	cmd := strings.TrimSpace(command)
+
+	// Destructive patterns: rm/rrmdir/chmod/chown/sudo/git reset --hard/git clean
+	// Also pipe-to-shell and /dev/null redirections that may indicate destructive intent.
+	destructiveMarkers := []string{
+		"rm ", "rmdir", "chmod", "chown", "sudo",
+		"git reset --hard", "git clean",
+		">/dev/null", ">/dev/null",
+		"curl ", "wget ",
+	}
+	shellMutationMarkers := []string{
+		"mv ", "cp ", "git ",
+	}
+
+	// Check for curl/wget piped to sh.
+	lower := strings.ToLower(cmd)
+	if (strings.Contains(lower, "curl ") || strings.Contains(lower, "wget ")) && strings.Contains(cmd, "| sh") {
+		return core.SafetyDestructive
+	}
+
+	for _, marker := range destructiveMarkers {
+		if strings.Contains(lower, marker) {
+			return core.SafetyDestructive
+		}
+	}
+
+	for _, marker := range shellMutationMarkers {
+		if strings.Contains(lower, marker) {
+			return core.SafetyShellMutation
+		}
+	}
+
+	return core.SafetyShellMutation
+}
+
+var (
+	secretKVPattern     = regexp.MustCompile(`(?i)(api[-_]?key|api[-_]?secret|secret[-_]?key|access[-_]?token|auth[-_]?token|private[-_]?key|token)\s*[=:]\s*\S+`)
+	secretBearerPattern = regexp.MustCompile(`(?i)Bearer\s+\S+`)
+)
+
+// redactSecrets scans data for patterns that look like API keys, tokens, or
+// other secrets and replaces their values with ***REDACTED***.
+func redactSecrets(data []byte) []byte {
+	if len(data) == 0 {
+		return data
+	}
+	text := string(data)
+	text = secretKVPattern.ReplaceAllStringFunc(text, func(match string) string {
+		for i, c := range match {
+			if c == '=' || c == ':' {
+				return match[:i+1] + "***REDACTED***"
+			}
+		}
+		return match
+	})
+	text = secretBearerPattern.ReplaceAllString(text, "Bearer ***REDACTED***")
+	return []byte(text)
+}
+
+// riskLevelLabel maps a SafetyGrade to a human-readable risk level for shell summaries.
+func riskLevelLabel(grade core.SafetyGrade) string {
+	switch grade {
+	case core.SafetyReadOnly:
+		return "low"
+	case core.SafetyWorkspaceMutation:
+		return "low"
+	case core.SafetyShellMutation:
+		return "medium"
+	case core.SafetyDestructive:
+		return "high"
+	default:
+		return "unknown"
+	}
+}
+
+func detectProjectType(workspace string) string {
+	// Check for Go
+	if _, err := os.Stat(filepath.Join(workspace, "go.mod")); err == nil {
+		return "go"
+	}
+
+	// Check for Node.js (check package.json for test script)
+	if data, err := os.ReadFile(filepath.Join(workspace, "package.json")); err == nil {
+		// Quick check for "test" script in package.json
+		if strings.Contains(string(data), "\"test\"") {
+			// Determine package manager
+			if _, err := os.Stat(filepath.Join(workspace, "pnpm-lock.yaml")); err == nil {
+				return "pnpm"
+			}
+			if _, err := os.Stat(filepath.Join(workspace, "yarn.lock")); err == nil {
+				return "yarn"
+			}
+			return "npm"
+		}
+		// package.json exists but no test script — still npm
+		if _, err := os.Stat(filepath.Join(workspace, "pnpm-lock.yaml")); err == nil {
+			return "pnpm"
+		}
+		if _, err := os.Stat(filepath.Join(workspace, "yarn.lock")); err == nil {
+			return "yarn"
+		}
+		return "npm"
+	}
+
+	// Check for Python
+	if _, err := os.Stat(filepath.Join(workspace, "pyproject.toml")); err == nil {
+		return "python"
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "setup.py")); err == nil {
+		return "python"
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "setup.cfg")); err == nil {
+		return "python"
+	}
+
+	// Check for Rust
+	if _, err := os.Stat(filepath.Join(workspace, "Cargo.toml")); err == nil {
+		return "rust"
+	}
+
+	return "go" // fallback
+}
+
+func defaultTestCommand(workspace string) string {
+	projectType := detectProjectType(workspace)
+	switch projectType {
+	case "go":
+		return "go test ./..."
+	case "npm":
+		return "npm test"
+	case "pnpm":
+		return "pnpm test"
+	case "yarn":
+		return "yarn test"
+	case "python":
+		return "python -m pytest"
+	case "rust":
+		return "cargo test"
+	default:
+		return "go test ./..."
+	}
+}
+
+// parseUnifiedDiff counts files changed, additions, and removals in a unified diff.
+func parseUnifiedDiff(patch string) (files, additions, removals int) {
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(patch, "\n") {
+		switch {
+		case strings.HasPrefix(line, "+++ b/"):
+			name := line[6:]
+			if name != "/dev/null" && !seen[name] {
+				seen[name] = true
+				files++
+			}
+		case strings.HasPrefix(line, "--- a/"):
+			name := line[6:]
+			if name != "/dev/null" && !seen[name] {
+				seen[name] = true
+				files++
+			}
+		case strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++"):
+			additions++
+		case strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---"):
+			removals++
+		}
+	}
+	return
+}
+
+// parseTestResults counts passed and failed tests from common test output formats.
+func parseTestResults(output string) (passed, failed int) {
+	for _, line := range strings.Split(output, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "--- PASS:") {
+			passed++
+		} else if strings.HasPrefix(trimmed, "--- FAIL:") {
+			failed++
+		}
+	}
+	return
 }

@@ -44,11 +44,12 @@ type TokenTotals struct {
 }
 
 type Manager struct {
-	mu           sync.RWMutex
-	windowTokens int
-	items        map[string]core.ContextItem
-	order        []string
-	now          func() time.Time
+	mu                 sync.RWMutex
+	windowTokens       int
+	items              map[string]core.ContextItem
+	order              []string
+	compressionRecords map[string]core.CompressionRecord
+	now                func() time.Time
 }
 
 func New(windowTokens int) *Manager {
@@ -56,9 +57,10 @@ func New(windowTokens int) *Manager {
 		windowTokens = DefaultWindowTokens
 	}
 	return &Manager{
-		windowTokens: windowTokens,
-		items:        make(map[string]core.ContextItem),
-		now:          time.Now,
+		windowTokens:       windowTokens,
+		items:              make(map[string]core.ContextItem),
+		compressionRecords: make(map[string]core.CompressionRecord),
+		now:                time.Now,
 	}
 }
 
@@ -129,9 +131,18 @@ func (m *Manager) Admit(item core.ContextItem) (core.ContextSnapshot, error) {
 		return m.snapshotLocked(), ErrInvalidItemID
 	}
 
+	// Truncate oversized summaries: force to artifact tier.
+	if len(item.Source) > 2000 {
+		item.Tier = core.TierArtifact
+		item.Source = item.Source[:2000] + "...[truncated]"
+		item.SelectionReason = "forced to artifact tier; summary exceeded 2000 chars"
+	}
+
 	// Artifact tier bypasses admission — it is raw output storage.
 	if item.Tier == core.TierArtifact {
-		item.SelectionReason = "artifact bypass; raw output stored as-is"
+		if item.SelectionReason == "" {
+			item.SelectionReason = "artifact bypass; raw output stored as-is"
+		}
 		if _, ok := m.items[item.ID]; !ok {
 			m.order = append(m.order, item.ID)
 		}
@@ -194,6 +205,8 @@ func (m *Manager) Remove(id string) (core.ContextSnapshot, error) {
 			break
 		}
 	}
+	// Clean up associated compression record.
+	delete(m.compressionRecords, id)
 	return m.snapshotLocked(), nil
 }
 
@@ -269,11 +282,21 @@ func (m *Manager) seedAnchorLocked(item core.ContextItem) {
 func (m *Manager) snapshotLocked() core.ContextSnapshot {
 	items := m.activeItemsLocked()
 	totals := totalsFor(m.windowTokens, items)
+
+	// Collect active compression records (those whose artifact is still in the map).
+	records := make([]core.CompressionRecord, 0, len(m.compressionRecords))
+	for id, record := range m.compressionRecords {
+		if _, ok := m.items[id]; ok {
+			records = append(records, record)
+		}
+	}
+
 	return core.ContextSnapshot{
-		WindowTokens:  m.windowTokens,
-		UsedTokens:    totals.UsedTokens,
-		Items:         items,
-		PollutionRisk: pollutionRisk(m.windowTokens, totals.UsedTokens),
+		WindowTokens:       m.windowTokens,
+		UsedTokens:         totals.UsedTokens,
+		Items:              items,
+		PollutionRisk:      pollutionRisk(m.windowTokens, totals.UsedTokens),
+		CompressionRecords: records,
 	}
 }
 

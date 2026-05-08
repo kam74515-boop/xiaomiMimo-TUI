@@ -524,6 +524,363 @@ func TestHealthCheckMockReturnsNil(t *testing.T) {
 	}
 }
 
+func TestToolCallMarshalJSON(t *testing.T) {
+	tests := []struct {
+		name string
+		tc   core.ToolCall
+		want map[string]any
+	}{
+		{
+			name: "full tool call",
+			tc:   core.ToolCall{ID: "call_1", Name: "read_file", Raw: `{"path":"README.md"}`},
+			want: map[string]any{
+				"id":   "call_1",
+				"type": "function",
+				"function": map[string]any{
+					"name":      "read_file",
+					"arguments": `{"path":"README.md"}`,
+				},
+			},
+		},
+		{
+			name: "tool call without id",
+			tc:   core.ToolCall{Name: "list_dir", Raw: `{}`},
+			want: map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":      "list_dir",
+					"arguments": `{}`,
+				},
+			},
+		},
+		{
+			name: "empty raw falls back to empty json",
+			tc:   core.ToolCall{Name: "git_status", Raw: ""},
+			want: map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":      "git_status",
+					"arguments": `{}`,
+				},
+			},
+		},
+		{
+			name: "raw from input marshaling",
+			tc:   core.ToolCall{Name: "shell", Input: core.ToolInput{"command": "go test ./..."}},
+			want: map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":      "shell",
+					"arguments": `{"command":"go test ./..."}`,
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			data, err := json.Marshal(test.tc)
+			if err != nil {
+				t.Fatalf("MarshalJSON error: %v", err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(data, &got); err != nil {
+				t.Fatalf("unmarshal result: %v", err)
+			}
+
+			if got["type"] != test.want["type"] {
+				t.Fatalf("type = %v, want %v", got["type"], test.want["type"])
+			}
+			wantFn := test.want["function"].(map[string]any)
+			gotFn, ok := got["function"].(map[string]any)
+			if !ok {
+				t.Fatalf("missing 'function' key in %s", data)
+			}
+			if gotFn["name"] != wantFn["name"] {
+				t.Fatalf("function.name = %v, want %v", gotFn["name"], wantFn["name"])
+			}
+			if gotFn["arguments"] != wantFn["arguments"] {
+				t.Fatalf("function.arguments = %v, want %v", gotFn["arguments"], wantFn["arguments"])
+			}
+			if _, hasID := test.want["id"]; hasID {
+				if got["id"] != test.want["id"] {
+					t.Fatalf("id = %v, want %v", got["id"], test.want["id"])
+				}
+			}
+		})
+	}
+}
+
+func TestToolCallUnmarshalJSON(t *testing.T) {
+	input := []byte(`{"id":"call_2","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"main.go\"}"}}`)
+	var tc core.ToolCall
+	if err := json.Unmarshal(input, &tc); err != nil {
+		t.Fatalf("UnmarshalJSON error: %v", err)
+	}
+	if tc.ID != "call_2" {
+		t.Fatalf("ID = %q, want call_2", tc.ID)
+	}
+	if tc.Name != "read_file" {
+		t.Fatalf("Name = %q, want read_file", tc.Name)
+	}
+	if tc.Raw != `{"path":"main.go"}` {
+		t.Fatalf("Raw = %q, want {\"path\":\"main.go\"}", tc.Raw)
+	}
+	if tc.Input == nil || tc.Input["path"] != "main.go" {
+		t.Fatalf("Input = %#v, want parsed path", tc.Input)
+	}
+}
+
+func TestMessageSerialization(t *testing.T) {
+	// Assistant message with tool_calls must have content field (even empty).
+	msg := core.Message{
+		Role:    "assistant",
+		Content: "",
+		ToolCalls: []core.ToolCall{
+			{ID: "call_3", Name: "read_file", Raw: `{"path":"x.go"}`},
+		},
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal assistant message: %v", err)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// Content must be present (not omitted).
+	content, hasContent := raw["content"]
+	if !hasContent {
+		t.Fatalf("content field is missing for assistant message with tool_calls; got keys: %v", raw)
+	}
+	if content != "" {
+		t.Fatalf("content = %q, want empty string", content)
+	}
+
+	// Tool message must include tool_call_id.
+	toolMsg := core.Message{
+		Role:       "tool",
+		Content:    "result text",
+		ToolCallID: "call_3",
+	}
+	data2, err := json.Marshal(toolMsg)
+	if err != nil {
+		t.Fatalf("marshal tool message: %v", err)
+	}
+	var raw2 map[string]any
+	if err := json.Unmarshal(data2, &raw2); err != nil {
+		t.Fatalf("unmarshal tool result: %v", err)
+	}
+	if raw2["tool_call_id"] != "call_3" {
+		t.Fatalf("tool_call_id = %v, want call_3", raw2["tool_call_id"])
+	}
+
+	// User message normal serialization.
+	userMsg := core.Message{Role: "user", Content: "hello world"}
+	data3, err := json.Marshal(userMsg)
+	if err != nil {
+		t.Fatalf("marshal user message: %v", err)
+	}
+	var raw3 map[string]any
+	if err := json.Unmarshal(data3, &raw3); err != nil {
+		t.Fatalf("unmarshal user result: %v", err)
+	}
+	if raw3["role"] != "user" {
+		t.Fatalf("role = %v, want user", raw3["role"])
+	}
+	if raw3["content"] != "hello world" {
+		t.Fatalf("content = %v, want hello world", raw3["content"])
+	}
+}
+
+func TestChatRequestSerialization(t *testing.T) {
+	req := core.ChatRequest{
+		Model: "mimo-v2.5-pro",
+		Messages: []core.Message{
+			{Role: "system", Content: "You are helpful."},
+			{Role: "user", Content: "hello"},
+		},
+		Stream: true,
+		Tools: []core.ToolSpec{
+			{
+				Type: "function",
+				Function: core.ToolFunctionSpec{
+					Name:        "list_dir",
+					Description: "List directory contents",
+					Parameters:  core.JSONSchema{"type": "object", "properties": map[string]any{}},
+				},
+			},
+		},
+	}
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal ChatRequest: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal ChatRequest: %v", err)
+	}
+
+	tools, ok := raw["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("tools = %v, want 1 tool in array", raw["tools"])
+	}
+	tool := tools[0].(map[string]any)
+	if tool["type"] != "function" {
+		t.Fatalf("tool.type = %v, want 'function'", tool["type"])
+	}
+	fn := tool["function"].(map[string]any)
+	if fn["name"] != "list_dir" {
+		t.Fatalf("tool.function.name = %v, want list_dir", fn["name"])
+	}
+	if fn["description"] != "List directory contents" {
+		t.Fatalf("tool.function.description = %v, want 'List directory contents'", fn["description"])
+	}
+	params, ok := fn["parameters"].(map[string]any)
+	if !ok {
+		t.Fatal("tool.function.parameters missing or not an object")
+	}
+	if params["type"] != "object" {
+		t.Fatalf("parameters.type = %v, want object", params["type"])
+	}
+}
+
+func TestMalformedToolArguments(t *testing.T) {
+	// Direct unit test: parseToolInput returns nil for malformed JSON (no panic).
+	if input := parseToolInput("{not valid"); input != nil {
+		t.Fatalf("parseToolInput with malformed JSON should return nil, got %v", input)
+	}
+	if input := parseToolInput(""); input != nil {
+		t.Fatalf("parseToolInput with empty string should return nil, got %v", input)
+	}
+	if input := parseToolInput(`{"key":"val"}`); input == nil || input["key"] != "val" {
+		t.Fatalf("parseToolInput with valid JSON should parse correctly, got %v", input)
+	}
+
+	// Also test accumulated malformed arguments through tool call state.
+	s := toolCallState{id: "x", name: "y", arguments: `{broken}`}
+	tc := s.toolCall()
+	if tc.Input != nil {
+		t.Fatalf("toolCall with malformed accumulated arguments: Input should be nil, got %v", tc.Input)
+	}
+	if tc.Raw != `{broken}` {
+		t.Fatalf("toolCall Raw = %q, want {broken}", tc.Raw)
+	}
+
+	// Now test through SSE stream with malformed arguments.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeSSEChunk(t, w, map[string]any{
+			"choices": []any{
+				map[string]any{
+					"delta": map[string]any{
+						"tool_calls": []any{
+							map[string]any{
+								"index": 0,
+								"id":    "call_mal",
+								"type":  "function",
+								"function": map[string]any{
+									"name":      "shell",
+									"arguments": `{not valid json`,
+								},
+							},
+						},
+					},
+				},
+			},
+		})
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	client := New(config.ProviderConfig{
+		BaseURL: server.URL,
+		APIKey:  "key",
+		Model:   "mimo-test",
+	})
+
+	events, err := client.ChatStream(context.Background(), core.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatStream error: %v", err)
+	}
+
+	for _, event := range collectModelEvents(t, events) {
+		if event.Err != nil {
+			t.Fatalf("unexpected error: %v", event.Err)
+		}
+		for _, tc := range event.ToolCalls {
+			// Malformed args: Raw preserved, Input must be nil (no panic).
+			if tc.Raw != `{not valid json` {
+				t.Fatalf("Raw = %q, want preserved raw string", tc.Raw)
+			}
+			if tc.Input != nil {
+				t.Fatalf("Input = %#v, want nil for malformed JSON", tc.Input)
+			}
+		}
+	}
+}
+
+func TestClientHandles400(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":{"message":"model not found: bad-model"}}`))
+	}))
+	defer server.Close()
+
+	client := New(config.ProviderConfig{
+		BaseURL: server.URL,
+		APIKey:  "key",
+		Model:   "bad-model",
+	})
+
+	events, err := client.ChatStream(context.Background(), core.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatStream returned error: %v", err)
+	}
+
+	var gotErr error
+	for _, event := range collectModelEvents(t, events) {
+		if event.Err != nil {
+			gotErr = event.Err
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("expected an error for 400 response")
+	}
+	if !strings.Contains(gotErr.Error(), "400") {
+		t.Fatalf("error = %q, want status code 400", gotErr.Error())
+	}
+	if !strings.Contains(gotErr.Error(), "model not found") {
+		t.Fatalf("error = %q, want body message", gotErr.Error())
+	}
+}
+
+func TestClientDoesNotRetryOn400(t *testing.T) {
+	var requestCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":{"message":"bad request"}}`))
+	}))
+	defer server.Close()
+
+	client := New(config.ProviderConfig{
+		BaseURL: server.URL,
+		APIKey:  "key",
+		Model:   "mimo-test",
+	})
+
+	events, _ := client.ChatStream(context.Background(), core.ChatRequest{})
+	for _, event := range collectModelEvents(t, events) {
+		_ = event.Err
+	}
+	if requestCount != 1 {
+		t.Fatalf("request count = %d, want 1 (no retry on 400)", requestCount)
+	}
+}
+
 func collectModelEvents(t *testing.T, events <-chan core.ModelEvent) []core.ModelEvent {
 	t.Helper()
 	var got []core.ModelEvent

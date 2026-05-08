@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -76,8 +78,14 @@ type LoopConfig struct {
 }
 
 func DefaultLoopConfig() LoopConfig {
+	maxSteps := 16
+	if v := os.Getenv("MIMO_MAX_STEPS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxSteps = n
+		}
+	}
 	return LoopConfig{
-		MaxSteps:     8,
+		MaxSteps:     maxSteps,
 		StepTimeout:  120 * time.Second,
 		TotalTimeout: 600 * time.Second,
 	}

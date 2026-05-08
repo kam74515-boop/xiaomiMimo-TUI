@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"mimo-tui/internal/agent"
+	"mimo-tui/internal/artifact"
 	"mimo-tui/internal/config"
 	contextmap "mimo-tui/internal/context"
 	"mimo-tui/internal/core"
@@ -46,6 +47,29 @@ func main() {
 
 	if opts.workspace != "" {
 		cfg.Runtime.Workspace = opts.workspace
+	}
+
+	// ----- rollback commands -----
+	if opts.rollbackList {
+		if err := runRollbackList(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "rollback list: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if opts.rollbackShow != "" {
+		if err := runRollbackShow(cfg, opts.rollbackShow); err != nil {
+			fmt.Fprintf(os.Stderr, "rollback show: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if opts.rollbackApply != "" {
+		if err := runRollbackApply(cfg, opts.rollbackApply, opts.rollbackConfirm); err != nil {
+			fmt.Fprintf(os.Stderr, "rollback apply: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	// ----- golden session marking -----
@@ -106,6 +130,10 @@ type cliOptions struct {
 	goldenSession    string
 	modelAccept      string
 	candidateSession string
+	rollbackList     bool
+	rollbackShow     string
+	rollbackApply    string
+	rollbackConfirm  bool
 }
 
 func parseFlags() cliOptions {
@@ -121,6 +149,10 @@ func parseFlags() cliOptions {
 	flag.StringVar(&opts.goldenSession, "golden-session", "", "mark a session as golden")
 	flag.StringVar(&opts.modelAccept, "model-accept", "", "accept a candidate model if the replay gate passes")
 	flag.StringVar(&opts.candidateSession, "candidate-session", "", "candidate session to evaluate against the golden session")
+	flag.BoolVar(&opts.rollbackList, "rollback-list", false, "list all rollback artifacts")
+	flag.StringVar(&opts.rollbackShow, "rollback-show", "", "show what a rollback artifact will restore")
+	flag.StringVar(&opts.rollbackApply, "rollback-apply", "", "apply a rollback artifact (dry-run by default, use -rollback-confirm to commit)")
+	flag.BoolVar(&opts.rollbackConfirm, "rollback-confirm", false, "confirm actual rollback apply (required with -rollback-apply)")
 	flag.Parse()
 	return opts
 }
@@ -188,7 +220,13 @@ func runSmoke(w io.Writer, events <-chan core.AgentEvent, timeout time.Duration)
 	for {
 		select {
 		case <-timer.C:
-			return errors.New("timed out waiting for event_done")
+			return fmt.Errorf("timed out waiting for event_done; received: message_delta=%d context_update=%d trace_update=%d tool_result=%d observation=%d error=%s",
+				counts[core.EventMessageDelta],
+				counts[core.EventContextUpdate],
+				counts[core.EventTraceUpdate],
+				counts[core.EventToolResult],
+				counts[core.EventObservation],
+				lastErr)
 		case event, ok := <-events:
 			if !ok {
 				return errors.New("event source closed before event_done")
@@ -263,8 +301,9 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 	go func() {
 		manager := newContextManager(cfg)
 		publishContextSnapshot(manager.Snapshot(), bus)
+		var resumeHistory []core.Message
 		if opts.resumeLatest {
-			publishResumeSummary(cfg, manager, bus)
+			_, _, resumeHistory = publishResumeSummary(cfg, manager, bus)
 		}
 
 		// Subscribe to TUI context commands (pin / unpin / remove).
@@ -294,6 +333,7 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 		toolRegistry := tools.NewDefaultRegistry(cfg.Runtime.Workspace, summarizers.NewRegistry)
 		approvalCh := make(chan core.ApprovalRequest, 8)
 		defer close(approvalCh)
+		policyCfg, _ := config.LoadPolicy()
 		executor := tools.NewExecutor(
 			toolRegistry,
 			bus,
@@ -302,6 +342,7 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 				snapshot := manager.Snapshot()
 				return tools.BudgetFromContext(snapshot.WindowTokens, snapshot.UsedTokens)
 			}),
+			tools.WithPolicyConfig(policyCfg),
 		)
 
 		// Bridge approval requests from the executor to the event bus.
@@ -353,7 +394,7 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 		// Initial agent run with the startup prompt.
 		runCtx, cancel := context.WithCancel(ctx)
 		agentCancel = cancel
-		history, err := agent.Loop(runCtx, prompt, client, executor, manager, toolRegistry.ToolSpecs(), bus, loopConfig, nil)
+		history, err := agent.Loop(runCtx, prompt, client, executor, manager, toolRegistry.ToolSpecs(), bus, loopConfig, resumeHistory)
 		if err != nil {
 			// Log error but continue to multi-turn listening so the user can retry.
 			bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: "startup agent error: " + err.Error()}})
@@ -465,25 +506,76 @@ func publishContextSnapshot(snapshot core.ContextSnapshot, bus *core.Bus) {
 	bus.Publish(event)
 }
 
-func publishResumeSummary(cfg config.Config, manager *contextmap.Manager, bus *core.Bus) {
+func publishResumeSummary(cfg config.Config, manager *contextmap.Manager, bus *core.Bus) (*sessionlog.ResumeSummary, string, []core.Message) {
 	latest, err := replay.LatestSession(cfg.Runtime.Workspace)
 	if err != nil {
-		return
+		return nil, "", nil
 	}
 	events, err := replay.ReadFile(latest.Path)
 	if err != nil {
-		return
+		return nil, "", nil
 	}
 	summary := sessionlog.BuildResumeSummary(events)
+
+	// --- Publish resumed session notification for TUI display. ---
+	// The EventAgentStarted clears any stale error state and signals a new run.
+	// The observation appears in the notes section of the Trace panel.
+	resumeMsg := fmt.Sprintf("resumed session %s (%d events, stage=%s)",
+		latest.ID, latest.EventCount, firstNonEmpty(string(summary.LastStage), "unknown"))
+	bus.Publish(core.AgentEvent{
+		Type:    core.EventAgentStarted,
+		Message: resumeMsg,
+		Time:    time.Now(),
+	})
+
+	// --- Restore context items from last session snapshot. ---
+	// Each item from the previous session's context map is re-inserted so the
+	// resumed context map has real content, not just a skeleton.
+	if summary.LatestContext != nil {
+		for _, item := range summary.LatestContext.Items {
+			manager.Add(core.ContextItem{
+				ID:            item.ID,
+				Tier:          item.Tier,
+				Title:         item.Title,
+				Source:        item.Source,
+				TokenEstimate: item.TokenEstimate,
+				Pinned:        item.Pinned,
+				Reason:        fmt.Sprintf("resumed from session %s: %s", latest.ID, item.Reason),
+			})
+		}
+	}
+
+	// --- Publish recent trace updates so the TUI Trace panel shows the latest stage. ---
+	for _, ts := range summary.RecentTraceUpdates {
+		step := core.TraceStep{
+			ID:     ts.ID,
+			Goal:   ts.Goal,
+			Status: ts.Status,
+			Stage:  ts.Stage,
+		}
+		event := core.NewEvent(core.EventTraceUpdate)
+		event.Trace = &step
+		event.Time = ts.Time
+		bus.Publish(event)
+	}
+
+	// --- Publish resume summary as a rich observation. ---
+	// This serves as the "chat summary" and "context snapshot" of the previous
+	// session, using only observation metadata (no raw artifact content).
 	observation := core.Observation{
-		Summary:          fmt.Sprintf("Latest session %s has %d events; last status: %s", latest.ID, latest.EventCount, firstNonEmpty(summary.LastStatus, "unknown")),
-		StateDelta:       fmt.Sprintf("resume skeleton includes %d recent trace updates and %d artifact references", len(summary.RecentTraceUpdates), len(summary.ArtifactIDs)),
-		RiskDelta:        firstNonEmpty(summary.LastError, "no resume error recorded"),
+		Summary: fmt.Sprintf("resumed session %s: %d events, last stage=%s, status=%s",
+			latest.ID, latest.EventCount, string(summary.LastStage), firstNonEmpty(summary.LastStatus, "unknown")),
+		StateDelta: fmt.Sprintf("restored %d context items, %d trace steps, %d artifact refs, %d history messages; last tool results: %s",
+			len(summary.LatestContext.Items), len(summary.RecentTraceUpdates), len(summary.ArtifactIDs), len(summary.RecentMessages),
+			strings.Join(summary.LastToolResults, "; ")),
+		RiskDelta:        firstNonEmpty(summary.LastError, "no pending risk from previous session"),
 		ContextPlacement: core.TierAnchor,
 	}
 	publishObservation(observation, bus)
 	snapshot, _ := manager.Upsert(contextmap.PromoteObservation("anchor:resume:"+latest.ID, observation))
 	publishContextSnapshot(snapshot, bus)
+
+	return &summary, latest.ID, summary.RecentMessages
 }
 
 func runBootstrapTools(ctx context.Context, executor *tools.Executor, manager *contextmap.Manager, bus *core.Bus) []core.Observation {
@@ -504,6 +596,66 @@ func publishObservation(observation core.Observation, bus *core.Bus) {
 	event := core.NewEvent(core.EventObservation)
 	event.Observation = &observation
 	bus.Publish(event)
+}
+
+// runRollbackList lists all rollback artifacts.
+func runRollbackList(cfg config.Config) error {
+	rollbacks, err := artifact.ListRollbacks(cfg.Runtime.Workspace)
+	if err != nil {
+		return err
+	}
+	if len(rollbacks) == 0 {
+		fmt.Println("No rollback artifacts found.")
+		return nil
+	}
+	fmt.Printf("Rollback artifacts (%d):\n", len(rollbacks))
+	for _, rb := range rollbacks {
+		status := "dirty"
+		if rb.ExitCode == 0 {
+			status = "clean"
+		}
+		fmt.Printf("  %s  tool=%-12s  size=%-6d  state=%-5s  created=%s\n",
+			rb.ID, rb.Tool, rb.DiffSize, status, rb.CreatedAt.Format(time.RFC3339))
+	}
+	return nil
+}
+
+// runRollbackShow displays what a rollback artifact will restore.
+func runRollbackShow(cfg config.Config, id string) error {
+	output, err := artifact.ShowRollback(cfg.Runtime.Workspace, id)
+	if err != nil {
+		return err
+	}
+	fmt.Println(output)
+	return nil
+}
+
+// runRollbackApply applies a rollback artifact.
+func runRollbackApply(cfg config.Config, id string, confirm bool) error {
+	if !confirm {
+		output, err := artifact.ApplyRollback(cfg.Runtime.Workspace, id, true)
+		if err != nil {
+			return err
+		}
+		fmt.Println(output)
+		fmt.Println("\nUse -rollback-confirm to actually apply this rollback.")
+		return nil
+	}
+
+	output, err := artifact.ApplyRollback(cfg.Runtime.Workspace, id, false)
+	if err != nil {
+		return err
+	}
+	fmt.Println(output)
+
+	// Record the rollback operation as an artifact event.
+	recordID, err := artifact.RecordRollbackApply(cfg.Runtime.Workspace, id)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to record rollback apply: %v\n", err)
+	} else {
+		fmt.Printf("rollback apply recorded as artifact %s\n", recordID)
+	}
+	return nil
 }
 
 // runGoldenMark marks the session specified by -golden-session as a golden

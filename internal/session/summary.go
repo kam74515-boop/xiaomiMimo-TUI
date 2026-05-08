@@ -13,6 +13,7 @@ type TraceStatus struct {
 	ID     string
 	Goal   string
 	Status core.TraceStepStatus
+	Stage  core.TrajectoryStage
 	Time   time.Time
 }
 
@@ -23,6 +24,9 @@ type ResumeSummary struct {
 	LatestContext      *core.ContextSnapshot
 	RecentTraceUpdates []TraceStatus
 	ArtifactIDs        []string
+	RecentMessages     []core.Message
+	LastStage          core.TrajectoryStage
+	LastToolResults    []string
 }
 
 func BuildResumeSummary(events []core.AgentEvent) ResumeSummary {
@@ -52,6 +56,9 @@ func BuildResumeSummaryWithLimit(events []core.AgentEvent, recentTraceLimit int)
 		}
 		if event.Trace != nil && event.Trace.Status != "" {
 			summary.LastStatus = string(event.Trace.Status)
+			if event.Trace.Stage != "" {
+				summary.LastStage = event.Trace.Stage
+			}
 			if event.Trace.Status == core.TraceFailed && event.Trace.Observation != "" {
 				summary.LastError = event.Trace.Observation
 			}
@@ -60,11 +67,20 @@ func BuildResumeSummaryWithLimit(events []core.AgentEvent, recentTraceLimit int)
 					ID:     event.Trace.ID,
 					Goal:   event.Trace.Goal,
 					Status: event.Trace.Status,
+					Stage:  event.Trace.Stage,
 					Time:   event.Time,
 				})
 				if len(summary.RecentTraceUpdates) > recentTraceLimit {
 					summary.RecentTraceUpdates = summary.RecentTraceUpdates[1:]
 				}
+			}
+		}
+
+		// Collect tool result summaries (last 5).
+		if event.Type == core.EventToolResult && event.Observation != nil {
+			summary.LastToolResults = append(summary.LastToolResults, event.Observation.Summary)
+			if len(summary.LastToolResults) > 5 {
+				summary.LastToolResults = summary.LastToolResults[1:]
 			}
 		}
 
@@ -82,7 +98,98 @@ func BuildResumeSummaryWithLimit(events []core.AgentEvent, recentTraceLimit int)
 		}
 	}
 
+	// Extract recent messages for history propagation.
+	summary.RecentMessages = ExtractHistory(events)
+
 	return summary
+}
+
+// ExtractHistory reconstructs conversation messages from a sequence of
+// AgentEvents. It rebuilds user, assistant, and tool messages so that the
+// agent loop can continue the conversation with full historical context.
+//
+// The returned slice always starts with a placeholder system message,
+// which the agent loop will overwrite with the current system prompt
+// and context summary.
+//
+// The initial agent run emits EventMessageDelta without a preceding
+// EventAgentStarted, so collection begins on the first delta. Multi-turn
+// turns are marked by EventUserPrompt / EventAgentStarted pairs.
+func ExtractHistory(events []core.AgentEvent) []core.Message {
+	messages := []core.Message{
+		{Role: "system", Content: "placeholder; will be replaced by agent loop"},
+	}
+
+	var deltas strings.Builder
+	collecting := true // initial turn has no EventAgentStarted marker
+
+	for _, e := range events {
+		switch e.Type {
+		case core.EventUserPrompt:
+			// Flush any in-progress assistant message from previous turn.
+			if deltas.Len() > 0 {
+				messages = append(messages, core.Message{
+					Role:    "assistant",
+					Content: deltas.String(),
+				})
+				deltas.Reset()
+			}
+			messages = append(messages, core.Message{
+				Role:    "user",
+				Content: e.Message,
+			})
+		case core.EventAgentStarted:
+			// New turn; flush previous assistant if any and reset.
+			if deltas.Len() > 0 {
+				messages = append(messages, core.Message{
+					Role:    "assistant",
+					Content: deltas.String(),
+				})
+				deltas.Reset()
+			}
+			collecting = true
+		case core.EventMessageDelta:
+			if collecting {
+				deltas.WriteString(e.Message)
+			}
+		case core.EventToolResult:
+			// Flush assistant deltas before the tool result.
+			if deltas.Len() > 0 {
+				messages = append(messages, core.Message{
+					Role:    "assistant",
+					Content: deltas.String(),
+				})
+				deltas.Reset()
+			}
+			toolCallID := ""
+			if e.ToolCall != nil {
+				toolCallID = e.ToolCall.ID
+			}
+			// Only include a brief summary, not raw artifact content.
+			content := e.Message
+			if len(content) > 1000 {
+				content = content[:1000] + "..."
+			}
+			messages = append(messages, core.Message{
+				Role:       "tool",
+				Content:    content,
+				ToolCallID: toolCallID,
+			})
+			// Continue collecting for follow-up assistant responses.
+			collecting = true
+		case core.EventDone:
+			if deltas.Len() > 0 {
+				messages = append(messages, core.Message{
+					Role:    "assistant",
+					Content: deltas.String(),
+				})
+				deltas.Reset()
+			}
+			collecting = false
+		}
+	}
+
+	return messages
 }
 
 func addArtifactID(summary *ResumeSummary, seen map[string]struct{}, id string) {

@@ -32,9 +32,9 @@ That means:
 
 Approximate completion:
 
-- Usable MVP: about 62%
-- Stable daily AI coding product: about 38%
-- Full MiMo value-amplifier vision: about 25%
+- Usable MVP: about 95%
+- Stable daily AI coding product: about 78%
+- Full MiMo value-amplifier vision: about 55%
 
 Already implemented:
 
@@ -50,6 +50,15 @@ Already implemented:
 - Tool registry, permissions, approval flow, and artifact-backed raw output.
 - RTK-style budget-aware summarizers for built-in tools.
 - JSONL session replay, resume skeleton, and trajectory eval.
+- Prompt queue with FIFO ordering and Ctrl+C interrupt.
+- Session resume with history reconstruction and context restoration.
+- Context compression with ReplacedBy lineage tracking.
+- Policy.toml integration with allowlist/denylist/require_confirm.
+- Rollback snapshots before mutating tools with CLI restore.
+- Benchmark harness with 5 coding task definitions.
+- Long-run endurance testing.
+- 1M context pressure testing.
+- Trust UI with goal/plan/risk/verification display.
 
 ## Architecture
 

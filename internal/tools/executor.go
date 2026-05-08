@@ -1,10 +1,14 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"os/exec"
 	"time"
 
+	"mimo-tui/internal/artifact"
+	"mimo-tui/internal/config"
 	"mimo-tui/internal/core"
 )
 
@@ -14,8 +18,11 @@ type Executor struct {
 	registry       *Registry
 	bus            *core.Bus
 	policy         ExecutorPolicy
+	policyConfig   *config.PolicyConfig
 	budgetProvider func() BudgetLevel
 	ApprovalCh     chan<- core.ApprovalRequest
+	store          *artifact.Store
+	workspace      string
 }
 
 type ExecutorPolicy struct {
@@ -61,6 +68,19 @@ func WithBudgetProvider(provider func() BudgetLevel) ExecutorOption {
 	}
 }
 
+func WithArtifactStore(store *artifact.Store, workspace string) ExecutorOption {
+	return func(executor *Executor) {
+		executor.store = store
+		executor.workspace = workspace
+	}
+}
+
+func WithPolicyConfig(cfg config.PolicyConfig) ExecutorOption {
+	return func(executor *Executor) {
+		executor.policyConfig = &cfg
+	}
+}
+
 func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolResult, core.Observation) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -85,7 +105,12 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 		return result, observation
 	}
 
+	// Evaluate permission: policy.toml overrides tool's default if configured.
 	permission := tool.Permission(call.Input)
+	if e.policyConfig != nil {
+		grade := tool.Safety(call.Input)
+		permission = config.EvaluatePolicy(*e.policyConfig, call.Name, call.Input, grade)
+	}
 
 	// If the tool asks for permission, there is an approval channel, and the tool
 	// is not already whitelisted, request user approval via the channel.
@@ -127,7 +152,7 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 				return result, observation
 			}
 			// Approved: fall through to normal execution.
-		case <-time.After(30 * time.Second):
+		case <-time.After(e.approvalTimeout()):
 			result := core.ToolResult{
 				Content:  fmt.Sprintf("tool %s approval timed out", tool.Name()),
 				ExitCode: permissionDeniedExitCode,
@@ -152,11 +177,20 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 		}
 	}
 
+	// Capture a rollback snapshot before mutating tools.
+	var rollbackArtifactID string
+	if tool.Safety(call.Input) != core.SafetyReadOnly {
+		if id, err := e.captureRollbackSnapshot(call.Name); err == nil {
+			rollbackArtifactID = id
+		}
+	}
+
 	result := tool.Run(ctx, call.Input)
 	e.publishResult(call, result)
 
 	observation := SummarizeTool(tool, result, e.currentBudget())
 	normalizeObservation(&observation, result)
+	observation.RollbackArtifactID = rollbackArtifactID
 	e.publishObservation(call, observation)
 	return result, observation
 }
@@ -166,6 +200,13 @@ func (e *Executor) currentBudget() BudgetLevel {
 		return BudgetSafe
 	}
 	return e.budgetProvider()
+}
+
+func (e *Executor) approvalTimeout() time.Duration {
+	if e != nil && e.policyConfig != nil && e.policyConfig.ApprovalTimeout > 0 {
+		return time.Duration(e.policyConfig.ApprovalTimeout) * time.Second
+	}
+	return 30 * time.Second
 }
 
 func (p ExecutorPolicy) isAllowedAsk(name string) bool {
@@ -259,4 +300,49 @@ func normalizeObservation(observation *core.Observation, result core.ToolResult)
 			observation.ContextPlacement = core.TierNear
 		}
 	}
+}
+
+func (e *Executor) captureRollbackSnapshot(toolName string) (string, error) {
+	if e.store == nil {
+		return "", fmt.Errorf("artifact store not available for rollback")
+	}
+
+	cmd := exec.Command("git", "diff")
+	if e.workspace != "" {
+		cmd.Dir = e.workspace
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	// git diff exits 1 when there are changes (expected), 0 when clean, other on error.
+	exitCode := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			return "", err
+		}
+	}
+
+	// Accept exit code 0 (clean) or 1 (dirty); anything else is a failure.
+	if exitCode > 1 {
+		return "", fmt.Errorf("git diff exited %d: %s", exitCode, stderr.String())
+	}
+
+	record, err := e.store.Write(artifact.WriteRequest{
+		Tool:     toolName,
+		Kind:     "rollback",
+		ExitCode: exitCode,
+		Inputs:   map[string]any{"tool": toolName},
+		Payloads: []artifact.Payload{
+			{Name: "pre_state.diff", Data: stdout.Bytes()},
+			{Name: "stderr.txt", Data: stderr.Bytes()},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	return record.ID, nil
 }

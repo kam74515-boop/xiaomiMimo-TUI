@@ -48,13 +48,27 @@ type ContextItem struct {
 	SelectionReason string      `json:"selection_reason,omitempty"`
 	ReplacedBy      string      `json:"replaced_by,omitempty"`
 	ExpiresAt       time.Time   `json:"expires_at,omitempty"`
+	SourceFile      string      `json:"source_file,omitempty"`
+	Keywords        []string    `json:"keywords,omitempty"`
+}
+
+// CompressionRecord describes a context-compression operation that merged
+// multiple low-activity items into a single compressed summary artifact.
+type CompressionRecord struct {
+	ID           string   `json:"id"`
+	SourceIDs    []string `json:"source_ids"`
+	Summary      string   `json:"summary"`
+	Reason       string   `json:"reason"`
+	TokensBefore int      `json:"tokens_before"`
+	TokensAfter  int      `json:"tokens_after"`
 }
 
 type ContextSnapshot struct {
-	WindowTokens  int           `json:"window_tokens"`
-	UsedTokens    int           `json:"used_tokens"`
-	Items         []ContextItem `json:"items"`
-	PollutionRisk string        `json:"pollution_risk"`
+	WindowTokens       int                 `json:"window_tokens"`
+	UsedTokens         int                 `json:"used_tokens"`
+	Items              []ContextItem       `json:"items"`
+	PollutionRisk      string              `json:"pollution_risk"`
+	CompressionRecords []CompressionRecord `json:"compression_records,omitempty"`
 }
 
 type TraceStepStatus string
@@ -66,6 +80,17 @@ const (
 	TraceFailed  TraceStepStatus = "failed"
 )
 
+type TrajectoryStage string
+
+const (
+	StageInspect TrajectoryStage = "inspect"
+	StagePlan    TrajectoryStage = "plan"
+	StagePatch   TrajectoryStage = "patch"
+	StageTest    TrajectoryStage = "test"
+	StageRevise  TrajectoryStage = "revise"
+	StageSummary TrajectoryStage = "summary"
+)
+
 type TraceStep struct {
 	ID          string          `json:"id"`
 	Goal        string          `json:"goal"`
@@ -75,17 +100,19 @@ type TraceStep struct {
 	Revision    string          `json:"revision"`
 	Risk        string          `json:"risk"`
 	Status      TraceStepStatus `json:"status"`
+	Stage       TrajectoryStage `json:"stage,omitempty"`
 	StartedAt   time.Time       `json:"started_at,omitempty"`
 	EndedAt     time.Time       `json:"ended_at,omitempty"`
 }
 
 type Observation struct {
-	Summary          string      `json:"summary"`
-	StateDelta       string      `json:"state_delta"`
-	RiskDelta        string      `json:"risk_delta"`
-	NextAffordances  []string    `json:"next_affordances"`
-	ContextPlacement ContextTier `json:"context_placement"`
-	ArtifactID       string      `json:"artifact_id,omitempty"`
+	Summary            string      `json:"summary"`
+	StateDelta         string      `json:"state_delta"`
+	RiskDelta          string      `json:"risk_delta"`
+	NextAffordances    []string    `json:"next_affordances"`
+	ContextPlacement   ContextTier `json:"context_placement"`
+	ArtifactID         string      `json:"artifact_id,omitempty"`
+	RollbackArtifactID string      `json:"rollback_artifact_id,omitempty"`
 }
 
 type AgentEvent struct {
@@ -111,7 +138,7 @@ type CostUpdate struct {
 
 type Message struct {
 	Role       string     `json:"role"`
-	Content    string     `json:"content,omitempty"`
+	Content    string     `json:"content"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 }
@@ -139,6 +166,55 @@ type ToolCall struct {
 	Name  string    `json:"name"`
 	Input ToolInput `json:"input,omitempty"`
 	Raw   string    `json:"raw,omitempty"`
+}
+
+// MarshalJSON serializes ToolCall in OpenAI-compatible format:
+// {"id":"...","type":"function","function":{"name":"...","arguments":"..."}}
+func (tc ToolCall) MarshalJSON() ([]byte, error) {
+	args := tc.Raw
+	if args == "" && tc.Input != nil {
+		b, _ := json.Marshal(tc.Input)
+		args = string(b)
+	}
+	if args == "" {
+		args = "{}"
+	}
+	m := map[string]any{
+		"type": "function",
+		"function": map[string]string{
+			"name":      tc.Name,
+			"arguments": args,
+		},
+	}
+	if tc.ID != "" {
+		m["id"] = tc.ID
+	}
+	return json.Marshal(m)
+}
+
+// UnmarshalJSON deserializes ToolCall from OpenAI-compatible format.
+func (tc *ToolCall) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		ID       string `json:"id"`
+		Type     string `json:"type"`
+		Function struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	tc.ID = raw.ID
+	tc.Name = raw.Function.Name
+	tc.Raw = raw.Function.Arguments
+	if tc.Raw != "" {
+		var input ToolInput
+		if err := json.Unmarshal([]byte(tc.Raw), &input); err == nil {
+			tc.Input = input
+		}
+	}
+	return nil
 }
 
 type ToolSpec struct {
@@ -191,9 +267,19 @@ type ToolResult struct {
 	Error      string `json:"error,omitempty"`
 }
 
+type SafetyGrade string
+
+const (
+	SafetyReadOnly          SafetyGrade = "read_only"
+	SafetyWorkspaceMutation SafetyGrade = "workspace_mutation"
+	SafetyShellMutation     SafetyGrade = "shell_mutation"
+	SafetyDestructive       SafetyGrade = "destructive"
+)
+
 type Tool interface {
 	Name() string
 	Schema() JSONSchema
+	Safety(input ToolInput) SafetyGrade
 	Permission(input ToolInput) PermissionRequest
 	Run(ctx context.Context, input ToolInput) ToolResult
 	Summarize(result ToolResult) Observation

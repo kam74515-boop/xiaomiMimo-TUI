@@ -13,12 +13,20 @@ type Oracle struct {
 	manager *Manager
 }
 
+// CompressionCandidate groups items that should be compressed together
+// with a machine-generated reason.
+type CompressionCandidate struct {
+	ItemIDs []string // IDs of items to compress into one artifact
+	Reason  string   // Why compression was triggered
+}
+
 // ReviewResult holds the outcome of an oracle review pass.
 type ReviewResult struct {
-	Promoted []core.ContextItem // Items recommended for promotion to Anchor
-	Demoted  []string           // Item IDs recommended for demotion or removal
-	Scores   map[string]int     // Score for each item, 0-100
-	Reason   string             // Human-readable explanation
+	Promoted   []core.ContextItem     // Items recommended for promotion to Anchor
+	Demoted    []string               // Item IDs recommended for demotion or removal
+	Compressed []CompressionCandidate // Groups of items recommended for compression
+	Scores     map[string]int         // Score for each item, 0-100
+	Reason     string                 // Human-readable explanation
 }
 
 // NewOracle creates an Oracle that reviews the given Manager's context.
@@ -47,6 +55,7 @@ func (o *Oracle) Review(goal string, recentObservations []core.Observation) Revi
 			obsWords[w] = true
 		}
 	}
+	hasObservations := len(obsWords) > 0
 
 	// Build insertion-order position map.
 	orderPos := make(map[string]int, len(order))
@@ -66,41 +75,65 @@ func (o *Oracle) Review(goal string, recentObservations []core.Observation) Revi
 	for _, item := range items {
 		isRecent := itemReferencedInObs(item, obsWords)
 		isOld := !item.Pinned && orderPos[item.ID] < oldThreshold && !isRecent
-		scores[item.ID] = computeOracleScore(item, goalWords, isRecent, isOld, windowTokens)
+		scores[item.ID] = computeOracleScore(item, goalWords, isRecent, isOld, windowTokens, hasObservations)
 	}
 
 	// Apply review thresholds.
+	//
+	// Thresholds:
+	//   score >= 60       → promote to anchor (if not already anchor/artifact)
+	//   score 5-9         → compress (marginal-activity items)
+	//   score < 5         → demote / remove (stale)
+	//   pinned items      → never demoted or compressed
+	//   score >= 70 items → explicitly excluded from compression
 	var promoted []core.ContextItem
 	var demoted []string
+	var compressible []core.ContextItem
+
 	for _, item := range items {
 		score := scores[item.ID]
 		switch {
 		case score >= 60 && item.Tier != core.TierAnchor && item.Tier != core.TierArtifact:
 			promoted = append(promoted, item)
-		case score < 20 && !item.Pinned:
+		case score < 5 && !item.Pinned:
 			demoted = append(demoted, item.ID)
+		case score >= 5 && score <= 9 && !item.Pinned && item.Tier == core.TierNear && score < 70:
+			compressible = append(compressible, item)
 		}
 	}
 
-	reason := buildOracleReason(promoted, demoted, scores)
+	// Build compression candidates from compressible items.
+	var compressed []CompressionCandidate
+	if len(compressible) > 0 {
+		ids := make([]string, len(compressible))
+		for i, item := range compressible {
+			ids[i] = item.ID
+		}
+		compressed = append(compressed, CompressionCandidate{
+			ItemIDs: ids,
+			Reason:  "low-activity near items with marginal value (score 5-9); compressing to save tokens",
+		})
+	}
+
+	reason := buildOracleReasonWithCompress(promoted, demoted, compressed, scores)
 
 	return ReviewResult{
-		Promoted: promoted,
-		Demoted:  demoted,
-		Scores:   scores,
-		Reason:   reason,
+		Promoted:   promoted,
+		Demoted:    demoted,
+		Compressed: compressed,
+		Scores:     scores,
+		Reason:     reason,
 	}
 }
 
-// RunOracleStep performs an oracle review and publishes results via the event
-// bus. Call this after tool executions to re-evaluate context placement.
+// RunOracleStep performs an oracle review, applies the recommended actions
+// (promotions, demotions, compressions), and publishes context updates via the
+// event bus when available. Actions are always applied; event publishing is
+// skipped when bus is nil. Call this after tool executions to re-evaluate
+// context placement.
 func RunOracleStep(manager *Manager, goal string, recentObservations []core.Observation, bus *core.Bus) ReviewResult {
 	oracle := NewOracle(manager)
 	result := oracle.Review(goal, recentObservations)
-
-	if bus == nil {
-		return result
-	}
 
 	// Apply promotions: update tier to Anchor.
 	for _, item := range result.Promoted {
@@ -108,7 +141,7 @@ func RunOracleStep(manager *Manager, goal string, recentObservations []core.Obse
 		promotedItem.Tier = core.TierAnchor
 		promotedItem.SelectionReason = "oracle promoted to anchor: " + result.Reason
 		snapshot, err := manager.Update(promotedItem)
-		if err == nil {
+		if err == nil && bus != nil {
 			publishContextUpdate(bus, snapshot)
 		}
 	}
@@ -116,7 +149,20 @@ func RunOracleStep(manager *Manager, goal string, recentObservations []core.Obse
 	// Apply demotions: remove the item.
 	for _, id := range result.Demoted {
 		snapshot, err := manager.Remove(id)
-		if err == nil {
+		if err == nil && bus != nil {
+			publishContextUpdate(bus, snapshot)
+		}
+	}
+
+	// Apply compressions: merge low-activity items into a single summary.
+	for _, candidate := range result.Compressed {
+		if len(candidate.ItemIDs) == 0 {
+			continue
+		}
+		// Build a summary from the source items' titles.
+		summary := oracleCompressionSummary(manager, candidate.ItemIDs)
+		_, snapshot, err := manager.CompressItems(candidate.ItemIDs, summary, candidate.Reason)
+		if err == nil && bus != nil {
 			publishContextUpdate(bus, snapshot)
 		}
 	}
@@ -124,9 +170,27 @@ func RunOracleStep(manager *Manager, goal string, recentObservations []core.Obse
 	return result
 }
 
+// oracleCompressionSummary builds a summary string from item titles.
+func oracleCompressionSummary(manager *Manager, ids []string) string {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+
+	titles := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if item, ok := manager.items[id]; ok {
+			title := item.Title
+			if title == "" {
+				title = item.ID
+			}
+			titles = append(titles, title)
+		}
+	}
+	return "Compressed context: " + strings.Join(titles, "; ")
+}
+
 // computeOracleScore calculates a relevance score (0-100) for a single
 // context item based on the specified rules.
-func computeOracleScore(item core.ContextItem, goalWords []string, isRecent, isOld bool, windowTokens int) int {
+func computeOracleScore(item core.ContextItem, goalWords []string, isRecent, isOld bool, windowTokens int, hasObservations bool) int {
 	score := 0
 
 	// Pinned items get a massive bonus and are never demoted.
@@ -147,9 +211,28 @@ func computeOracleScore(item core.ContextItem, goalWords []string, isRecent, isO
 		}
 	}
 
+	// Keyword overlap: +15 if any of the item's Keywords overlap with goal keywords.
+	if len(item.Keywords) > 0 {
+		kwSet := make(map[string]bool, len(item.Keywords))
+		for _, kw := range item.Keywords {
+			kwSet[strings.ToLower(kw)] = true
+		}
+		for _, w := range goalWords {
+			if kwSet[w] {
+				score += 15
+				break
+			}
+		}
+	}
+
 	// Recency bonus from observations.
 	if isRecent {
 		score += 25
+	}
+
+	// Recency decay: -10 if observations exist but item was not referenced and is not pinned.
+	if hasObservations && !isRecent && !item.Pinned {
+		score -= 10
 	}
 
 	// Staleness penalty.
@@ -205,7 +288,13 @@ func tokenize(text string) []string {
 // buildOracleReason produces a human-readable summary of the oracle's
 // decisions.
 func buildOracleReason(promoted []core.ContextItem, demoted []string, scores map[string]int) string {
-	parts := make([]string, 0, 3)
+	return buildOracleReasonWithCompress(promoted, demoted, nil, scores)
+}
+
+// buildOracleReasonWithCompress produces a human-readable summary including
+// compression decisions.
+func buildOracleReasonWithCompress(promoted []core.ContextItem, demoted []string, compressed []CompressionCandidate, scores map[string]int) string {
+	parts := make([]string, 0, 4)
 
 	if len(promoted) > 0 {
 		ids := make([]string, len(promoted))
@@ -223,8 +312,22 @@ func buildOracleReason(promoted []core.ContextItem, demoted []string, scores map
 		parts = append(parts, fmt.Sprintf("demoted %d item(s): %s", len(demoted), strings.Join(ids, ", ")))
 	}
 
+	if len(compressed) > 0 {
+		totalCompressed := 0
+		for _, c := range compressed {
+			totalCompressed += len(c.ItemIDs)
+		}
+		ids := make([]string, 0)
+		for _, c := range compressed {
+			for _, id := range c.ItemIDs {
+				ids = append(ids, fmt.Sprintf("%s(%d)", id, scores[id]))
+			}
+		}
+		parts = append(parts, fmt.Sprintf("compressed %d item(s): %s", totalCompressed, strings.Join(ids, ", ")))
+	}
+
 	if len(parts) == 0 {
-		return "oracle review complete; no promotions or demotions recommended"
+		return "oracle review complete; no promotions, demotions, or compressions recommended"
 	}
 	return strings.Join(parts, "; ")
 }
