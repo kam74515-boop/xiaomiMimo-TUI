@@ -30,8 +30,8 @@ type listDirTool struct {
 	baseTool
 }
 
-func NewListDirTool(workspace string, store *artifact.Store) core.Tool {
-	return listDirTool{baseTool: newBase("list_dir", workspace, store)}
+func NewListDirTool(workspace string, store *artifact.Store, s Summarizer) core.Tool {
+	return listDirTool{baseTool: newBase("list_dir", workspace, store, s)}
 }
 
 func (t listDirTool) Schema() core.JSONSchema {
@@ -99,6 +99,9 @@ func (t listDirTool) Run(ctx context.Context, input core.ToolInput) core.ToolRes
 }
 
 func (t listDirTool) Summarize(result core.ToolResult) core.Observation {
+	if t.summarizer != nil {
+		return t.summarizer.Summarize(result, BudgetSafe)
+	}
 	return summarizeResult("list_dir", result, core.TierArtifact)
 }
 
@@ -106,8 +109,8 @@ type gitDiffTool struct {
 	baseTool
 }
 
-func NewGitDiffTool(workspace string, store *artifact.Store) core.Tool {
-	return gitDiffTool{baseTool: newBase("git_diff", workspace, store)}
+func NewGitDiffTool(workspace string, store *artifact.Store, s Summarizer) core.Tool {
+	return gitDiffTool{baseTool: newBase("git_diff", workspace, store, s)}
 }
 
 func (t gitDiffTool) Schema() core.JSONSchema {
@@ -139,6 +142,9 @@ func (t gitDiffTool) Run(ctx context.Context, input core.ToolInput) core.ToolRes
 }
 
 func (t gitDiffTool) Summarize(result core.ToolResult) core.Observation {
+	if t.summarizer != nil {
+		return t.summarizer.Summarize(result, BudgetSafe)
+	}
 	return summarizeResult("git_diff", result, core.TierArtifact)
 }
 
@@ -146,8 +152,8 @@ type gitLogTool struct {
 	baseTool
 }
 
-func NewGitLogTool(workspace string, store *artifact.Store) core.Tool {
-	return gitLogTool{baseTool: newBase("git_log", workspace, store)}
+func NewGitLogTool(workspace string, store *artifact.Store, s Summarizer) core.Tool {
+	return gitLogTool{baseTool: newBase("git_log", workspace, store, s)}
 }
 
 func (t gitLogTool) Schema() core.JSONSchema {
@@ -173,6 +179,9 @@ func (t gitLogTool) Run(ctx context.Context, input core.ToolInput) core.ToolResu
 }
 
 func (t gitLogTool) Summarize(result core.ToolResult) core.Observation {
+	if t.summarizer != nil {
+		return t.summarizer.Summarize(result, BudgetSafe)
+	}
 	return summarizeResult("git_log", result, core.TierArtifact)
 }
 
@@ -180,8 +189,8 @@ type artifactReadTool struct {
 	baseTool
 }
 
-func NewArtifactReadTool(workspace string, store *artifact.Store) core.Tool {
-	return artifactReadTool{baseTool: newBase("artifact_read", workspace, store)}
+func NewArtifactReadTool(workspace string, store *artifact.Store, s Summarizer) core.Tool {
+	return artifactReadTool{baseTool: newBase("artifact_read", workspace, store, s)}
 }
 
 func (t artifactReadTool) Schema() core.JSONSchema {
@@ -238,6 +247,9 @@ func (t artifactReadTool) Run(ctx context.Context, input core.ToolInput) core.To
 }
 
 func (t artifactReadTool) Summarize(result core.ToolResult) core.Observation {
+	if t.summarizer != nil {
+		return t.summarizer.Summarize(result, BudgetSafe)
+	}
 	placement := core.TierNear
 	state := "small artifact payloads summarized"
 	if strings.Contains(result.Content, "large_files=") {

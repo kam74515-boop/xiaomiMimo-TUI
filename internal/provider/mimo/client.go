@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"mimo-tui/internal/config"
 	"mimo-tui/internal/core"
@@ -45,7 +47,13 @@ func New(cfg config.ProviderConfig) *Client {
 		apiKey:  strings.TrimSpace(cfg.APIKey),
 		model:   model,
 		mock:    cfg.Mock || strings.TrimSpace(cfg.APIKey) == "",
-		http:    http.DefaultClient,
+		http: &http.Client{
+			Transport: &http.Transport{
+				DialContext:         (&net.Dialer{Timeout: 30 * time.Second}).DialContext,
+				TLSHandshakeTimeout: 10 * time.Second,
+			},
+			Timeout: 0,
+		},
 	}
 }
 
@@ -79,29 +87,20 @@ func (c *Client) ChatStream(ctx context.Context, req core.ChatRequest) (<-chan c
 	if err != nil {
 		return nil, fmt.Errorf("mimo: encode chat request: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(), bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("mimo: build chat request: %w", err)
-	}
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-		httpReq.Header.Set("api-key", c.apiKey)
-	}
 
 	out := make(chan core.ModelEvent, 8)
 	go func() {
 		defer close(out)
-		resp, err := c.http.Do(httpReq)
+		resp, err := c.doWithRetry(ctx, body)
 		if err != nil {
-			sendModelEvent(ctx, out, core.ModelEvent{Err: fmt.Errorf("mimo: chat stream request: %w", err)})
+			sendModelEvent(ctx, out, core.ModelEvent{Err: err})
 			return
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-			sendModelEvent(ctx, out, core.ModelEvent{Err: fmt.Errorf("mimo: chat completions returned %s: %s", resp.Status, readErrorBody(resp.Body))})
+			retryAfter := resp.Header.Get("Retry-After")
+			sendModelEvent(ctx, out, core.ModelEvent{Err: formatHTTPError(resp.StatusCode, retryAfter, readErrorBody(resp.Body))})
 			return
 		}
 
@@ -402,4 +401,121 @@ func readErrorBody(r io.Reader) string {
 		return parseStreamError(apiErr.Error)
 	}
 	return text
+}
+
+// retryableStatusCodes lists HTTP status codes that trigger a retry.
+var retryableStatusCodes = map[int]bool{
+	http.StatusTooManyRequests:    true,
+	http.StatusBadGateway:         true,
+	http.StatusServiceUnavailable: true,
+	http.StatusGatewayTimeout:     true,
+}
+
+// isRetryableStatusCode reports whether the HTTP status code should be retried.
+func isRetryableStatusCode(code int) bool {
+	return retryableStatusCodes[code]
+}
+
+// doWithRetry performs the HTTP request with retry and backoff for transient errors.
+// It retries on 429, 502, 503, 504 with backoffs of 1s, 2s, 4s (max 3 retries).
+// When retries are exhausted, it returns nil and a formatted error based on the
+// last response's status code and body.
+func (c *Client) doWithRetry(ctx context.Context, body []byte) (*http.Response, error) {
+	backoffs := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
+	var lastStatus int
+	var lastRetryAfter string
+	var lastBodyText string
+
+	for attempt := 0; attempt <= len(backoffs); attempt++ {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(), bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("mimo: build chat request: %w", err)
+		}
+		httpReq.Header.Set("Accept", "text/event-stream")
+		httpReq.Header.Set("Content-Type", "application/json")
+		if c.apiKey != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+			httpReq.Header.Set("api-key", c.apiKey)
+		}
+
+		resp, err := c.http.Do(httpReq)
+		if err != nil {
+			return nil, wrapConnectionError(err, c.endpoint())
+		}
+
+		if !isRetryableStatusCode(resp.StatusCode) {
+			return resp, nil
+		}
+
+		// Capture error info from this response for potential later use.
+		lastStatus = resp.StatusCode
+		lastRetryAfter = resp.Header.Get("Retry-After")
+		lastBodyText = readErrorBody(resp.Body)
+		resp.Body.Close()
+
+		if attempt < len(backoffs) {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoffs[attempt]):
+			}
+		}
+	}
+
+	return nil, formatHTTPError(lastStatus, lastRetryAfter, lastBodyText)
+}
+
+// wrapConnectionError produces a descriptive error for network-level failures.
+func wrapConnectionError(err error, url string) error {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return fmt.Errorf("mimo: Cannot reach MiMo API at %s: %w", url, err)
+	}
+	return fmt.Errorf("mimo: chat stream request: %w", err)
+}
+
+// formatHTTPError produces a structured, user-friendly error for HTTP status codes.
+func formatHTTPError(statusCode int, retryAfter string, body string) error {
+	switch {
+	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
+		if body != "" {
+			return fmt.Errorf("mimo: MiMo API authentication failed. Check MIMO_API_KEY. (status %d: %s)", statusCode, body)
+		}
+		return fmt.Errorf("mimo: MiMo API authentication failed. Check MIMO_API_KEY. (status %d)", statusCode)
+	case statusCode == http.StatusTooManyRequests:
+		if retryAfter != "" {
+			return fmt.Errorf("mimo: MiMo API rate limit exceeded (status %d: %s; Retry-After: %s)", statusCode, body, retryAfter)
+		}
+		return fmt.Errorf("mimo: MiMo API rate limit exceeded (status %d: %s)", statusCode, body)
+	case statusCode == http.StatusBadGateway ||
+		statusCode == http.StatusServiceUnavailable ||
+		statusCode == http.StatusGatewayTimeout:
+		return fmt.Errorf("mimo: MiMo API temporarily unavailable (status %d: %s)", statusCode, body)
+	default:
+		return fmt.Errorf("mimo: chat completions returned %d: %s", statusCode, body)
+	}
+}
+
+// HealthCheck sends a minimal request to verify the API is reachable.
+// Returns nil if the server responds (any status), or an error if unreachable.
+func (c *Client) HealthCheck(ctx context.Context) error {
+	if c.mock {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	baseURL := strings.TrimRight(c.baseURL, "/")
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/health", nil)
+	if err != nil {
+		return fmt.Errorf("mimo: health check request: %w", err)
+	}
+
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		return wrapConnectionError(err, baseURL+"/health")
+	}
+	defer resp.Body.Close()
+	return nil
 }

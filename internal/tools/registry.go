@@ -16,28 +16,45 @@ func NewRegistry() *Registry {
 	return &Registry{tools: map[string]core.Tool{}}
 }
 
-func NewDefaultRegistry(workspace string) *Registry {
+// NewDefaultRegistry creates a Registry pre-populated with all built-in tools.
+// An optional factory function may be passed to create budget-aware summarizers.
+// The factory receives the artifact store so summarizers can read raw payloads.
+// If no factory is provided, each tool falls back to a basic summarizer that
+// echoes the raw result content.
+func NewDefaultRegistry(workspace string, factory ...func(*artifact.Store) map[string]Summarizer) *Registry {
 	store := artifact.NewStore(workspace)
+	var summarizerMap map[string]Summarizer
+	if len(factory) > 0 && factory[0] != nil {
+		summarizerMap = factory[0](store)
+	}
 	registry := NewRegistry()
-	for _, tool := range Builtins(workspace, store) {
+	for _, tool := range Builtins(workspace, store, summarizerMap) {
 		_ = registry.Register(tool)
 	}
 	return registry
 }
 
-func Builtins(workspace string, store *artifact.Store) []core.Tool {
+// Builtins returns a slice of all built-in tools. An optional summarizer map
+// wires each tool to a budget-aware summarizer.
+func Builtins(workspace string, store *artifact.Store, summarizers map[string]Summarizer) []core.Tool {
+	s := func(name string) Summarizer {
+		if summarizers == nil {
+			return nil
+		}
+		return summarizers[name]
+	}
 	return []core.Tool{
-		NewShellTool(workspace, store),
-		NewRGTool(workspace, store),
-		NewReadFileTool(workspace, store),
-		NewListDirTool(workspace, store),
-		NewGitDiffTool(workspace, store),
-		NewGitLogTool(workspace, store),
-		NewArtifactReadTool(workspace, store),
-		NewWriteFileTool(workspace, store),
-		NewApplyPatchTool(workspace, store),
-		NewGitStatusTool(workspace, store),
-		NewRunTestTool(workspace, store),
+		NewShellTool(workspace, store, s("shell")),
+		NewRGTool(workspace, store, s("rg")),
+		NewReadFileTool(workspace, store, s("read_file")),
+		NewListDirTool(workspace, store, s("list_dir")),
+		NewGitDiffTool(workspace, store, s("git_diff")),
+		NewGitLogTool(workspace, store, s("git_log")),
+		NewArtifactReadTool(workspace, store, s("artifact_read")),
+		NewWriteFileTool(workspace, store, s("write_file")),
+		NewApplyPatchTool(workspace, store, s("apply_patch")),
+		NewGitStatusTool(workspace, store, s("git_status")),
+		NewRunTestTool(workspace, store, s("run_test")),
 	}
 }
 

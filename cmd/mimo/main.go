@@ -20,6 +20,7 @@ import (
 	"mimo-tui/internal/replay"
 	sessionlog "mimo-tui/internal/session"
 	"mimo-tui/internal/tools"
+	"mimo-tui/internal/tools/summarizers"
 	"mimo-tui/internal/tui"
 )
 
@@ -46,6 +47,26 @@ func main() {
 	if opts.workspace != "" {
 		cfg.Runtime.Workspace = opts.workspace
 	}
+
+	// ----- golden session marking -----
+	if opts.goldenSession != "" && opts.modelAccept == "" {
+		if err := runGoldenMark(cfg, opts); err != nil {
+			fmt.Fprintf(os.Stderr, "golden: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("golden: session %q marked as golden\n", opts.goldenSession)
+		return
+	}
+
+	// ----- model acceptance via replay gate -----
+	if opts.modelAccept != "" {
+		if err := runGateAccept(cfg, opts, registry); err != nil {
+			fmt.Fprintf(os.Stderr, "gate: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if opts.sessionID == "" {
 		opts.sessionID = newSessionID()
 	}
@@ -74,14 +95,17 @@ func main() {
 }
 
 type cliOptions struct {
-	smoke        bool
-	smokeTimeout time.Duration
-	workspace    string
-	sessionID    string
-	resumeLatest bool
-	eval         bool
-	evalSession  string
-	listModels   bool
+	smoke            bool
+	smokeTimeout     time.Duration
+	workspace        string
+	sessionID        string
+	resumeLatest     bool
+	eval             bool
+	evalSession      string
+	listModels       bool
+	goldenSession    string
+	modelAccept      string
+	candidateSession string
 }
 
 func parseFlags() cliOptions {
@@ -94,6 +118,9 @@ func parseFlags() cliOptions {
 	flag.BoolVar(&opts.eval, "eval", false, "extract and compare trajectories from session logs")
 	flag.StringVar(&opts.evalSession, "eval-session", "", "session ID to evaluate (default: latest)")
 	flag.BoolVar(&opts.listModels, "list-models", false, "print all registered models and exit")
+	flag.StringVar(&opts.goldenSession, "golden-session", "", "mark a session as golden")
+	flag.StringVar(&opts.modelAccept, "model-accept", "", "accept a candidate model if the replay gate passes")
+	flag.StringVar(&opts.candidateSession, "candidate-session", "", "candidate session to evaluate against the golden session")
 	flag.Parse()
 	return opts
 }
@@ -264,7 +291,7 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 			}
 		}()
 
-		toolRegistry := tools.NewDefaultRegistry(cfg.Runtime.Workspace)
+		toolRegistry := tools.NewDefaultRegistry(cfg.Runtime.Workspace, summarizers.NewRegistry)
 		approvalCh := make(chan core.ApprovalRequest, 8)
 		defer close(approvalCh)
 		executor := tools.NewExecutor(toolRegistry, bus, tools.WithApprovalChannel(approvalCh))
@@ -399,6 +426,79 @@ func publishObservation(observation core.Observation, bus *core.Bus) {
 	event := core.NewEvent(core.EventObservation)
 	event.Observation = &observation
 	bus.Publish(event)
+}
+
+// runGoldenMark marks the session specified by -golden-session as a golden
+// session by copying it into .mimo/golden/.
+func runGoldenMark(cfg config.Config, opts cliOptions) error {
+	workspace := cfg.Runtime.Workspace
+	desc := fmt.Sprintf("golden session %s", opts.goldenSession)
+	return eval.MarkGolden(workspace, opts.goldenSession, desc)
+}
+
+// runGateAccept evaluates a candidate session against a golden session and
+// promotes the candidate model if the replay gate passes.
+func runGateAccept(cfg config.Config, opts cliOptions, registry *model.Registry) error {
+	workspace := cfg.Runtime.Workspace
+
+	// Validate flags.
+	goldenID := strings.TrimSpace(opts.goldenSession)
+	candidateID := strings.TrimSpace(opts.candidateSession)
+	modelID := strings.TrimSpace(opts.modelAccept)
+
+	if goldenID == "" {
+		return fmt.Errorf("-golden-session is required for gate evaluation")
+	}
+	if candidateID == "" {
+		return fmt.Errorf("-candidate-session is required for gate evaluation")
+	}
+	if modelID == "" {
+		return fmt.Errorf("-model-accept is required")
+	}
+
+	// Load golden events.
+	goldenEvents, err := eval.LoadGolden(workspace, goldenID)
+	if err != nil {
+		return fmt.Errorf("load golden session %q: %w", goldenID, err)
+	}
+	if len(goldenEvents) == 0 {
+		return fmt.Errorf("golden session %q is empty", goldenID)
+	}
+
+	// Load candidate events.
+	candidateEvents, err := replay.Read(workspace, candidateID)
+	if err != nil {
+		return fmt.Errorf("load candidate session %q: %w", candidateID, err)
+	}
+	if len(candidateEvents) == 0 {
+		return fmt.Errorf("candidate session %q is empty", candidateID)
+	}
+
+	// Evaluate.
+	result := eval.EvaluateCandidate(goldenEvents, candidateEvents)
+
+	fmt.Printf("Gate Result for model %q:\n", modelID)
+	fmt.Printf("  Passed: %t\n", result.Passed)
+	fmt.Printf("  Score: %.2f\n", result.Score)
+	fmt.Printf("  ToolMatchRate: %.2f\n", result.ToolMatchRate)
+	fmt.Printf("  TrajectorySimilarity: %.2f\n", result.TrajectorySimilarity)
+	if len(result.Failures) > 0 {
+		fmt.Println("  Failures:")
+		for _, f := range result.Failures {
+			fmt.Printf("    - %s\n", f)
+		}
+	}
+
+	if !result.Passed {
+		return fmt.Errorf("replay gate NOT passed for model %q — candidate not promoted", modelID)
+	}
+
+	// Promote the candidate model.
+	if err := registry.AcceptCandidate(modelID); err != nil {
+		return fmt.Errorf("accept candidate model %q: %w", modelID, err)
+	}
+	fmt.Printf("Model %q promoted to default channel.\n", modelID)
+	return nil
 }
 
 func runEval(cfg config.Config, opts cliOptions) error {

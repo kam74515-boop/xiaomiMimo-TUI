@@ -139,7 +139,7 @@ func TestArtifactReadSummarizesSmallPayloadsAndKeepsLargeRawOutputOut(t *testing
 		t.Fatal(err)
 	}
 
-	tool := NewArtifactReadTool(workspace, store)
+	tool := NewArtifactReadTool(workspace, store, nil)
 	result := tool.Run(context.Background(), core.ToolInput{"artifact_id": record.ID})
 	if result.ExitCode != 0 {
 		t.Fatalf("artifact_read failed: %+v", result)

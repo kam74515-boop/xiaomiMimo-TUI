@@ -246,6 +246,284 @@ func writeSSEChunk(t *testing.T, w http.ResponseWriter, chunk any) {
 	fmt.Fprintf(w, "data: %s\n\n", data)
 }
 
+func TestClientHandles401(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":{"message":"invalid api key"}}`))
+	}))
+	defer server.Close()
+
+	client := New(config.ProviderConfig{
+		BaseURL: server.URL,
+		APIKey:  "bad-key",
+		Model:   "mimo-test",
+	})
+
+	events, err := client.ChatStream(context.Background(), core.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatStream returned error: %v", err)
+	}
+
+	var gotErr error
+	for _, event := range collectModelEvents(t, events) {
+		if event.Err != nil {
+			gotErr = event.Err
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("expected an error for 401 response")
+	}
+	if !strings.Contains(gotErr.Error(), "MiMo API authentication failed") {
+		t.Fatalf("error = %q, want authentication failed message", gotErr.Error())
+	}
+	if !strings.Contains(gotErr.Error(), "Check MIMO_API_KEY") {
+		t.Fatalf("error = %q, want hint to check MIMO_API_KEY", gotErr.Error())
+	}
+}
+
+func TestClientHandles429(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte("rate limit exceeded"))
+	}))
+	defer server.Close()
+
+	client := New(config.ProviderConfig{
+		BaseURL: server.URL,
+		APIKey:  "key",
+		Model:   "mimo-test",
+	})
+
+	events, err := client.ChatStream(context.Background(), core.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatStream returned error: %v", err)
+	}
+
+	var gotErr error
+	for _, event := range collectModelEvents(t, events) {
+		if event.Err != nil {
+			gotErr = event.Err
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("expected an error for 429 response")
+	}
+	if !strings.Contains(gotErr.Error(), "MiMo API rate limit exceeded") {
+		t.Fatalf("error = %q, want rate limit message", gotErr.Error())
+	}
+	if !strings.Contains(gotErr.Error(), "Retry-After: 30") {
+		t.Fatalf("error = %q, want Retry-After info", gotErr.Error())
+	}
+}
+
+func TestClientHandles5xx(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		w.Write([]byte("upstream error"))
+	}))
+	defer server.Close()
+
+	client := New(config.ProviderConfig{
+		BaseURL: server.URL,
+		APIKey:  "key",
+		Model:   "mimo-test",
+	})
+
+	events, err := client.ChatStream(context.Background(), core.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatStream returned error: %v", err)
+	}
+
+	var gotErr error
+	for _, event := range collectModelEvents(t, events) {
+		if event.Err != nil {
+			gotErr = event.Err
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("expected an error for 502 response")
+	}
+	if !strings.Contains(gotErr.Error(), "MiMo API temporarily unavailable") {
+		t.Fatalf("error = %q, want temporarily unavailable message", gotErr.Error())
+	}
+}
+
+func TestClientRetriesOn502(t *testing.T) {
+	var requestCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if requestCount < 3 {
+			w.WriteHeader(http.StatusBadGateway)
+			w.Write([]byte("upstream error"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	client := New(config.ProviderConfig{
+		BaseURL: server.URL,
+		APIKey:  "key",
+		Model:   "mimo-test",
+	})
+
+	events, err := client.ChatStream(context.Background(), core.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatStream returned error: %v", err)
+	}
+
+	var content string
+	done := false
+	for _, event := range collectModelEvents(t, events) {
+		if event.Err != nil {
+			t.Fatalf("unexpected model error: %v", event.Err)
+		}
+		content += event.Delta
+		if event.Done {
+			done = true
+		}
+	}
+
+	if requestCount < 2 {
+		t.Fatalf("request count = %d, want at least 2 (retry occurred)", requestCount)
+	}
+	if content != "ok" {
+		t.Fatalf("content = %q, want ok", content)
+	}
+	if !done {
+		t.Fatal("missing done event")
+	}
+}
+
+func TestClientDoesNotRetryOn401(t *testing.T) {
+	var requestCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":{"message":"unauthorized"}}`))
+	}))
+	defer server.Close()
+
+	client := New(config.ProviderConfig{
+		BaseURL: server.URL,
+		APIKey:  "bad-key",
+		Model:   "mimo-test",
+	})
+
+	events, err := client.ChatStream(context.Background(), core.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatStream returned error: %v", err)
+	}
+
+	var gotErr error
+	for _, event := range collectModelEvents(t, events) {
+		if event.Err != nil {
+			gotErr = event.Err
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("expected an error for 401 response")
+	}
+	if requestCount != 1 {
+		t.Fatalf("request count = %d, want 1 (no retry on 401)", requestCount)
+	}
+}
+
+func TestClientConnectionRefused(t *testing.T) {
+	// Use a closed server to simulate connection refused.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	serverURL := server.URL
+	server.Close() // immediately close to cause connection refused
+
+	client := New(config.ProviderConfig{
+		BaseURL: serverURL,
+		APIKey:  "key",
+		Model:   "mimo-test",
+	})
+
+	events, err := client.ChatStream(context.Background(), core.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatStream returned error: %v", err)
+	}
+
+	var gotErr error
+	for _, event := range collectModelEvents(t, events) {
+		if event.Err != nil {
+			gotErr = event.Err
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("expected an error for connection refused")
+	}
+	if !strings.Contains(gotErr.Error(), "Cannot reach MiMo API at") {
+		t.Fatalf("error = %q, want 'Cannot reach MiMo API at' message", gotErr.Error())
+	}
+}
+
+func TestHealthCheckReturnsNilWhenReachable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := New(config.ProviderConfig{
+		BaseURL: server.URL,
+		APIKey:  "key",
+		Model:   "mimo-test",
+	})
+
+	if err := client.HealthCheck(context.Background()); err != nil {
+		t.Fatalf("HealthCheck returned error for reachable server: %v", err)
+	}
+}
+
+func TestHealthCheckReturnsNilEvenWithErrorStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := New(config.ProviderConfig{
+		BaseURL: server.URL,
+		APIKey:  "key",
+		Model:   "mimo-test",
+	})
+
+	if err := client.HealthCheck(context.Background()); err != nil {
+		t.Fatalf("HealthCheck should return nil even on error status, got: %v", err)
+	}
+}
+
+func TestHealthCheckReturnsErrorWhenUnreachable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	serverURL := server.URL
+	server.Close()
+
+	client := New(config.ProviderConfig{
+		BaseURL: serverURL,
+		APIKey:  "key",
+		Model:   "mimo-test",
+	})
+
+	err := client.HealthCheck(context.Background())
+	if err == nil {
+		t.Fatal("HealthCheck should return error for unreachable server")
+	}
+	if !strings.Contains(err.Error(), "Cannot reach MiMo API at") {
+		t.Fatalf("error = %q, want 'Cannot reach MiMo API at' message", err.Error())
+	}
+}
+
+func TestHealthCheckMockReturnsNil(t *testing.T) {
+	client := NewMock("mimo-test")
+	if err := client.HealthCheck(context.Background()); err != nil {
+		t.Fatalf("HealthCheck on mock client returned error: %v", err)
+	}
+}
+
 func collectModelEvents(t *testing.T, events <-chan core.ModelEvent) []core.ModelEvent {
 	t.Helper()
 	var got []core.ModelEvent
@@ -256,7 +534,7 @@ func collectModelEvents(t *testing.T, events <-chan core.ModelEvent) []core.Mode
 				return got
 			}
 			got = append(got, event)
-		case <-time.After(time.Second):
+		case <-time.After(15 * time.Second):
 			t.Fatal("timed out waiting for model events")
 		}
 	}

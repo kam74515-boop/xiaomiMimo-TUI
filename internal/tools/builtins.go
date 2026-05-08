@@ -16,9 +16,10 @@ import (
 )
 
 type baseTool struct {
-	name      string
-	workspace string
-	store     *artifact.Store
+	name       string
+	workspace  string
+	store      *artifact.Store
+	summarizer Summarizer
 }
 
 func (t baseTool) Name() string {
@@ -51,8 +52,8 @@ type shellTool struct {
 	baseTool
 }
 
-func NewShellTool(workspace string, store *artifact.Store) core.Tool {
-	return shellTool{baseTool: newBase("shell", workspace, store)}
+func NewShellTool(workspace string, store *artifact.Store, s Summarizer) core.Tool {
+	return shellTool{baseTool: newBase("shell", workspace, store, s)}
 }
 
 func (t shellTool) Schema() core.JSONSchema {
@@ -74,6 +75,9 @@ func (t shellTool) Run(ctx context.Context, input core.ToolInput) core.ToolResul
 }
 
 func (t shellTool) Summarize(result core.ToolResult) core.Observation {
+	if t.summarizer != nil {
+		return t.summarizer.Summarize(result, BudgetSafe)
+	}
 	return summarizeResult("shell", result, core.TierArtifact)
 }
 
@@ -111,8 +115,8 @@ type rgTool struct {
 	baseTool
 }
 
-func NewRGTool(workspace string, store *artifact.Store) core.Tool {
-	return rgTool{baseTool: newBase("rg", workspace, store)}
+func NewRGTool(workspace string, store *artifact.Store, s Summarizer) core.Tool {
+	return rgTool{baseTool: newBase("rg", workspace, store, s)}
 }
 
 func (t rgTool) Schema() core.JSONSchema {
@@ -167,6 +171,9 @@ func (t rgTool) Run(ctx context.Context, input core.ToolInput) core.ToolResult {
 }
 
 func (t rgTool) Summarize(result core.ToolResult) core.Observation {
+	if t.summarizer != nil {
+		return t.summarizer.Summarize(result, BudgetSafe)
+	}
 	return summarizeResult("rg", result, core.TierArtifact)
 }
 
@@ -174,8 +181,8 @@ type readFileTool struct {
 	baseTool
 }
 
-func NewReadFileTool(workspace string, store *artifact.Store) core.Tool {
-	return readFileTool{baseTool: newBase("read_file", workspace, store)}
+func NewReadFileTool(workspace string, store *artifact.Store, s Summarizer) core.Tool {
+	return readFileTool{baseTool: newBase("read_file", workspace, store, s)}
 }
 
 func (t readFileTool) Schema() core.JSONSchema {
@@ -215,6 +222,9 @@ func (t readFileTool) Run(ctx context.Context, input core.ToolInput) core.ToolRe
 }
 
 func (t readFileTool) Summarize(result core.ToolResult) core.Observation {
+	if t.summarizer != nil {
+		return t.summarizer.Summarize(result, BudgetSafe)
+	}
 	return summarizeResult("read_file", result, core.TierArtifact)
 }
 
@@ -222,8 +232,8 @@ type writeFileTool struct {
 	baseTool
 }
 
-func NewWriteFileTool(workspace string, store *artifact.Store) core.Tool {
-	return writeFileTool{baseTool: newBase("write_file", workspace, store)}
+func NewWriteFileTool(workspace string, store *artifact.Store, s Summarizer) core.Tool {
+	return writeFileTool{baseTool: newBase("write_file", workspace, store, s)}
 }
 
 func (t writeFileTool) Schema() core.JSONSchema {
@@ -267,6 +277,9 @@ func (t writeFileTool) Run(ctx context.Context, input core.ToolInput) core.ToolR
 }
 
 func (t writeFileTool) Summarize(result core.ToolResult) core.Observation {
+	if t.summarizer != nil {
+		return t.summarizer.Summarize(result, BudgetSafe)
+	}
 	return summarizeResult("write_file", result, core.TierArtifact)
 }
 
@@ -274,8 +287,8 @@ type applyPatchTool struct {
 	baseTool
 }
 
-func NewApplyPatchTool(workspace string, store *artifact.Store) core.Tool {
-	return applyPatchTool{baseTool: newBase("apply_patch", workspace, store)}
+func NewApplyPatchTool(workspace string, store *artifact.Store, s Summarizer) core.Tool {
+	return applyPatchTool{baseTool: newBase("apply_patch", workspace, store, s)}
 }
 
 func (t applyPatchTool) Schema() core.JSONSchema {
@@ -326,6 +339,9 @@ func (t applyPatchTool) Run(ctx context.Context, input core.ToolInput) core.Tool
 }
 
 func (t applyPatchTool) Summarize(result core.ToolResult) core.Observation {
+	if t.summarizer != nil {
+		return t.summarizer.Summarize(result, BudgetSafe)
+	}
 	return summarizeResult("apply_patch", result, core.TierArtifact)
 }
 
@@ -333,8 +349,8 @@ type gitStatusTool struct {
 	baseTool
 }
 
-func NewGitStatusTool(workspace string, store *artifact.Store) core.Tool {
-	return gitStatusTool{baseTool: newBase("git_status", workspace, store)}
+func NewGitStatusTool(workspace string, store *artifact.Store, s Summarizer) core.Tool {
+	return gitStatusTool{baseTool: newBase("git_status", workspace, store, s)}
 }
 
 func (t gitStatusTool) Schema() core.JSONSchema {
@@ -377,6 +393,9 @@ func (t gitStatusTool) Run(ctx context.Context, input core.ToolInput) core.ToolR
 }
 
 func (t gitStatusTool) Summarize(result core.ToolResult) core.Observation {
+	if t.summarizer != nil {
+		return t.summarizer.Summarize(result, BudgetSafe)
+	}
 	return summarizeResult("git_status", result, core.TierArtifact)
 }
 
@@ -384,8 +403,8 @@ type runTestTool struct {
 	baseTool
 }
 
-func NewRunTestTool(workspace string, store *artifact.Store) core.Tool {
-	return runTestTool{baseTool: newBase("run_test", workspace, store)}
+func NewRunTestTool(workspace string, store *artifact.Store, s Summarizer) core.Tool {
+	return runTestTool{baseTool: newBase("run_test", workspace, store, s)}
 }
 
 func (t runTestTool) Schema() core.JSONSchema {
@@ -407,14 +426,17 @@ func (t runTestTool) Run(ctx context.Context, input core.ToolInput) core.ToolRes
 }
 
 func (t runTestTool) Summarize(result core.ToolResult) core.Observation {
+	if t.summarizer != nil {
+		return t.summarizer.Summarize(result, BudgetSafe)
+	}
 	return summarizeResult("run_test", result, core.TierArtifact)
 }
 
-func newBase(name, workspace string, store *artifact.Store) baseTool {
+func newBase(name, workspace string, store *artifact.Store, s Summarizer) baseTool {
 	if workspace == "" {
 		workspace = "."
 	}
-	return baseTool{name: name, workspace: workspace, store: store}
+	return baseTool{name: name, workspace: workspace, store: store, summarizer: s}
 }
 
 func objectSchema(description string, properties map[string]any) core.JSONSchema {
