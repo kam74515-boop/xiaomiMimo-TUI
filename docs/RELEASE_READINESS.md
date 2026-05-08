@@ -81,7 +81,7 @@ Each item is rated PASS, FAIL, or PARTIAL with evidence.
 | `-list-models` flag | PASS | Prints registered models and exits. |
 | Replay gate | PASS | `eval.EvaluateCandidate` compares candidate trajectory against golden session. |
 | `-model-accept` workflow | PASS | Requires `-golden-session` and `-candidate-session`; promotes model only if gate passes. |
-| Model persistence across restarts | PARTIAL | Registry changes via `-model-accept` are in-memory only. Config file persistence is a known gap (listed in KNOWN_LIMITATIONS.md). |
+| Model persistence across restarts | PASS | `config.SaveModelsConfig()` writes to `.mimo/models.toml` on `-model-accept`; `LoadModelsConfig()` reads it on startup. KNOWN_LIMITATIONS.md is outdated on this point. |
 
 ## Trust UI
 
@@ -95,7 +95,7 @@ Each item is rated PASS, FAIL, or PARTIAL with evidence.
 
 | Item | Status | Evidence |
 |------|--------|----------|
-| Secret redaction in shell output | PASS | `redactSecrets()` redacts API keys, tokens, bearer tokens from stdout/stderr before artifact storage. |
+| Secret redaction in shell output | PARTIAL | `redactSecrets()` redacts secrets from `shell` and `run_test` stdout/stderr. However, `rg`, `git_diff`, `git_log`, `read_file`, and `list_dir` store raw bytes without redaction. See P1-1 in blocker report. |
 | Input redaction for large payloads | PASS | `redactInput()` replaces `content` and `patch` fields with byte counts. |
 | Shell risk detection | PASS | Destructive commands flagged as `SafetyDestructive`; mutation commands as `SafetyShellMutation`. |
 
@@ -136,7 +136,7 @@ Each item is rated PASS, FAIL, or PARTIAL with evidence.
 | README with architecture, flags, controls | PASS | Comprehensive README.md with Mermaid diagram, CLI flags, TUI controls. |
 | Release readiness doc | PASS | This document. |
 | Known limitations doc | PASS | `docs/KNOWN_LIMITATIONS.md`. |
-| Quickstart doc | PASS | `docs/QUICKSTART.md`. |
+| Quickstart doc | PARTIAL | `docs/QUICKSTART.md` has minor inconsistencies: env var default URL mismatch, missing Ctrl+C/Ctrl+G keybindings, policy path ordering unclear. |
 | Configuration reference | PASS | `docs/CONFIGURATION.md`. |
 | Existing design docs | PASS | `docs/` contains ARCHITECTURE.md, AGENT_CONTRACTS.md, EVALS.md, CLEAN_ROOM.md, etc. |
 
@@ -163,17 +163,23 @@ Each item is rated PASS, FAIL, or PARTIAL with evidence.
 | Rollback | 3 | 0 | 0 |
 | Session Resume | 4 | 0 | 0 |
 | Context Management | 5 | 0 | 0 |
-| Model Governance | 6 | 1 | 0 |
+| Model Governance | 7 | 0 | 0 |
 | Trust UI | 3 | 0 | 0 |
-| Safety | 3 | 0 | 0 |
+| Safety | 2 | 1 | 0 |
 | Benchmark | 3 | 0 | 0 |
 | Endurance | 2 | 0 | 0 |
 | Context Pressure | 2 | 0 | 0 |
 | Real MiMo API | 3 | 0 | 0 |
-| Documentation | 6 | 0 | 0 |
+| Documentation | 5 | 1 | 0 |
 | No API Key Leakage | 4 | 0 | 0 |
-| **Total** | **59** | **1** | **0** |
+| **Total** | **58** | **2** | **0** |
 
-**Overall: PASS with one partial item** (model persistence across restarts).
+**Overall: PASS with two partial items.**
 
-The 1.0 RC is release-ready. The single partial item (model registry persistence) is documented as a known limitation and does not block the release.
+Partial items:
+1. **Safety (Redaction):** `rg`, `git_diff`, `git_log`, `read_file` do not redact secrets from artifact storage. Should fix before 1.0 (P1-1 in blocker report).
+2. **Documentation (Quickstart):** Minor URL and keybinding inconsistencies. Non-blocking but should fix (P1-2, P2-1, P2-2 in blocker report).
+
+No P0 blockers found. See `docs/RELEASE_BLOCKER_REPORT.md` for the full audit.
+
+The known limitation about model persistence has been resolved: `config.SaveModelsConfig()` and `LoadModelsConfig()` implement persistence to `.mimo/models.toml`. KNOWN_LIMITATIONS.md is outdated on this point.

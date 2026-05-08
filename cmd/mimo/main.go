@@ -28,6 +28,11 @@ import (
 func main() {
 	opts := parseFlags()
 
+	if opts.showVersion {
+		fmt.Printf("MiMo-TUI %s\n", version)
+		return
+	}
+
 	// ----- model registry (persisted) -----
 	registry, err := config.LoadModelsConfig()
 	if err != nil {
@@ -122,6 +127,10 @@ func main() {
 	}
 }
 
+// version is set at build time via -ldflags "-X main.version=...".
+// The default value is used when running from source.
+var version = "1.0-rc"
+
 type cliOptions struct {
 	smoke            bool
 	smokeTimeout     time.Duration
@@ -138,6 +147,7 @@ type cliOptions struct {
 	rollbackShow     string
 	rollbackApply    string
 	rollbackConfirm  bool
+	showVersion      bool
 }
 
 func parseFlags() cliOptions {
@@ -157,6 +167,7 @@ func parseFlags() cliOptions {
 	flag.StringVar(&opts.rollbackShow, "rollback-show", "", "show what a rollback artifact will restore")
 	flag.StringVar(&opts.rollbackApply, "rollback-apply", "", "apply a rollback artifact (dry-run by default, use -rollback-confirm to commit)")
 	flag.BoolVar(&opts.rollbackConfirm, "rollback-confirm", false, "confirm actual rollback apply (required with -rollback-apply)")
+	flag.BoolVar(&opts.showVersion, "version", false, "print version and exit")
 	flag.Parse()
 	return opts
 }
