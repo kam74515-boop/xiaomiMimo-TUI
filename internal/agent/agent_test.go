@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -212,6 +213,18 @@ func hasToolTraceUpdate(events []core.AgentEvent, name string) bool {
 	return false
 }
 
+func hasObservationContaining(events []core.AgentEvent, text string) bool {
+	for _, event := range events {
+		if event.Type != core.EventObservation || event.Observation == nil {
+			continue
+		}
+		if strings.Contains(event.Observation.Summary, text) {
+			return true
+		}
+	}
+	return false
+}
+
 // ---- Loop tests ----
 
 type fakeExecutor struct {
@@ -235,6 +248,8 @@ func (e *fakeExecutor) Execute(ctx context.Context, call core.ToolCall) (core.To
 type fakeContextManager struct {
 	items    []core.ContextItem
 	upserted []core.ContextItem
+	admitted []core.ContextItem
+	admitErr error
 }
 
 func (m *fakeContextManager) Add(item core.ContextItem) (core.ContextSnapshot, error) {
@@ -303,6 +318,14 @@ func (m *fakeContextManager) AutoBudget() contextmap.AutoBudgetResult {
 	return contextmap.AutoBudgetResult{}
 }
 
+func (m *fakeContextManager) Admit(item core.ContextItem) (core.ContextSnapshot, error) {
+	m.admitted = append(m.admitted, item)
+	if m.admitErr != nil {
+		return m.Snapshot(), m.admitErr
+	}
+	return m.Upsert(item)
+}
+
 func TestLoopSingleStep(t *testing.T) {
 	bus := core.NewBus()
 	sub := bus.Subscribe(50)
@@ -316,7 +339,7 @@ func TestLoopSingleStep(t *testing.T) {
 	ctxMgr := &fakeContextManager{}
 	config := DefaultLoopConfig()
 
-	err := Loop(context.Background(), "hello", client, executor, ctxMgr, nil, bus, config)
+	_, err := Loop(context.Background(), "hello", client, executor, ctxMgr, nil, bus, config, nil)
 	if err != nil {
 		t.Fatalf("Loop returned error: %v", err)
 	}
@@ -377,7 +400,7 @@ func TestLoopMultiStep(t *testing.T) {
 	ctxMgr := &fakeContextManager{}
 	config := DefaultLoopConfig()
 
-	err := Loop(context.Background(), "whats in README", client, executor, ctxMgr, nil, bus, config)
+	_, err := Loop(context.Background(), "whats in README", client, executor, ctxMgr, nil, bus, config, nil)
 	if err != nil {
 		t.Fatalf("Loop returned error: %v", err)
 	}
@@ -392,6 +415,9 @@ func TestLoopMultiStep(t *testing.T) {
 	}
 	if len(ctxMgr.upserted) != 1 {
 		t.Fatalf("context upserted %d times, want 1", len(ctxMgr.upserted))
+	}
+	if len(ctxMgr.admitted) != 1 {
+		t.Fatalf("context admitted %d times, want 1", len(ctxMgr.admitted))
 	}
 
 	events := drainBus(sub)
@@ -426,7 +452,7 @@ func TestLoopMaxSteps(t *testing.T) {
 	ctxMgr := &fakeContextManager{}
 	config := LoopConfig{MaxSteps: 3, StepTimeout: 10 * time.Second, TotalTimeout: 30 * time.Second}
 
-	err := Loop(context.Background(), "loop", client, executor, ctxMgr, nil, bus, config)
+	_, err := Loop(context.Background(), "loop", client, executor, ctxMgr, nil, bus, config, nil)
 	if err == nil || !strings.Contains(err.Error(), "max steps") {
 		t.Fatalf("Loop error = %v, want max steps error", err)
 	}
@@ -436,6 +462,57 @@ func TestLoopMaxSteps(t *testing.T) {
 	events := drainBus(sub)
 	if !hasEvent(events, core.EventError) {
 		t.Fatal("missing error event")
+	}
+}
+
+func TestLoopPublishesContextAdmissionRejection(t *testing.T) {
+	bus := core.NewBus()
+	sub := bus.Subscribe(80)
+
+	callCount := 0
+	client := &fakeClient{
+		streamFn: func(ctx context.Context, req core.ChatRequest) (<-chan core.ModelEvent, error) {
+			callCount++
+			ch := make(chan core.ModelEvent, 2)
+			if callCount == 1 {
+				ch <- core.ModelEvent{
+					ToolCalls: []core.ToolCall{
+						{ID: "call_1", Name: "read_file", Input: core.ToolInput{"path": "README.md"}},
+					},
+				}
+				ch <- core.ModelEvent{Done: true}
+			} else {
+				ch <- core.ModelEvent{Delta: "done"}
+				ch <- core.ModelEvent{Done: true}
+			}
+			close(ch)
+			return ch, nil
+		},
+	}
+	executor := &fakeExecutor{
+		results: []struct {
+			result      core.ToolResult
+			observation core.Observation
+		}{
+			{core.ToolResult{Content: "content", ArtifactID: "art-1"}, core.Observation{Summary: "read README.md", ContextPlacement: core.TierNear}},
+		},
+	}
+	ctxMgr := &fakeContextManager{admitErr: contextmap.ErrAdmitOverWindow}
+
+	_, err := Loop(context.Background(), "read", client, executor, ctxMgr, nil, bus, DefaultLoopConfig(), nil)
+	if err != nil {
+		t.Fatalf("Loop returned error: %v", err)
+	}
+	if len(ctxMgr.admitted) != 1 {
+		t.Fatalf("context admitted %d times, want 1", len(ctxMgr.admitted))
+	}
+	if len(ctxMgr.upserted) != 0 {
+		t.Fatalf("context upserted %d times after admission rejection, want 0", len(ctxMgr.upserted))
+	}
+
+	events := drainBus(sub)
+	if !hasObservationContaining(events, "context admission rejected") {
+		t.Fatalf("missing admission rejection observation: %#v", events)
 	}
 }
 
@@ -475,7 +552,7 @@ func TestLoopToolError(t *testing.T) {
 	ctxMgr := &fakeContextManager{}
 	config := DefaultLoopConfig()
 
-	err := Loop(context.Background(), "run bad cmd", client, executor, ctxMgr, nil, bus, config)
+	_, err := Loop(context.Background(), "run bad cmd", client, executor, ctxMgr, nil, bus, config, nil)
 	if err != nil {
 		t.Fatalf("Loop returned unexpected error: %v", err)
 	}
@@ -507,7 +584,7 @@ func TestLoopContextSummaryInjected(t *testing.T) {
 	executor := &fakeExecutor{}
 	config := DefaultLoopConfig()
 
-	_ = Loop(context.Background(), "test", client, executor, ctxMgr, nil, bus, config)
+	_, _ = Loop(context.Background(), "test", client, executor, ctxMgr, nil, bus, config, nil)
 	drainBus(sub)
 
 	sysContent := client.req.Messages[0].Content
@@ -519,5 +596,67 @@ func TestLoopContextSummaryInjected(t *testing.T) {
 	}
 	if !strings.Contains(sysContent, "Near: git status output") {
 		t.Fatalf("context summary missing near: %q", sysContent)
+	}
+}
+
+func TestLoopHistoryPropagation(t *testing.T) {
+	bus := core.NewBus()
+	sub := bus.Subscribe(50)
+
+	// Step 1: first call returns some messages.
+	callCount := 0
+	client := &fakeClient{
+		streamFn: func(ctx context.Context, req core.ChatRequest) (<-chan core.ModelEvent, error) {
+			callCount++
+			ch := make(chan core.ModelEvent, 2)
+			ch <- core.ModelEvent{Delta: fmt.Sprintf("turn-%d", callCount)}
+			ch <- core.ModelEvent{Done: true}
+			close(ch)
+			return ch, nil
+		},
+	}
+	executor := &fakeExecutor{}
+	ctxMgr := &fakeContextManager{}
+	config := DefaultLoopConfig()
+
+	// First turn: no history.
+	history, err := Loop(context.Background(), "first", client, executor, ctxMgr, nil, bus, config, nil)
+	if err != nil {
+		t.Fatalf("first Loop returned error: %v", err)
+	}
+	drainBus(sub)
+
+	// Verify the returned messages include system + user + assistant.
+	if len(history) < 3 {
+		t.Fatalf("history after first turn = %d messages, want 3", len(history))
+	}
+	if history[0].Role != "system" {
+		t.Fatalf("first message role = %q, want system", history[0].Role)
+	}
+	if history[len(history)-1].Role != "assistant" {
+		t.Fatalf("last message role = %q, want assistant", history[len(history)-1].Role)
+	}
+
+	// Second turn: pass history from first turn.
+	history2, err := Loop(context.Background(), "second", client, executor, ctxMgr, nil, bus, config, history)
+	if err != nil {
+		t.Fatalf("second Loop returned error: %v", err)
+	}
+	drainBus(sub)
+
+	// Should have grown: original messages + new user + new assistant.
+	if len(history2) <= len(history) {
+		t.Fatalf("history2 length = %d, want > %d", len(history2), len(history))
+	}
+
+	// The first message should still be the system prompt.
+	if history2[0].Role != "system" || !strings.Contains(history2[0].Content, "MiMo inside") {
+		t.Fatalf("system message lost after second turn: %#v", history2[0])
+	}
+
+	// The system prompt in the second request should contain context summary.
+	sysContent := client.req.Messages[0].Content
+	if !strings.Contains(sysContent, "[Context Map Summary]") {
+		t.Fatalf("second turn system prompt missing context summary: %q", sysContent)
 	}
 }

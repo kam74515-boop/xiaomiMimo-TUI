@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,9 +23,13 @@ const (
 )
 
 var (
-	ErrDuplicateItem = errors.New("context item already exists")
-	ErrItemNotFound  = errors.New("context item not found")
-	ErrInvalidItemID = errors.New("context item id is required")
+	ErrDuplicateItem   = errors.New("context item already exists")
+	ErrItemNotFound    = errors.New("context item not found")
+	ErrInvalidItemID   = errors.New("context item id is required")
+	ErrAdmitRejected   = errors.New("context item rejected by admission policy")
+	ErrAdmitNoSource   = errors.New("context item must have a source to be admitted")
+	ErrAdmitNoReason   = errors.New("context item must have a reason to be admitted")
+	ErrAdmitOverWindow = errors.New("context window is over capacity; cannot admit Near item")
 
 	SafeBudgetRatio = 0.85
 )
@@ -102,6 +107,69 @@ func (m *Manager) Upsert(item core.ContextItem) (core.ContextSnapshot, error) {
 	if item.ID == "" {
 		return m.snapshotLocked(), ErrInvalidItemID
 	}
+	if _, ok := m.items[item.ID]; !ok {
+		m.order = append(m.order, item.ID)
+	}
+	m.items[item.ID] = item
+	return m.snapshotLocked(), nil
+}
+
+// Admit evaluates whether item should enter the context map and, if accepted,
+// upserts it. Admission rules:
+//   - Source and Reason are required.
+//   - Artifact-tier items bypass admission (they are raw output storage).
+//   - When projected pollution risk is over_window, non-pinned Near items are rejected.
+//   - The item's SelectionReason is set to document why it was admitted.
+func (m *Manager) Admit(item core.ContextItem) (core.ContextSnapshot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	item = normalizeItem(item)
+	if item.ID == "" {
+		return m.snapshotLocked(), ErrInvalidItemID
+	}
+
+	// Artifact tier bypasses admission — it is raw output storage.
+	if item.Tier == core.TierArtifact {
+		item.SelectionReason = "artifact bypass; raw output stored as-is"
+		if _, ok := m.items[item.ID]; !ok {
+			m.order = append(m.order, item.ID)
+		}
+		m.items[item.ID] = item
+		return m.snapshotLocked(), nil
+	}
+
+	// Source and Reason are required for Near and Anchor items.
+	if strings.TrimSpace(item.Source) == "" {
+		return m.snapshotLocked(), ErrAdmitNoSource
+	}
+	if strings.TrimSpace(item.Reason) == "" {
+		return m.snapshotLocked(), ErrAdmitNoReason
+	}
+
+	// Check pollution risk for Near items.
+	if item.Tier == core.TierNear && !item.Pinned {
+		totals := m.totalsLocked()
+		projectedUsed := totals.UsedTokens + item.TokenEstimate
+		if existing, ok := m.items[item.ID]; ok && !expired(existing, m.now()) {
+			projectedUsed -= existing.TokenEstimate
+			if projectedUsed < 0 {
+				projectedUsed = item.TokenEstimate
+			}
+		}
+		risk := pollutionRisk(m.windowTokens, projectedUsed)
+		if risk == PollutionOverWindow {
+			return m.snapshotLocked(), ErrAdmitOverWindow
+		}
+		if risk == PollutionWarning {
+			item.SelectionReason = fmt.Sprintf("admitted under warning (%d/%d projected tokens used)", projectedUsed, m.windowTokens)
+		} else {
+			item.SelectionReason = fmt.Sprintf("admitted; within safe budget (%d/%d projected tokens used)", projectedUsed, m.windowTokens)
+		}
+	} else {
+		item.SelectionReason = fmt.Sprintf("admitted as %s tier", item.Tier)
+	}
+
 	if _, ok := m.items[item.ID]; !ok {
 		m.order = append(m.order, item.ID)
 	}

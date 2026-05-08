@@ -143,11 +143,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case tea.KeyEnter:
 				if strings.TrimSpace(m.textInput) != "" {
 					m.chat += "\nuser> " + m.textInput
+					if m.bus != nil {
+						event := core.NewEvent(core.EventUserPrompt)
+						event.Message = m.textInput
+						m.bus.Publish(event)
+					}
 				}
 				m.textInput = ""
 				m.cursorPos = 0
 				m.inputMode = InputNone
-				m.status = "prompt submitted"
+				m.status = "prompt submitted to agent"
 				return m, nil
 			case tea.KeyEsc:
 				m.textInput = ""

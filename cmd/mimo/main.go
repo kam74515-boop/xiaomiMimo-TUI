@@ -228,8 +228,36 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 
 		client := mimo.New(cfg.Provider)
 		loopConfig := agent.DefaultLoopConfig()
-		if err := agent.Loop(ctx, prompt, client, executor, manager, registry.ToolSpecs(), bus, loopConfig); err != nil {
-			return
+		userPrompts := bus.Subscribe(8)
+
+		// Initial agent run with the startup prompt.
+		history, err := agent.Loop(ctx, prompt, client, executor, manager, registry.ToolSpecs(), bus, loopConfig, nil)
+		if err != nil {
+			// Log error but continue to multi-turn listening so the user can retry.
+			bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: "startup agent error: " + err.Error()}})
+		}
+
+		// Multi-turn: listen for user prompts from the TUI.
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event, ok := <-userPrompts:
+				if !ok {
+					return
+				}
+				if event.Type == core.EventUserPrompt && event.Message != "" {
+					nextHistory, loopErr := agent.Loop(ctx, event.Message, client, executor, manager, registry.ToolSpecs(), bus, loopConfig, history)
+					if loopErr != nil {
+						bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: "agent error: " + loopErr.Error()}})
+						if len(nextHistory) > 0 {
+							history = nextHistory
+						}
+						continue
+					}
+					history = nextHistory
+				}
+			}
 		}
 	}()
 

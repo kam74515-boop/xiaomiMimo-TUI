@@ -23,6 +23,7 @@ const (
 	EventError          EventType = "error"
 	EventDone           EventType = "done"
 	EventApprovalNeeded EventType = "approval_needed"
+	EventUserPrompt     EventType = "user_prompt"
 )
 
 type ContextTier string
@@ -34,14 +35,16 @@ const (
 )
 
 type ContextItem struct {
-	ID            string      `json:"id"`
-	Tier          ContextTier `json:"tier"`
-	Title         string      `json:"title"`
-	Source        string      `json:"source"`
-	TokenEstimate int         `json:"token_estimate"`
-	Pinned        bool        `json:"pinned"`
-	Reason        string      `json:"reason"`
-	ExpiresAt     time.Time   `json:"expires_at,omitempty"`
+	ID              string      `json:"id"`
+	Tier            ContextTier `json:"tier"`
+	Title           string      `json:"title"`
+	Source          string      `json:"source"`
+	TokenEstimate   int         `json:"token_estimate"`
+	Pinned          bool        `json:"pinned"`
+	Reason          string      `json:"reason"`
+	SelectionReason string      `json:"selection_reason,omitempty"`
+	ReplacedBy      string      `json:"replaced_by,omitempty"`
+	ExpiresAt       time.Time   `json:"expires_at,omitempty"`
 }
 
 type ContextSnapshot struct {

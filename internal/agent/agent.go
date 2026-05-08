@@ -31,6 +31,7 @@ type ContextManager interface {
 	Remove(id string) (core.ContextSnapshot, error)
 	Pin(id string) (core.ContextSnapshot, error)
 	Unpin(id string) (core.ContextSnapshot, error)
+	Admit(item core.ContextItem) (core.ContextSnapshot, error)
 	Snapshot() core.ContextSnapshot
 	AutoBudget() contextmap.AutoBudgetResult
 }
@@ -104,6 +105,10 @@ func BuildSystemPrompt() string {
 //     observations into the context map.
 //
 // The loop stops when the model emits no tool calls, max steps are reached, or a timeout fires.
+//
+// If history is non-empty, it is used as the message prefix (system + prior turns).
+// A new user message with the prompt is appended. The returned messages slice
+// contains the full conversation including this turn, suitable for multi-turn use.
 func Loop(
 	ctx context.Context,
 	prompt string,
@@ -113,33 +118,40 @@ func Loop(
 	toolSpecs []core.ToolSpec,
 	bus *core.Bus,
 	config LoopConfig,
-) error {
+	history []core.Message,
+) ([]core.Message, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if bus == nil {
-		return ErrNilBus
+		return nil, ErrNilBus
 	}
 	if client == nil {
 		publishError(bus, ErrNilClient)
 		publishDone(bus)
-		return ErrNilClient
+		return nil, ErrNilClient
 	}
 
 	totalCtx, totalCancel := context.WithTimeout(ctx, config.TotalTimeout)
 	defer totalCancel()
 
-	messages := []core.Message{
-		{Role: "system", Content: BuildSystemPrompt()},
-		{Role: "user", Content: prompt},
+	var messages []core.Message
+	if len(history) > 0 {
+		messages = make([]core.Message, len(history))
+		copy(messages, history)
+	} else {
+		messages = []core.Message{
+			{Role: "system", Content: BuildSystemPrompt()},
+		}
 	}
+	messages = append(messages, core.Message{Role: "user", Content: prompt})
 
 	for step := 0; step < config.MaxSteps; step++ {
 		select {
 		case <-totalCtx.Done():
 			publishError(bus, totalCtx.Err())
 			publishDone(bus)
-			return totalCtx.Err()
+			return messages, totalCtx.Err()
 		default:
 		}
 
@@ -172,7 +184,7 @@ func Loop(
 			publishTrace(bus, stepTrace)
 			publishError(bus, err)
 			publishDone(bus)
-			return err
+			return messages, err
 		}
 
 		var assistantContent string
@@ -189,7 +201,7 @@ func Loop(
 				publishTrace(bus, stepTrace)
 				publishError(bus, totalCtx.Err())
 				publishDone(bus)
-				return totalCtx.Err()
+				return messages, totalCtx.Err()
 			case event, ok := <-events:
 				if !ok {
 					break streamLoop
@@ -203,7 +215,7 @@ func Loop(
 					publishTrace(bus, stepTrace)
 					publishError(bus, event.Err)
 					publishDone(bus)
-					return event.Err
+					return messages, event.Err
 				}
 				if event.Delta != "" {
 					assistantContent += event.Delta
@@ -225,12 +237,18 @@ func Loop(
 
 		// If the model produced no tool calls it gave a final answer.
 		if len(toolCalls) == 0 {
+			// Append the assistant message to history so callers can
+			// continue the conversation across turns.
+			messages = append(messages, core.Message{
+				Role:    "assistant",
+				Content: assistantContent,
+			})
 			stepTrace.Status = core.TraceDone
 			stepTrace.EndedAt = time.Now()
 			stepTrace.Observation = "Model produced final answer without tool calls."
 			publishTrace(bus, stepTrace)
 			publishDone(bus)
-			return nil
+			return messages, nil
 		}
 
 		// Append the assistant message with tool calls to the history.
@@ -268,8 +286,11 @@ func Loop(
 			})
 
 			// Promote the observation into the context map.
-			promoted := promoteObservationToContext(fmt.Sprintf("obs:%s:%d", call.Name, time.Now().UnixNano()), observation)
-			snapshot, _ := ctxMgr.Upsert(promoted)
+			promoted := contextmap.PromoteObservation(fmt.Sprintf("obs:%s:%d", call.Name, time.Now().UnixNano()), observation)
+			snapshot, err := ctxMgr.Admit(promoted)
+			if err != nil {
+				publishNote(bus, fmt.Sprintf("context admission rejected for %s: %v", promoted.ID, err))
+			}
 			publishContext(bus, snapshot)
 
 			toolTrace.Status = core.TraceDone
@@ -306,7 +327,7 @@ func Loop(
 	err := fmt.Errorf("agent loop reached max steps limit (%d)", config.MaxSteps)
 	publishError(bus, err)
 	publishDone(bus)
-	return err
+	return messages, err
 }
 
 // RunOnce is the original single-pass agent call, retained for backward compatibility
@@ -446,32 +467,6 @@ func buildContextSummary(snapshot core.ContextSnapshot) string {
 		b.WriteString("Artifacts: " + strings.Join(artifactItems, ", ") + "\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
-}
-
-func promoteObservationToContext(id string, obs core.Observation) core.ContextItem {
-	item := core.ContextItem{
-		ID:     id,
-		Tier:   obs.ContextPlacement,
-		Source: "observation",
-		Pinned: false,
-	}
-	if obs.ArtifactID != "" {
-		item.Source = "artifact:" + obs.ArtifactID
-		item.Tier = core.TierArtifact
-	}
-	if obs.Summary != "" {
-		item.Title = obs.Summary
-	} else if obs.StateDelta != "" {
-		item.Title = obs.StateDelta
-	} else if obs.RiskDelta != "" {
-		item.Title = obs.RiskDelta
-	}
-	item.TokenEstimate = core.EstimateTokens(item.Title + item.Source + obs.StateDelta + obs.RiskDelta)
-	item.Reason = fmt.Sprintf("Tool observation: %s", obs.Summary)
-	if item.Tier == "" {
-		item.Tier = core.TierNear
-	}
-	return item
 }
 
 func publishTrace(bus *core.Bus, step core.TraceStep) {

@@ -348,6 +348,36 @@ func TestInputPromptEmptySubmit(t *testing.T) {
 	}
 }
 
+func TestInputPromptPublishesUserPromptEvent(t *testing.T) {
+	bus := core.NewBus()
+	sub := bus.Subscribe(10)
+
+	m := NewModel(nil, bus)
+	m.width = 80
+	m.height = 24
+
+	// Enter prompt mode, type, and submit.
+	m = updateModel(t, m, runeKey('i'))
+	m = updateModel(t, m, runeKey('h'))
+	m = updateModel(t, m, runeKey('i'))
+	m = updateModel(t, m, keyMsg(tea.KeyEnter))
+
+	if m.inputMode != InputNone {
+		t.Fatalf("inputMode after Enter = %d, want InputNone", m.inputMode)
+	}
+
+	events := drainTuiBus(sub)
+	hasUserPrompt := false
+	for _, ev := range events {
+		if ev.Type == core.EventUserPrompt && ev.Message == "hi" {
+			hasUserPrompt = true
+		}
+	}
+	if !hasUserPrompt {
+		t.Fatalf("expected EventUserPrompt with message 'hi', got events: %#v", events)
+	}
+}
+
 func TestInputPromptBackspace(t *testing.T) {
 	m := NewModel(nil, nil)
 	m.width = 80

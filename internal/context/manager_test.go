@@ -297,3 +297,194 @@ func TestPromoteObservationPlacementDefaultsAndPreservesKnownTiers(t *testing.T)
 		})
 	}
 }
+
+func TestAdmitRequiresSourceAndReason(t *testing.T) {
+	manager := New(10000)
+
+	// Missing source.
+	_, err := manager.Admit(core.ContextItem{ID: "no-source", Tier: core.TierNear, Reason: "has reason"})
+	if !errors.Is(err, ErrAdmitNoSource) {
+		t.Fatalf("admit with no source error = %v, want ErrAdmitNoSource", err)
+	}
+
+	// Missing reason.
+	_, err = manager.Admit(core.ContextItem{ID: "no-reason", Tier: core.TierNear, Source: "has source"})
+	if !errors.Is(err, ErrAdmitNoReason) {
+		t.Fatalf("admit with no reason error = %v, want ErrAdmitNoReason", err)
+	}
+}
+
+func TestAdmitAcceptsValidNearItem(t *testing.T) {
+	manager := New(10000)
+	snapshot, err := manager.Admit(core.ContextItem{
+		ID:     "near-valid",
+		Tier:   core.TierNear,
+		Source: "tool:git_status",
+		Reason: "git status provides current workspace state",
+		Title:  "Git status",
+	})
+	if err != nil {
+		t.Fatalf("Admit error: %v", err)
+	}
+	found := false
+	for _, item := range snapshot.Items {
+		if item.ID == "near-valid" {
+			found = true
+			if item.SelectionReason == "" {
+				t.Fatal("SelectionReason should be set on admitted item")
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatal("admitted item not in snapshot")
+	}
+}
+
+func TestAdmitBypassesArtifactTier(t *testing.T) {
+	manager := New(10000)
+	// Artifact items can be admitted without source/reason.
+	snapshot, err := manager.Admit(core.ContextItem{
+		ID:    "artifact-raw",
+		Tier:  core.TierArtifact,
+		Title: "Raw build output",
+	})
+	if err != nil {
+		t.Fatalf("Admit artifact error: %v", err)
+	}
+	found := false
+	for _, item := range snapshot.Items {
+		if item.ID == "artifact-raw" {
+			found = true
+			if !strings.Contains(item.SelectionReason, "artifact bypass") {
+				t.Fatalf("artifact SelectionReason = %q, want 'artifact bypass'", item.SelectionReason)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatal("artifact item not in snapshot")
+	}
+}
+
+func TestAdmitRejectsNearWhenOverWindow(t *testing.T) {
+	manager := New(100) // Small window.
+
+	// Fill it to over_window with a large item.
+	_, _ = manager.Add(core.ContextItem{
+		ID:            "big-anchor",
+		Tier:          core.TierAnchor,
+		TokenEstimate: 120, // Exceeds 100 window.
+		Pinned:        true,
+		Source:        "test",
+		Reason:        "test",
+	})
+
+	// Trying to admit a Near item should fail.
+	_, err := manager.Admit(core.ContextItem{
+		ID:            "near-rejected",
+		Tier:          core.TierNear,
+		Source:        "test",
+		Reason:        "test",
+		TokenEstimate: 5,
+	})
+	if !errors.Is(err, ErrAdmitOverWindow) {
+		t.Fatalf("Admit over_window error = %v, want ErrAdmitOverWindow", err)
+	}
+}
+
+func TestAdmitRejectsNearWhenProjectedOverWindow(t *testing.T) {
+	manager := New(100)
+	_, _ = manager.Add(core.ContextItem{
+		ID:            "existing-near",
+		Tier:          core.TierNear,
+		TokenEstimate: 90,
+		Source:        "test",
+		Reason:        "test",
+	})
+
+	_, err := manager.Admit(core.ContextItem{
+		ID:            "near-would-overflow",
+		Tier:          core.TierNear,
+		Source:        "test",
+		Reason:        "projected item should exceed context window",
+		TokenEstimate: 15,
+	})
+	if !errors.Is(err, ErrAdmitOverWindow) {
+		t.Fatalf("Admit projected over_window error = %v, want ErrAdmitOverWindow", err)
+	}
+}
+
+func TestAdmitAcceptsPinnedNearWhenProjectedOverWindow(t *testing.T) {
+	manager := New(100)
+	_, _ = manager.Add(core.ContextItem{
+		ID:            "existing-near",
+		Tier:          core.TierNear,
+		TokenEstimate: 90,
+		Source:        "test",
+		Reason:        "test",
+	})
+
+	snapshot, err := manager.Admit(core.ContextItem{
+		ID:            "pinned-near",
+		Tier:          core.TierNear,
+		Source:        "test",
+		Reason:        "user-pinned evidence bypasses Near admission rejection",
+		TokenEstimate: 15,
+		Pinned:        true,
+	})
+	if err != nil {
+		t.Fatalf("Admit pinned near error: %v", err)
+	}
+	if snapshot.PollutionRisk != PollutionOverWindow {
+		t.Fatalf("pollution risk = %q, want over_window", snapshot.PollutionRisk)
+	}
+}
+
+func TestAdmitAcceptsAnchorWhenOverWindow(t *testing.T) {
+	manager := New(100)
+
+	// Fill to over_window.
+	_, _ = manager.Add(core.ContextItem{
+		ID:            "big-near",
+		Tier:          core.TierNear,
+		TokenEstimate: 120,
+		Source:        "test",
+		Reason:        "test",
+	})
+
+	// Anchor items bypass the over_window check.
+	_, err := manager.Admit(core.ContextItem{
+		ID:            "anchor-important",
+		Tier:          core.TierAnchor,
+		Source:        "test",
+		Reason:        "critical anchor should always be admitted",
+		TokenEstimate: 10,
+	})
+	if err != nil {
+		t.Fatalf("Admit anchor error: %v", err)
+	}
+}
+
+func TestAdmitSetsSelectionReason(t *testing.T) {
+	manager := New(10000)
+	snapshot, err := manager.Admit(core.ContextItem{
+		ID:     "near-with-reason",
+		Tier:   core.TierNear,
+		Source: "tool:read_file",
+		Reason: "file contents relevant to current task",
+		Title:  "README.md",
+	})
+	if err != nil {
+		t.Fatalf("Admit error: %v", err)
+	}
+	for _, item := range snapshot.Items {
+		if item.ID == "near-with-reason" {
+			if !strings.Contains(item.SelectionReason, "safe budget") {
+				t.Fatalf("SelectionReason = %q, want 'safe budget'", item.SelectionReason)
+			}
+			return
+		}
+	}
+	t.Fatal("admitted item not found")
+}
