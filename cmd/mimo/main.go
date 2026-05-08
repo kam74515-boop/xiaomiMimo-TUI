@@ -169,9 +169,14 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 		if opts.resumeLatest {
 			publishResumeSummary(cfg, manager, bus)
 		}
-		runBootstrapTools(ctx, cfg, manager, bus)
+
+		registry := tools.NewDefaultRegistry(cfg.Runtime.Workspace)
+		executor := tools.NewExecutor(registry, bus)
+		runBootstrapTools(ctx, executor, manager, bus)
+
 		client := mimo.New(cfg.Provider)
-		if err := agent.RunOnce(ctx, prompt, client, bus); err != nil {
+		loopConfig := agent.DefaultLoopConfig()
+		if err := agent.Loop(ctx, prompt, client, executor, manager, registry.ToolSpecs(), bus, loopConfig); err != nil {
 			return
 		}
 	}()
@@ -239,9 +244,7 @@ func publishResumeSummary(cfg config.Config, manager *contextmap.Manager, bus *c
 	publishContextSnapshot(snapshot, bus)
 }
 
-func runBootstrapTools(ctx context.Context, cfg config.Config, manager *contextmap.Manager, bus *core.Bus) {
-	registry := tools.NewDefaultRegistry(cfg.Runtime.Workspace)
-	executor := tools.NewExecutor(registry, bus)
+func runBootstrapTools(ctx context.Context, executor *tools.Executor, manager *contextmap.Manager, bus *core.Bus) {
 	for index, call := range []core.ToolCall{
 		{Name: "list_dir", Input: core.ToolInput{"path": ".", "max_entries": 80}},
 		{Name: "git_status", Input: core.ToolInput{}},

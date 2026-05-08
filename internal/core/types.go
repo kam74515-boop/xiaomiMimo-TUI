@@ -99,8 +99,10 @@ type CostUpdate struct {
 }
 
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 }
 
 type ChatRequest struct {
@@ -177,6 +179,13 @@ type Tool interface {
 
 func NewEvent(t EventType) AgentEvent {
 	return AgentEvent{Type: t, Time: time.Now()}
+}
+
+func EstimateTokens(text string) int {
+	if text == "" {
+		return 0
+	}
+	return (len(text) + 3) / 4
 }
 
 func MarshalSchema(v any) JSONSchema {

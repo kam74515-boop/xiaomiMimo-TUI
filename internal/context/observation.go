@@ -24,7 +24,7 @@ func PromoteObservation(id string, obs core.Observation) core.ContextItem {
 		Tier:          tier,
 		Title:         observationTitle(obs),
 		Source:        source,
-		TokenEstimate: EstimateTokens(observationText(obs)),
+		TokenEstimate: core.EstimateTokens(observationText(obs)),
 		Reason:        observationReason(tier, obs.ArtifactID),
 	}
 }

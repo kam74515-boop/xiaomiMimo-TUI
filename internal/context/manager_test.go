@@ -126,7 +126,7 @@ func TestPromoteObservationSetsPlacementSourceTokensAndReason(t *testing.T) {
 	if item.Title != obs.Summary {
 		t.Fatalf("title = %q, want %q", item.Title, obs.Summary)
 	}
-	wantTokens := EstimateTokens("read target files\ncaptured current implementation\nno new risk\nwrite focused tests\napply small patch")
+	wantTokens := core.EstimateTokens("read target files\ncaptured current implementation\nno new risk\nwrite focused tests\napply small patch")
 	if item.TokenEstimate != wantTokens {
 		t.Fatalf("token estimate = %d, want %d", item.TokenEstimate, wantTokens)
 	}

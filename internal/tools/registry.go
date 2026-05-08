@@ -78,3 +78,22 @@ func (r *Registry) Tools() []core.Tool {
 	}
 	return out
 }
+
+func (r *Registry) ToolSpecs() []core.ToolSpec {
+	names := r.Names()
+	specs := make([]core.ToolSpec, 0, len(names))
+	for _, name := range names {
+		tool := r.tools[name]
+		schema := tool.Schema()
+		description, _ := schema["description"].(string)
+		specs = append(specs, core.ToolSpec{
+			Type: "function",
+			Function: core.ToolFunctionSpec{
+				Name:        tool.Name(),
+				Description: description,
+				Parameters:  schema,
+			},
+		})
+	}
+	return specs
+}

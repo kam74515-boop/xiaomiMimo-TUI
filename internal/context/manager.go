@@ -155,7 +155,7 @@ func (m *Manager) SeedAnchors(projectMapSource, taskGoalSource string) core.Cont
 		Tier:          core.TierAnchor,
 		Title:         "Project map",
 		Source:        projectMapSource,
-		TokenEstimate: EstimateTokens(projectMapSource),
+		TokenEstimate: core.EstimateTokens(projectMapSource),
 		Pinned:        true,
 		Reason:        "Seed anchor for project structure and important files",
 	})
@@ -164,18 +164,11 @@ func (m *Manager) SeedAnchors(projectMapSource, taskGoalSource string) core.Cont
 		Tier:          core.TierAnchor,
 		Title:         "Task goal",
 		Source:        taskGoalSource,
-		TokenEstimate: EstimateTokens(taskGoalSource),
+		TokenEstimate: core.EstimateTokens(taskGoalSource),
 		Pinned:        true,
 		Reason:        "Seed anchor for the active task objective",
 	})
 	return m.snapshotLocked()
-}
-
-func EstimateTokens(text string) int {
-	if text == "" {
-		return 0
-	}
-	return (len(text) + 3) / 4
 }
 
 func (m *Manager) setPinned(id string, pinned bool) (core.ContextSnapshot, error) {
