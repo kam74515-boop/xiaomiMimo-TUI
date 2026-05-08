@@ -77,23 +77,14 @@ is proven reliable.
 
 ---
 
-## Model Persistence Requires Manual Config
+## Model Registry Persistence
 
-**Status:** Known gap.
+**Status:** Implemented.
 
-Model registry changes made via `-model-accept` are stored in memory and do not
-persist across restarts. To permanently change the default model, users must
-manually edit `~/.mimo-tui/config.toml` or `.mimo/config.toml`.
-
-**Impact:** Accepted candidate models revert to the built-in default on restart.
-
-**Workaround:** Edit the config file directly:
-```toml
-[provider]
-model = "your-accepted-model"
-```
-
-**Planned:** Auto-persist model registry changes to config file.
+Model registry changes made via `-model-accept` are persisted to `.mimo/models.toml`
+(project-level). On startup, the registry loads from `~/.mimo-tui/models.toml` (global)
+then `.mimo/models.toml` (project, overrides global). Accepted candidates and default
+model changes survive restarts.
 
 ---
 

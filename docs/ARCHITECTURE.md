@@ -11,7 +11,7 @@ MiMo-TUI is a Go single-binary terminal AI coding agent. It amplifies MiMo model
 | `cmd/mimo` | CLI entry point, flag parsing, wiring |
 | `internal/agent` | Agent loop, system prompt, step management |
 | `internal/provider/mimo` | MiMo API client, SSE streaming |
-| `internal/tools` | Tool registry, executor, 11 built-in tools |
+| `internal/tools` | Tool registry, executor, 12 built-in tools |
 | `internal/context` | Context manager, oracle, compression |
 | `internal/tui` | Bubble Tea TUI, 4-panel layout |
 | `internal/session` | Session resume, history extraction |

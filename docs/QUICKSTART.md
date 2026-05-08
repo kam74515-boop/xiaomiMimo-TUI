@@ -90,7 +90,8 @@ go run ./cmd/mimo "Explain the context oracle architecture"
 | `Up/Down` | Scroll within focused panel |
 | `PgUp/PgDn` | Page scroll |
 | `Home/End` | Jump to top/bottom |
-| `q` | Quit |
+| `q` or `Ctrl+C` | Quit |
+| `Ctrl+G` | Interrupt running agent |
 
 When a tool requests approval:
 - `y` or `Enter` to approve
