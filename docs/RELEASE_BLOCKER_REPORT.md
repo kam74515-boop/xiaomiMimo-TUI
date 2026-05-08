@@ -174,6 +174,11 @@ already handled separately).
 
 ### P2-7: No tests for `cmd/mimo` or `internal/core`
 
+**Status:** DEFERRED -- too risky to add cmd/mimo tests this close to 1.0 tag.
+The entry point has significant side-effectful logic (TUI launch, event bus
+wiring, smoke validation) that would need substantial mocking infrastructure.
+Post-1.0 follow-up.
+
 **Description:** Both `cmd/mimo` and `internal/core` have `[no test files]`.
 The `cmd/mimo` package contains significant logic (flag parsing, smoke
 validation, rollback commands, eval commands, model resolution) that would
