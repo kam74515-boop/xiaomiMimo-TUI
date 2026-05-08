@@ -320,19 +320,23 @@ func (m *Manager) AutoBudget() AutoBudgetResult {
 	}
 
 	evict := m.collectNearEvictionCandidatesLocked()
-	// Phase 1: evict expired non-pinned Near items first.
-	for i := 0; i < len(evict) && totals.UsedTokens > safeBoundary; {
+	// Phase 1: evict expired non-pinned Near items (cleanup; they do not
+	// contribute to the budget so we do not subtract from totals).
+	for i := 0; i < len(evict); {
 		item := evict[i]
 		if !expired(item, m.now()) {
 			i++
 			continue
 		}
-		totals.UsedTokens -= item.TokenEstimate
 		result.Evicted = append(result.Evicted, item.ID)
 		delete(m.items, item.ID)
 		m.removeOrderEntryLocked(item.ID)
 		evict = append(evict[:i], evict[i+1:]...)
 	}
+
+	// Recalculate totals after expired-item cleanup (in case pinned items
+	// with the same IDs were removed, though that should not happen).
+	totals = m.totalsLocked()
 
 	// Phase 2: if still over safe boundary, evict oldest non-pinned Near items
 	// by insertion order.

@@ -135,6 +135,140 @@ func TestPromoteObservationSetsPlacementSourceTokensAndReason(t *testing.T) {
 	}
 }
 
+func TestAutoBudgetLowRiskNoEviction(t *testing.T) {
+	manager := New(100)
+	_, _ = manager.Add(core.ContextItem{ID: "near-1", Tier: core.TierNear, TokenEstimate: 30})
+	_, _ = manager.Add(core.ContextItem{ID: "near-2", Tier: core.TierNear, TokenEstimate: 30})
+
+	// 60/100 = 60% -> low risk, no eviction expected.
+	result := manager.AutoBudget()
+	if len(result.Evicted) != 0 {
+		t.Fatalf("evicted = %d, want 0 (low risk)", len(result.Evicted))
+	}
+	if len(manager.Snapshot().Items) != 2 {
+		t.Fatalf("items after auto budget = %d, want 2", len(manager.Snapshot().Items))
+	}
+}
+
+func TestAutoBudgetWarningEvictsNonPinnedNear(t *testing.T) {
+	manager := New(100)
+	_, _ = manager.Add(core.ContextItem{ID: "near-1", Tier: core.TierNear, TokenEstimate: 40})
+	_, _ = manager.Add(core.ContextItem{ID: "near-2", Tier: core.TierNear, TokenEstimate: 30})
+	_, _ = manager.Add(core.ContextItem{ID: "near-3", Tier: core.TierNear, TokenEstimate: 25})
+
+	// 95/100 = 95% -> warning, should evict.
+	result := manager.AutoBudget()
+	if len(result.Evicted) == 0 {
+		t.Fatal("evicted = 0, want some evictions at warning risk")
+	}
+	snapshot := manager.Snapshot()
+	if snapshot.PollutionRisk == PollutionWarning || snapshot.PollutionRisk == PollutionOverWindow {
+		t.Fatalf("pollution risk after eviction = %q, want low", snapshot.PollutionRisk)
+	}
+}
+
+func TestAutoBudgetPreservesPinnedAndAnchor(t *testing.T) {
+	manager := New(100)
+	_, _ = manager.Add(core.ContextItem{ID: "near-1", Tier: core.TierNear, TokenEstimate: 40})
+	_, _ = manager.Add(core.ContextItem{ID: "near-pinned", Tier: core.TierNear, TokenEstimate: 40, Pinned: true})
+	_, _ = manager.Add(core.ContextItem{ID: "anchor-1", Tier: core.TierAnchor, TokenEstimate: 20, Pinned: true})
+
+	// 100/100 = 100% -> over window.
+	result := manager.AutoBudget()
+	if len(result.Evicted) == 0 {
+		t.Fatal("evicted = 0, want near-1 evicted")
+	}
+
+	// near-pinned and anchor-1 should still be present.
+	ids := idSet(manager.Snapshot().Items)
+	if !ids["near-pinned"] {
+		t.Fatal("near-pinned was evicted, want preserved")
+	}
+	if !ids["anchor-1"] {
+		t.Fatal("anchor-1 was evicted, want preserved")
+	}
+	if ids["near-1"] {
+		t.Fatal("near-1 was not evicted, want evicted")
+	}
+}
+
+func TestAutoBudgetEvictsExpiredFirst(t *testing.T) {
+	manager := New(100)
+	manager.now = func() time.Time { return time.Now() }
+
+	expiredAt := time.Now().Add(-time.Minute)
+	// near-old and near-extra are non-expired (90 tokens -> warning).
+	// near-expired is expired and does not count toward the budget.
+	_, _ = manager.Add(core.ContextItem{ID: "near-old", Tier: core.TierNear, TokenEstimate: 45})
+	_, _ = manager.Add(core.ContextItem{ID: "near-expired", Tier: core.TierNear, TokenEstimate: 45, ExpiresAt: expiredAt})
+	_, _ = manager.Add(core.ContextItem{ID: "near-extra", Tier: core.TierNear, TokenEstimate: 45})
+
+	// Active items: near-old (45) + near-extra (45) = 90 / 100 = 90% -> warning.
+	// Phase 1: near-expired should be evicted (cleanup).
+	// Phase 2: near-old should be evicted to get below 85%.
+	result := manager.AutoBudget()
+	evictedIDs := make(map[string]bool)
+	for _, id := range result.Evicted {
+		evictedIDs[id] = true
+	}
+	if !evictedIDs["near-expired"] {
+		t.Fatalf("expired item not evicted first: evicted=%v", result.Evicted)
+	}
+	// near-old (first non-expired) should be evicted to bring budget under 85%.
+	if !evictedIDs["near-old"] {
+		t.Fatal("near-old should be evicted after expired items")
+	}
+	// near-extra should be preserved (45 + 10 = 55 < 85 after Phase 2 stops).
+	if evictedIDs["near-extra"] {
+		t.Fatal("near-extra should not be evicted; budget is already safe")
+	}
+}
+
+func TestPinUnpinStateTransitions(t *testing.T) {
+	manager := New(100)
+	_, _ = manager.Add(core.ContextItem{ID: "near-1", Tier: core.TierNear, TokenEstimate: 10})
+
+	if manager.Snapshot().Items[0].Pinned {
+		t.Fatal("item should not be pinned initially")
+	}
+
+	_, err := manager.Pin("near-1")
+	if err != nil {
+		t.Fatalf("pin error: %v", err)
+	}
+	if !manager.Snapshot().Items[0].Pinned {
+		t.Fatal("item should be pinned after Pin")
+	}
+
+	_, err = manager.Unpin("near-1")
+	if err != nil {
+		t.Fatalf("unpin error: %v", err)
+	}
+	if manager.Snapshot().Items[0].Pinned {
+		t.Fatal("item should be unpinned after Unpin")
+	}
+}
+
+func TestPinUnpinMissingItemReturnsError(t *testing.T) {
+	manager := New(100)
+	_, err := manager.Pin("does-not-exist")
+	if !errors.Is(err, ErrItemNotFound) {
+		t.Fatalf("pin missing error = %v, want ErrItemNotFound", err)
+	}
+	_, err = manager.Unpin("does-not-exist")
+	if !errors.Is(err, ErrItemNotFound) {
+		t.Fatalf("unpin missing error = %v, want ErrItemNotFound", err)
+	}
+}
+
+func idSet(items []core.ContextItem) map[string]bool {
+	set := make(map[string]bool, len(items))
+	for _, item := range items {
+		set[item.ID] = true
+	}
+	return set
+}
+
 func TestPromoteObservationPlacementDefaultsAndPreservesKnownTiers(t *testing.T) {
 	tests := []struct {
 		name      string

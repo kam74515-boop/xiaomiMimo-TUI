@@ -10,6 +10,10 @@ The first build focuses on:
 - Tool Cockpit for tool-native execution and raw artifact storage.
 - MiMo streaming with mock fallback when no API key is configured.
 
+Full development and architecture guide:
+
+- [docs/FULL_DEVELOPMENT_GUIDE.md](docs/FULL_DEVELOPMENT_GUIDE.md)
+
 ## Local Run
 
 ```sh

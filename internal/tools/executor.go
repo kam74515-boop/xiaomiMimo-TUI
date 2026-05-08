@@ -101,7 +101,6 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 			e.publishObservation(call, observation)
 			return result, observation
 		}
-		e.publishApprovalNeeded(call, req)
 
 		select {
 		case decision := <-req.Response:

@@ -208,7 +208,22 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 		}()
 
 		registry := tools.NewDefaultRegistry(cfg.Runtime.Workspace)
-		executor := tools.NewExecutor(registry, bus)
+		approvalCh := make(chan core.ApprovalRequest, 8)
+		defer close(approvalCh)
+		executor := tools.NewExecutor(registry, bus, tools.WithApprovalChannel(approvalCh))
+
+		// Bridge approval requests from the executor to the event bus.
+		go func() {
+			for req := range approvalCh {
+				event := core.NewEvent(core.EventApprovalNeeded)
+				event.ToolName = req.ToolCall.Name
+				event.ToolCall = &req.ToolCall
+				event.Approval = &req
+				event.Message = "Approval needed for tool " + req.ToolCall.Name
+				bus.Publish(event)
+			}
+		}()
+
 		runBootstrapTools(ctx, executor, manager, bus)
 
 		client := mimo.New(cfg.Provider)

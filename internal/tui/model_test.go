@@ -146,6 +146,142 @@ func runeKey(r rune) tea.KeyMsg {
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}
 }
 
+func TestContextSelectionMovement(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.hasContext = true
+	m.context = core.ContextSnapshot{
+		WindowTokens: 100,
+		UsedTokens:   30,
+		Items: []core.ContextItem{
+			{ID: "near-1", Tier: core.TierNear, Title: "first", TokenEstimate: 10},
+			{ID: "near-2", Tier: core.TierNear, Title: "second", TokenEstimate: 10},
+			{ID: "anchor-1", Tier: core.TierAnchor, Title: "anchor", TokenEstimate: 10},
+		},
+	}
+	m.focus = contextPanel
+
+	// selectedContextItem starts at -1.
+	if m.selectedContextItem != -1 {
+		t.Fatalf("initial selection = %d, want -1", m.selectedContextItem)
+	}
+
+	// j moves to first item (wrap from -1).
+	m = updateModel(t, m, runeKey('j'))
+	if m.selectedContextItem != 0 {
+		t.Fatalf("selection after j = %d, want 0", m.selectedContextItem)
+	}
+
+	// k wraps to last.
+	m = updateModel(t, m, runeKey('k'))
+	if m.selectedContextItem != 2 {
+		t.Fatalf("selection after k = %d, want 2", m.selectedContextItem)
+	}
+
+	// k again -> 1.
+	m = updateModel(t, m, runeKey('k'))
+	if m.selectedContextItem != 1 {
+		t.Fatalf("selection after k = %d, want 1", m.selectedContextItem)
+	}
+}
+
+func TestContextPinToggle(t *testing.T) {
+	bus := core.NewBus()
+	sub := bus.Subscribe(10)
+
+	m := NewModel(nil, bus)
+	m.hasContext = true
+	m.context = core.ContextSnapshot{
+		WindowTokens: 100,
+		UsedTokens:   20,
+		Items: []core.ContextItem{
+			{ID: "near-1", Tier: core.TierNear, Title: "item", TokenEstimate: 20, Pinned: false},
+		},
+	}
+	m.focus = contextPanel
+	m.selectedContextItem = 0
+
+	m = updateModel(t, m, runeKey('p'))
+
+	events := drainTuiBus(sub)
+	hasPin := false
+	for _, ev := range events {
+		if ev.Type == core.EventContextPin && ev.Message == "near-1" {
+			hasPin = true
+		}
+	}
+	if !hasPin {
+		t.Fatalf("expected EventContextPin, got events: %#v", events)
+	}
+}
+
+func TestContextRemoveItem(t *testing.T) {
+	bus := core.NewBus()
+	sub := bus.Subscribe(10)
+
+	m := NewModel(nil, bus)
+	m.hasContext = true
+	m.context = core.ContextSnapshot{
+		WindowTokens: 100,
+		UsedTokens:   20,
+		Items: []core.ContextItem{
+			{ID: "near-1", Tier: core.TierNear, Title: "removable", TokenEstimate: 20, Pinned: false},
+		},
+	}
+	m.focus = contextPanel
+	m.selectedContextItem = 0
+
+	m = updateModel(t, m, runeKey('d'))
+
+	events := drainTuiBus(sub)
+	hasRemove := false
+	for _, ev := range events {
+		if ev.Type == core.EventContextRemove && ev.Message == "near-1" {
+			hasRemove = true
+		}
+	}
+	if !hasRemove {
+		t.Fatalf("expected EventContextRemove, got events: %#v", events)
+	}
+}
+
+func TestContextRemovePinnedItemBlocked(t *testing.T) {
+	bus := core.NewBus()
+	sub := bus.Subscribe(10)
+
+	m := NewModel(nil, bus)
+	m.hasContext = true
+	m.context = core.ContextSnapshot{
+		WindowTokens: 100,
+		UsedTokens:   20,
+		Items: []core.ContextItem{
+			{ID: "pinned-1", Tier: core.TierAnchor, Title: "pinned", TokenEstimate: 20, Pinned: true},
+		},
+	}
+	m.focus = contextPanel
+	m.selectedContextItem = 0
+
+	m = updateModel(t, m, runeKey('d'))
+
+	events := drainTuiBus(sub)
+	for _, ev := range events {
+		if ev.Type == core.EventContextRemove {
+			t.Fatal("pinned item should not be removable")
+		}
+	}
+}
+
+func drainTuiBus(ch <-chan core.AgentEvent) []core.AgentEvent {
+	var events []core.AgentEvent
+	for {
+		select {
+		case event := <-ch:
+			events = append(events, event)
+		default:
+			return events
+		}
+	}
+}
+
 func numberedLines(count int) string {
 	lines := make([]string, count)
 	for i := range lines {

@@ -54,7 +54,7 @@ type Model struct {
 
 	context             core.ContextSnapshot
 	hasContext          bool
-	selectedContextItem int // index into context.Items; -1 means none selected
+	selectedContextItem int
 	chat                string
 	trace               []core.TraceStep
 	traceIndex          map[string]int
@@ -68,7 +68,7 @@ type Model struct {
 	sourceClosed bool
 	showHelp     bool
 
-	bus *core.Bus // optional, for publishing context commands back to the event bus
+	bus *core.Bus
 
 	inputMode       InputMode
 	textInput       string
@@ -110,10 +110,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		key := msg.String()
-		switch key {
-		case "q", "ctrl+c":
+
+		if key == "q" || key == "ctrl+c" {
 			return m, tea.Quit
-		case "?":
+		}
+
+		if m.inputMode == InputNone && key == "?" {
 			m.showHelp = !m.showHelp
 			if m.showHelp {
 				m.status = "help opened"
@@ -121,57 +123,151 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = "help closed"
 			}
 			return m, nil
-		case "esc":
+		}
+
+		if key == "esc" {
 			if m.showHelp {
 				m.showHelp = false
 				m.status = "help closed"
 				return m, nil
 			}
 		}
+
 		if m.showHelp {
 			return m, nil
 		}
-		switch key {
-		case "tab":
-			m.focus = (m.focus + 1) % panelCount
-			m.status = "focused " + panelNames[m.focus]
+
+		switch m.inputMode {
+		case InputPrompt:
+			switch msg.Type {
+			case tea.KeyEnter:
+				if strings.TrimSpace(m.textInput) != "" {
+					m.chat += "\nuser> " + m.textInput
+				}
+				m.textInput = ""
+				m.cursorPos = 0
+				m.inputMode = InputNone
+				m.status = "prompt submitted"
+				return m, nil
+			case tea.KeyEsc:
+				m.textInput = ""
+				m.cursorPos = 0
+				m.inputMode = InputNone
+				m.status = "prompt cancelled"
+				return m, nil
+			case tea.KeyBackspace, tea.KeyDelete:
+				if m.cursorPos > 0 {
+					runes := []rune(m.textInput)
+					m.textInput = string(runes[:m.cursorPos-1]) + string(runes[m.cursorPos:])
+					m.cursorPos--
+				}
+				return m, nil
+			case tea.KeyLeft:
+				if m.cursorPos > 0 {
+					m.cursorPos--
+				}
+				return m, nil
+			case tea.KeyRight:
+				if m.cursorPos < len([]rune(m.textInput)) {
+					m.cursorPos++
+				}
+				return m, nil
+			case tea.KeyHome:
+				m.cursorPos = 0
+				return m, nil
+			case tea.KeyEnd:
+				m.cursorPos = len([]rune(m.textInput))
+				return m, nil
+			case tea.KeyRunes:
+				runes := []rune(m.textInput)
+				insert := string(msg.Runes)
+				m.textInput = string(runes[:m.cursorPos]) + insert + string(runes[m.cursorPos:])
+				m.cursorPos += len(msg.Runes)
+				return m, nil
+			}
 			return m, nil
+
+		case InputApprove:
+			switch key {
+			case "y", "Y":
+				if m.pendingApproval.Response != nil {
+					m.pendingApproval.Response <- core.ApprovalDecision{Allowed: true, Reason: "user approved"}
+				}
+				m.inputMode = InputNone
+				m.pendingApproval = core.ApprovalRequest{}
+				m.status = "tool approved"
+				return m, nil
+			case "n", "N":
+				if m.pendingApproval.Response != nil {
+					m.pendingApproval.Response <- core.ApprovalDecision{Allowed: false, Reason: "user denied"}
+				}
+				m.inputMode = InputNone
+				m.pendingApproval = core.ApprovalRequest{}
+				m.status = "tool denied"
+				return m, nil
+			case "esc":
+				if m.pendingApproval.Response != nil {
+					m.pendingApproval.Response <- core.ApprovalDecision{Allowed: false, Reason: "user cancelled"}
+				}
+				m.inputMode = InputNone
+				m.pendingApproval = core.ApprovalRequest{}
+				m.status = "approval cancelled"
+				return m, nil
+			}
+			return m, nil
+
+		case InputNone:
+			switch key {
+			case "tab":
+				m.focus = (m.focus + 1) % panelCount
+				m.status = "focused " + panelNames[m.focus]
+				return m, nil
+			case "i":
+				m.inputMode = InputPrompt
+				m.textInput = ""
+				m.cursorPos = 0
+				m.status = "PROMPT> type your message, Enter to submit, Esc to cancel"
+				return m, nil
+			}
+
+			if m.focus == contextPanel {
+				switch key {
+				case "j", "down":
+					m.moveContextSelection(1)
+					return m, nil
+				case "k", "up":
+					m.moveContextSelection(-1)
+					return m, nil
+				case "p":
+					m.toggleContextPin()
+					return m, nil
+				case "d":
+					m.removeContextItem()
+					return m, nil
+				case "pgup", "pgdown", "home", "end":
+					m.scrollFocused(key)
+					return m, nil
+				}
+			} else {
+				switch key {
+				case "up", "down", "pgup", "pgdown", "home", "end":
+					m.scrollFocused(key)
+					return m, nil
+				}
+			}
 		}
 
-		if m.focus == contextPanel {
-			switch key {
-			case "j", "down":
-				m.moveContextSelection(1)
-				return m, nil
-			case "k", "up":
-				m.moveContextSelection(-1)
-				return m, nil
-			case "p":
-				m.toggleContextPin()
-				return m, nil
-			case "d":
-				m.removeContextItem()
-				return m, nil
-			case "pgup", "pgdown", "home", "end":
-				m.scrollFocused(key)
-				return m, nil
-			}
-		} else {
-			switch key {
-			case "up", "down", "pgup", "pgdown", "home", "end":
-				m.scrollFocused(key)
-				return m, nil
-			}
-		}
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
 		m.clampAllScrolls()
 		return m, nil
+
 	case agentEventMsg:
 		m.applyEvent(core.AgentEvent(msg))
 		m.clampAllScrolls()
 		return m, waitForEvent(m.events)
+
 	case eventSourceClosedMsg:
 		m.sourceClosed = true
 		if m.status == "" || m.status == "waiting for agent events" {
@@ -186,9 +282,14 @@ func (m Model) View() string {
 	width := maxInt(m.width, 60)
 	height := maxInt(m.height, 20)
 
-	header := renderHeader(width, m.status, m.sourceClosed, panelNames[m.focus], m.scrollPosition(m.focus))
+	header := renderHeader(width, m.status, m.sourceClosed, panelNames[m.focus], "")
 	footer := renderFooter(width, m.showHelp)
-	bodyHeight := maxInt(height-lipgloss.Height(header)-lipgloss.Height(footer), 12)
+	inputBar := m.renderInputBar(width)
+	inputBarHeight := 0
+	if m.inputMode != InputNone {
+		inputBarHeight = lipgloss.Height(inputBar)
+	}
+	bodyHeight := maxInt(height-lipgloss.Height(header)-lipgloss.Height(footer)-inputBarHeight, 12)
 
 	if m.showHelp {
 		return lipgloss.JoinVertical(lipgloss.Left, header, renderHelp(width, bodyHeight), footer)
@@ -210,7 +311,55 @@ func (m Model) View() string {
 		m.renderPanel(toolPanel, rightWidth, bottomHeight),
 	)
 
+	if m.inputMode != InputNone {
+		return lipgloss.JoinVertical(lipgloss.Left, header, top, bottom, inputBar, footer)
+	}
 	return lipgloss.JoinVertical(lipgloss.Left, header, top, bottom, footer)
+}
+
+func (m Model) renderInputBar(width int) string {
+	if m.inputMode == InputNone {
+		return ""
+	}
+
+	var prefix string
+	content := m.textInput
+	switch m.inputMode {
+	case InputPrompt:
+		prefix = "PROMPT> "
+	case InputApprove:
+		prefix = "APPROVE? "
+		if m.pendingApproval.ToolCall.Name != "" {
+			prefix += m.pendingApproval.ToolCall.Name + " - Allow? [y/n] "
+		} else {
+			prefix += "Allow? [y/n] "
+		}
+		content = ""
+	}
+
+	runes := []rune(content)
+	cursorPos := clampInt(m.cursorPos, 0, len(runes))
+	var display string
+	if m.inputMode == InputPrompt {
+		before := string(runes[:cursorPos])
+		after := string(runes[cursorPos:])
+		cursorChar := " "
+		if cursorPos < len(runes) {
+			cursorChar = string(runes[cursorPos])
+		}
+		display = prefix + before + lipgloss.NewStyle().
+			Background(lipgloss.Color("15")).
+			Foreground(lipgloss.Color("0")).
+			Render(cursorChar) + after
+	} else {
+		display = prefix
+	}
+
+	return lipgloss.NewStyle().
+		Width(width).
+		Background(lipgloss.Color("237")).
+		Foreground(lipgloss.Color("15")).
+		Render(truncate(display, width))
 }
 
 func waitForEvent(events <-chan core.AgentEvent) tea.Cmd {
@@ -269,6 +418,14 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 		m.status = "error: " + msg
 	case core.EventDone:
 		m.status = fallback(event.Message, "agent run complete")
+	case core.EventApprovalNeeded:
+		if event.Approval != nil {
+			m.inputMode = InputApprove
+			m.pendingApproval = *event.Approval
+			m.textInput = ""
+			m.cursorPos = 0
+			m.status = fmt.Sprintf("APPROVE? tool '%s' requires approval [y/n]", event.Approval.ToolCall.Name)
+		}
 	default:
 		if event.Message != "" {
 			m.notes = append(m.notes, event.Message)
@@ -427,7 +584,14 @@ func (m Model) panelViewport(panel focusPanel) (int, int) {
 func (m Model) panelSize(panel focusPanel) (int, int) {
 	width := maxInt(m.width, 60)
 	height := maxInt(m.height, 20)
-	bodyHeight := maxInt(height-2, 12)
+
+	header := renderHeader(width, m.status, m.sourceClosed, panelNames[m.focus], "")
+	footer := renderFooter(width, m.showHelp)
+	inputBarHeight := 0
+	if m.inputMode != InputNone {
+		inputBarHeight = 1
+	}
+	bodyHeight := maxInt(height-lipgloss.Height(header)-lipgloss.Height(footer)-inputBarHeight, 12)
 
 	leftWidth := width / 2
 	rightWidth := width - leftWidth
@@ -490,96 +654,31 @@ func (m Model) contextContent() string {
 	used := m.context.UsedTokens
 	window := maxInt(m.context.WindowTokens, 1)
 	var b strings.Builder
-
 	fmt.Fprintf(&b, "tokens: %d / %d (%d%%)\n", used, window, used*100/window)
+	fmt.Fprintf(&b, "pollution risk: %s\n", fallback(m.context.PollutionRisk, "unknown"))
 
-	// Color-code pollution risk.
-	riskColor := lipgloss.Color("252")
-	switch m.context.PollutionRisk {
-	case "low":
-		riskColor = lipgloss.Color("42") // green
-	case "warning":
-		riskColor = lipgloss.Color("220") // yellow
-	case "over_window":
-		riskColor = lipgloss.Color("196") // red
-	}
-	riskLine := fmt.Sprintf("pollution risk: %s", fallback(m.context.PollutionRisk, "unknown"))
-	fmt.Fprintf(&b, "%s\n", lipgloss.NewStyle().Foreground(riskColor).Render(riskLine))
-
-	// Bar chart for token usage across tiers.
-	nearT, anchorT, artifactT := 0, 0, 0
-	for _, item := range m.context.Items {
-		switch item.Tier {
-		case core.TierNear:
-			nearT += item.TokenEstimate
-		case core.TierAnchor:
-			anchorT += item.TokenEstimate
-		case core.TierArtifact:
-			artifactT += item.TokenEstimate
-		}
-	}
-	renderTierBar(&b, "NEAR:", nearT, window)
-	renderTierBar(&b, "ANCHOR:", anchorT, window)
-	renderTierBar(&b, "ARTIFACT:", artifactT, window)
-
-	// Item listing with selection highlighting.
-	itemIdx := 0
 	for _, tier := range []core.ContextTier{core.TierNear, core.TierAnchor, core.TierArtifact} {
-		b.WriteByte('\n')
-		b.WriteString(strings.ToUpper(string(tier)))
-		b.WriteByte('\n')
+		fmt.Fprintf(&b, "\n%s\n", strings.ToUpper(string(tier)))
 		count := 0
 		for _, item := range m.context.Items {
 			if item.Tier != tier {
 				continue
 			}
 			count++
-			isSelected := itemIdx == m.selectedContextItem
-
 			pin := " "
 			if item.Pinned {
 				pin = "*"
 			}
-			cursor := " "
-			if isSelected {
-				cursor = ">"
-			}
-			line := fmt.Sprintf("%s%s %5d %s", cursor, pin, item.TokenEstimate, fallback(item.Title, item.ID))
-
-			if isSelected {
-				line = lipgloss.NewStyle().Reverse(true).Render(line)
-			}
-			b.WriteString(line)
-			b.WriteByte('\n')
-
+			fmt.Fprintf(&b, "%s %5d %s\n", pin, item.TokenEstimate, fallback(item.Title, item.ID))
 			if item.Reason != "" {
-				reasonLine := fmt.Sprintf("  %s", item.Reason)
-				if isSelected {
-					reasonLine = lipgloss.NewStyle().Reverse(true).Render(reasonLine)
-				}
-				b.WriteString(reasonLine)
-				b.WriteByte('\n')
+				fmt.Fprintf(&b, "  %s\n", item.Reason)
 			}
-			itemIdx++
 		}
 		if count == 0 {
 			b.WriteString("  empty\n")
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")
-}
-
-func renderTierBar(b *strings.Builder, label string, tierTokens, windowTokens int) {
-	pct := 0
-	if windowTokens > 0 {
-		pct = tierTokens * 100 / windowTokens
-	}
-	filled := pct / 10
-	if filled > 10 {
-		filled = 10
-	}
-	bar := strings.Repeat("\u2588", filled) + strings.Repeat("\u2591", 10-filled)
-	fmt.Fprintf(b, "\n%-9s %s %d%%", label, bar, pct)
 }
 
 func (m Model) traceContent() string {
@@ -656,7 +755,7 @@ func renderHeader(width int, status string, closed bool, focusName, scroll strin
 }
 
 func renderFooter(width int, showHelp bool) string {
-	line := "tab focus | ? help | j/k select | p pin | d delete | pgup/pgdn scroll | q quit"
+	line := "tab focus | i prompt | ? help | up/down scroll | pgup/pgdn | home/end | q quit"
 	if showHelp {
 		line = "? close help | esc close | q quit"
 	}
@@ -682,14 +781,16 @@ func helpContent() string {
 	return strings.TrimSpace(`
 Controls
   tab: focus next panel
-  up/down: scroll focused panel (list panels)
-  j/k: move cursor in context panel
-  p: pin/unpin selected context item
-  d: delete selected context item (not pinned)
+  i: enter prompt input mode
+  up/down: scroll focused panel
   pgup/pgdn: scroll focused panel by page
   home/end: jump focused panel
   ?: toggle help
   q or ctrl+c: quit
+
+Input Modes
+  Prompt (i): type a message, Enter to submit, Esc to cancel
+  Approve: y to allow tool, n to deny, Esc to cancel
 
 Panels
   Context Map: evidence and context budget by tier
