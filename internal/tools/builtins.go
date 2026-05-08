@@ -75,8 +75,12 @@ func (t shellTool) Run(ctx context.Context, input core.ToolInput) core.ToolResul
 }
 
 func (t shellTool) Summarize(result core.ToolResult) core.Observation {
+	return t.SummarizeWithBudget(result, BudgetSafe)
+}
+
+func (t shellTool) SummarizeWithBudget(result core.ToolResult, budget BudgetLevel) core.Observation {
 	if t.summarizer != nil {
-		return t.summarizer.Summarize(result, BudgetSafe)
+		return t.summarizer.Summarize(result, budget)
 	}
 	return summarizeResult("shell", result, core.TierArtifact)
 }
@@ -171,8 +175,12 @@ func (t rgTool) Run(ctx context.Context, input core.ToolInput) core.ToolResult {
 }
 
 func (t rgTool) Summarize(result core.ToolResult) core.Observation {
+	return t.SummarizeWithBudget(result, BudgetSafe)
+}
+
+func (t rgTool) SummarizeWithBudget(result core.ToolResult, budget BudgetLevel) core.Observation {
 	if t.summarizer != nil {
-		return t.summarizer.Summarize(result, BudgetSafe)
+		return t.summarizer.Summarize(result, budget)
 	}
 	return summarizeResult("rg", result, core.TierArtifact)
 }
@@ -222,8 +230,12 @@ func (t readFileTool) Run(ctx context.Context, input core.ToolInput) core.ToolRe
 }
 
 func (t readFileTool) Summarize(result core.ToolResult) core.Observation {
+	return t.SummarizeWithBudget(result, BudgetSafe)
+}
+
+func (t readFileTool) SummarizeWithBudget(result core.ToolResult, budget BudgetLevel) core.Observation {
 	if t.summarizer != nil {
-		return t.summarizer.Summarize(result, BudgetSafe)
+		return t.summarizer.Summarize(result, budget)
 	}
 	return summarizeResult("read_file", result, core.TierArtifact)
 }
@@ -277,8 +289,12 @@ func (t writeFileTool) Run(ctx context.Context, input core.ToolInput) core.ToolR
 }
 
 func (t writeFileTool) Summarize(result core.ToolResult) core.Observation {
+	return t.SummarizeWithBudget(result, BudgetSafe)
+}
+
+func (t writeFileTool) SummarizeWithBudget(result core.ToolResult, budget BudgetLevel) core.Observation {
 	if t.summarizer != nil {
-		return t.summarizer.Summarize(result, BudgetSafe)
+		return t.summarizer.Summarize(result, budget)
 	}
 	return summarizeResult("write_file", result, core.TierArtifact)
 }
@@ -339,8 +355,12 @@ func (t applyPatchTool) Run(ctx context.Context, input core.ToolInput) core.Tool
 }
 
 func (t applyPatchTool) Summarize(result core.ToolResult) core.Observation {
+	return t.SummarizeWithBudget(result, BudgetSafe)
+}
+
+func (t applyPatchTool) SummarizeWithBudget(result core.ToolResult, budget BudgetLevel) core.Observation {
 	if t.summarizer != nil {
-		return t.summarizer.Summarize(result, BudgetSafe)
+		return t.summarizer.Summarize(result, budget)
 	}
 	return summarizeResult("apply_patch", result, core.TierArtifact)
 }
@@ -393,8 +413,12 @@ func (t gitStatusTool) Run(ctx context.Context, input core.ToolInput) core.ToolR
 }
 
 func (t gitStatusTool) Summarize(result core.ToolResult) core.Observation {
+	return t.SummarizeWithBudget(result, BudgetSafe)
+}
+
+func (t gitStatusTool) SummarizeWithBudget(result core.ToolResult, budget BudgetLevel) core.Observation {
 	if t.summarizer != nil {
-		return t.summarizer.Summarize(result, BudgetSafe)
+		return t.summarizer.Summarize(result, budget)
 	}
 	return summarizeResult("git_status", result, core.TierArtifact)
 }
@@ -426,8 +450,12 @@ func (t runTestTool) Run(ctx context.Context, input core.ToolInput) core.ToolRes
 }
 
 func (t runTestTool) Summarize(result core.ToolResult) core.Observation {
+	return t.SummarizeWithBudget(result, BudgetSafe)
+}
+
+func (t runTestTool) SummarizeWithBudget(result core.ToolResult, budget BudgetLevel) core.Observation {
 	if t.summarizer != nil {
-		return t.summarizer.Summarize(result, BudgetSafe)
+		return t.summarizer.Summarize(result, budget)
 	}
 	return summarizeResult("run_test", result, core.TierArtifact)
 }

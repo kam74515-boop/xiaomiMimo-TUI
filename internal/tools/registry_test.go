@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -89,6 +90,31 @@ func TestExecutorPublishesEventsAndPlacesArtifacts(t *testing.T) {
 	}
 }
 
+func TestExecutorUsesRuntimeBudgetForSummarizers(t *testing.T) {
+	workspace := t.TempDir()
+	writeFile(t, filepath.Join(workspace, "alpha.txt"), strings.Repeat("alpha\n", 40))
+
+	recorder := &recordingSummarizer{}
+	registry := NewDefaultRegistry(workspace, func(store *artifact.Store) map[string]Summarizer {
+		return map[string]Summarizer{"read_file": recorder}
+	})
+	executor := NewExecutor(registry, nil, WithBudgetProvider(func() BudgetLevel {
+		return BudgetCritical
+	}))
+
+	_, observation := executor.Execute(context.Background(), core.ToolCall{
+		Name:  "read_file",
+		Input: core.ToolInput{"path": "alpha.txt"},
+	})
+
+	if recorder.budget != BudgetCritical {
+		t.Fatalf("summarizer budget = %v, want %v", recorder.budget, BudgetCritical)
+	}
+	if !strings.Contains(observation.Summary, "budget=2") {
+		t.Fatalf("observation summary = %q, want critical budget marker", observation.Summary)
+	}
+}
+
 func TestExecutorConservativePermissionPolicy(t *testing.T) {
 	workspace := t.TempDir()
 	registry := NewDefaultRegistry(workspace)
@@ -119,6 +145,19 @@ func TestExecutorConservativePermissionPolicy(t *testing.T) {
 	}
 	if got := mustReadFile(t, filepath.Join(workspace, "allowed.txt")); got != "ok" {
 		t.Fatalf("allowed write_file content = %q", got)
+	}
+}
+
+type recordingSummarizer struct {
+	budget BudgetLevel
+}
+
+func (r *recordingSummarizer) Summarize(result core.ToolResult, budget BudgetLevel) core.Observation {
+	r.budget = budget
+	return core.Observation{
+		Summary:          fmt.Sprintf("budget=%d artifact=%s", budget, result.ArtifactID),
+		ContextPlacement: core.TierArtifact,
+		ArtifactID:       result.ArtifactID,
 	}
 }
 

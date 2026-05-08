@@ -11,10 +11,11 @@ import (
 const permissionDeniedExitCode = 126
 
 type Executor struct {
-	registry   *Registry
-	bus        *core.Bus
-	policy     ExecutorPolicy
-	ApprovalCh chan<- core.ApprovalRequest
+	registry       *Registry
+	bus            *core.Bus
+	policy         ExecutorPolicy
+	budgetProvider func() BudgetLevel
+	ApprovalCh     chan<- core.ApprovalRequest
 }
 
 type ExecutorPolicy struct {
@@ -51,6 +52,12 @@ func WithAllowedAskTools(names ...string) ExecutorOption {
 func WithApprovalChannel(ch chan<- core.ApprovalRequest) ExecutorOption {
 	return func(executor *Executor) {
 		executor.ApprovalCh = ch
+	}
+}
+
+func WithBudgetProvider(provider func() BudgetLevel) ExecutorOption {
+	return func(executor *Executor) {
+		executor.budgetProvider = provider
 	}
 }
 
@@ -148,10 +155,17 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 	result := tool.Run(ctx, call.Input)
 	e.publishResult(call, result)
 
-	observation := tool.Summarize(result)
+	observation := SummarizeTool(tool, result, e.currentBudget())
 	normalizeObservation(&observation, result)
 	e.publishObservation(call, observation)
 	return result, observation
+}
+
+func (e *Executor) currentBudget() BudgetLevel {
+	if e == nil || e.budgetProvider == nil {
+		return BudgetSafe
+	}
+	return e.budgetProvider()
 }
 
 func (p ExecutorPolicy) isAllowedAsk(name string) bool {

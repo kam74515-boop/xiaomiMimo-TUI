@@ -21,6 +21,22 @@ type Summarizer interface {
 	Summarize(result core.ToolResult, budget BudgetLevel) core.Observation
 }
 
+// BudgetAwareTool is implemented by tools that can summarize with a caller-
+// supplied budget level. It is intentionally separate from core.Tool so older
+// tools remain compatible.
+type BudgetAwareTool interface {
+	SummarizeWithBudget(result core.ToolResult, budget BudgetLevel) core.Observation
+}
+
+// SummarizeTool converts a result into an observation, using the budget-aware
+// path when a tool supports it.
+func SummarizeTool(tool core.Tool, result core.ToolResult, budget BudgetLevel) core.Observation {
+	if budgeted, ok := tool.(BudgetAwareTool); ok {
+		return budgeted.SummarizeWithBudget(result, budget)
+	}
+	return tool.Summarize(result)
+}
+
 // BudgetFromContext computes a BudgetLevel based on how much of the context
 // window has been consumed. The calculation is deliberately simple:
 //

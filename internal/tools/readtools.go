@@ -99,8 +99,12 @@ func (t listDirTool) Run(ctx context.Context, input core.ToolInput) core.ToolRes
 }
 
 func (t listDirTool) Summarize(result core.ToolResult) core.Observation {
+	return t.SummarizeWithBudget(result, BudgetSafe)
+}
+
+func (t listDirTool) SummarizeWithBudget(result core.ToolResult, budget BudgetLevel) core.Observation {
 	if t.summarizer != nil {
-		return t.summarizer.Summarize(result, BudgetSafe)
+		return t.summarizer.Summarize(result, budget)
 	}
 	return summarizeResult("list_dir", result, core.TierArtifact)
 }
@@ -142,8 +146,12 @@ func (t gitDiffTool) Run(ctx context.Context, input core.ToolInput) core.ToolRes
 }
 
 func (t gitDiffTool) Summarize(result core.ToolResult) core.Observation {
+	return t.SummarizeWithBudget(result, BudgetSafe)
+}
+
+func (t gitDiffTool) SummarizeWithBudget(result core.ToolResult, budget BudgetLevel) core.Observation {
 	if t.summarizer != nil {
-		return t.summarizer.Summarize(result, BudgetSafe)
+		return t.summarizer.Summarize(result, budget)
 	}
 	return summarizeResult("git_diff", result, core.TierArtifact)
 }
@@ -179,8 +187,12 @@ func (t gitLogTool) Run(ctx context.Context, input core.ToolInput) core.ToolResu
 }
 
 func (t gitLogTool) Summarize(result core.ToolResult) core.Observation {
+	return t.SummarizeWithBudget(result, BudgetSafe)
+}
+
+func (t gitLogTool) SummarizeWithBudget(result core.ToolResult, budget BudgetLevel) core.Observation {
 	if t.summarizer != nil {
-		return t.summarizer.Summarize(result, BudgetSafe)
+		return t.summarizer.Summarize(result, budget)
 	}
 	return summarizeResult("git_log", result, core.TierArtifact)
 }
@@ -247,8 +259,12 @@ func (t artifactReadTool) Run(ctx context.Context, input core.ToolInput) core.To
 }
 
 func (t artifactReadTool) Summarize(result core.ToolResult) core.Observation {
+	return t.SummarizeWithBudget(result, BudgetSafe)
+}
+
+func (t artifactReadTool) SummarizeWithBudget(result core.ToolResult, budget BudgetLevel) core.Observation {
 	if t.summarizer != nil {
-		return t.summarizer.Summarize(result, BudgetSafe)
+		return t.summarizer.Summarize(result, budget)
 	}
 	placement := core.TierNear
 	state := "small artifact payloads summarized"

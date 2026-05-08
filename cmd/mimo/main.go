@@ -294,7 +294,15 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 		toolRegistry := tools.NewDefaultRegistry(cfg.Runtime.Workspace, summarizers.NewRegistry)
 		approvalCh := make(chan core.ApprovalRequest, 8)
 		defer close(approvalCh)
-		executor := tools.NewExecutor(toolRegistry, bus, tools.WithApprovalChannel(approvalCh))
+		executor := tools.NewExecutor(
+			toolRegistry,
+			bus,
+			tools.WithApprovalChannel(approvalCh),
+			tools.WithBudgetProvider(func() tools.BudgetLevel {
+				snapshot := manager.Snapshot()
+				return tools.BudgetFromContext(snapshot.WindowTokens, snapshot.UsedTokens)
+			}),
+		)
 
 		// Bridge approval requests from the executor to the event bus.
 		go func() {
