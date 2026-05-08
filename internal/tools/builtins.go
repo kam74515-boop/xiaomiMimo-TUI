@@ -187,14 +187,17 @@ func (t rgTool) Run(ctx context.Context, input core.ToolInput) core.ToolResult {
 	err := cmd.Run()
 	code := exitCode(err)
 
+	redactedStdout := redactSecrets(stdout.Bytes())
+	redactedStderr := redactSecrets(stderr.Bytes())
+
 	artifactID, artifactErr := t.writeArtifact(artifact.WriteRequest{
 		Tool:     t.Name(),
 		Kind:     "command",
 		ExitCode: code,
 		Inputs:   redactInput(input),
 		Payloads: []artifact.Payload{
-			{Name: "stdout.txt", Data: stdout.Bytes()},
-			{Name: "stderr.txt", Data: stderr.Bytes()},
+			{Name: "stdout.txt", Data: redactedStdout},
+			{Name: "stderr.txt", Data: redactedStderr},
 		},
 	})
 	if artifactErr != nil {
@@ -252,7 +255,7 @@ func (t readFileTool) Run(ctx context.Context, input core.ToolInput) core.ToolRe
 		Kind:     "content",
 		ExitCode: 0,
 		Inputs:   redactInput(input),
-		Payloads: []artifact.Payload{{Name: "content.txt", Data: data}},
+		Payloads: []artifact.Payload{{Name: "content.txt", Data: redactSecrets(data)}},
 	})
 	if artifactErr != nil {
 		return core.ToolResult{ExitCode: 1, Error: artifactErr.Error()}
@@ -435,14 +438,17 @@ func (t gitStatusTool) Run(ctx context.Context, input core.ToolInput) core.ToolR
 	err := cmd.Run()
 	code := exitCode(err)
 
+	redactedStdout := redactSecrets(stdout.Bytes())
+	redactedStderr := redactSecrets(stderr.Bytes())
+
 	artifactID, artifactErr := t.writeArtifact(artifact.WriteRequest{
 		Tool:     t.Name(),
 		Kind:     "command",
 		ExitCode: code,
 		Inputs:   redactInput(input),
 		Payloads: []artifact.Payload{
-			{Name: "stdout.txt", Data: stdout.Bytes()},
-			{Name: "stderr.txt", Data: stderr.Bytes()},
+			{Name: "stdout.txt", Data: redactedStdout},
+			{Name: "stderr.txt", Data: redactedStderr},
 		},
 	})
 	if artifactErr != nil {

@@ -286,14 +286,17 @@ func (t baseTool) runGitCommand(ctx context.Context, input core.ToolInput, args 
 	err := cmd.Run()
 	code := exitCode(err)
 
+	redactedStdout := redactSecrets(stdout.Bytes())
+	redactedStderr := redactSecrets(stderr.Bytes())
+
 	artifactID, artifactErr := t.writeArtifact(artifact.WriteRequest{
 		Tool:     t.Name(),
 		Kind:     "command",
 		ExitCode: code,
 		Inputs:   redactInput(input),
 		Payloads: []artifact.Payload{
-			{Name: "stdout.txt", Data: stdout.Bytes()},
-			{Name: "stderr.txt", Data: stderr.Bytes()},
+			{Name: "stdout.txt", Data: redactedStdout},
+			{Name: "stderr.txt", Data: redactedStderr},
 		},
 	})
 	if artifactErr != nil {
