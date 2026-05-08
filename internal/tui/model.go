@@ -82,6 +82,8 @@ type Model struct {
 	textInput       string
 	cursorPos       int
 	pendingApproval core.ApprovalRequest
+
+	promptQueue []string
 }
 
 type agentEventMsg core.AgentEvent
@@ -157,15 +159,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.Type {
 			case tea.KeyEnter:
 				if strings.TrimSpace(m.textInput) != "" {
-					m.chat += "\nuser> " + m.textInput
-					if m.bus != nil {
-						event := core.NewEvent(core.EventUserPrompt)
-						event.Message = m.textInput
-						m.bus.Publish(event)
+					if m.running {
+						m.promptQueue = append(m.promptQueue, m.textInput)
+						m.status = fmt.Sprintf("prompt queued (position %d)", len(m.promptQueue))
+					} else {
+						m.chat += "\nuser> " + m.textInput
+						if m.bus != nil {
+							event := core.NewEvent(core.EventUserPrompt)
+							event.Message = m.textInput
+							m.bus.Publish(event)
+						}
+						m.running = true
+						m.lastError = ""
+						m.status = "agent processing..."
 					}
-					m.running = true
-					m.lastError = ""
-					m.status = "agent processing..."
 				} else {
 					m.status = "prompt submitted (empty)"
 				}
@@ -261,6 +268,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					event := core.NewEvent(core.EventOracleReview)
 					m.bus.Publish(event)
 					m.status = "oracle review requested"
+				}
+				return m, nil
+			case "ctrl+g":
+				if m.running {
+					m.promptQueue = nil
+					if m.bus != nil {
+						m.bus.Publish(core.NewEvent(core.EventInterrupt))
+					}
+					m.status = "interrupt sent — agent run cancelled"
 				}
 				return m, nil
 			}
@@ -460,9 +476,24 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 		m.notes = append(m.notes, "error: "+msg)
 		m.running = false
 		m.status = "error: " + msg
+	case core.EventAgentStarted:
+		m.running = true
+		m.lastError = ""
 	case core.EventDone:
 		m.running = false
 		m.status = fallback(event.Message, "agent complete")
+		if len(m.promptQueue) > 0 {
+			next := m.promptQueue[0]
+			m.promptQueue = m.promptQueue[1:]
+			m.chat += "\nuser> " + next
+			if m.bus != nil {
+				ev := core.NewEvent(core.EventUserPrompt)
+				ev.Message = next
+				m.bus.Publish(ev)
+			}
+			m.running = true
+			m.status = fmt.Sprintf("dequeued prompt (%d remaining)", len(m.promptQueue))
+		}
 	case core.EventApprovalNeeded:
 		if event.Approval != nil {
 			m.inputMode = InputApprove

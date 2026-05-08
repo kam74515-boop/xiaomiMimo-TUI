@@ -328,6 +328,7 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 		loopConfig := agent.DefaultLoopConfig()
 		userPrompts := bus.Subscribe(8)
 		oracleEvents := bus.Subscribe(8)
+		interruptEvents := bus.Subscribe(4)
 
 		// Track the most recent prompt and observations for oracle review.
 		lastPrompt := prompt
@@ -346,14 +347,19 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 			}
 		}()
 
+		// Shared cancel for in-progress agent runs.
+		var agentCancel context.CancelFunc
+
 		// Initial agent run with the startup prompt.
-		history, err := agent.Loop(ctx, prompt, client, executor, manager, toolRegistry.ToolSpecs(), bus, loopConfig, nil)
+		runCtx, cancel := context.WithCancel(ctx)
+		agentCancel = cancel
+		history, err := agent.Loop(runCtx, prompt, client, executor, manager, toolRegistry.ToolSpecs(), bus, loopConfig, nil)
 		if err != nil {
 			// Log error but continue to multi-turn listening so the user can retry.
 			bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: "startup agent error: " + err.Error()}})
 		}
 
-		// Multi-turn: listen for user prompts and oracle review requests.
+		// Multi-turn: listen for user prompts, oracle review, and interrupt.
 		for {
 			select {
 			case <-ctx.Done():
@@ -364,7 +370,20 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 				}
 				if event.Type == core.EventUserPrompt && event.Message != "" {
 					lastPrompt = event.Message
-					nextHistory, loopErr := agent.Loop(ctx, event.Message, client, executor, manager, toolRegistry.ToolSpecs(), bus, loopConfig, history)
+					// Create a fresh cancel context if previous was used.
+					if agentCancel == nil {
+						runCtx, cancel = context.WithCancel(ctx)
+						agentCancel = cancel
+					} else {
+						select {
+						case <-runCtx.Done():
+							runCtx, cancel = context.WithCancel(ctx)
+							agentCancel = cancel
+						default:
+						}
+					}
+					bus.Publish(core.NewEvent(core.EventAgentStarted))
+					nextHistory, loopErr := agent.Loop(runCtx, event.Message, client, executor, manager, toolRegistry.ToolSpecs(), bus, loopConfig, history)
 					if loopErr != nil {
 						bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: "agent error: " + loopErr.Error()}})
 						if len(nextHistory) > 0 {
@@ -373,6 +392,15 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 						continue
 					}
 					history = nextHistory
+				}
+			case event, ok := <-interruptEvents:
+				if !ok {
+					return
+				}
+				if event.Type == core.EventInterrupt {
+					if agentCancel != nil {
+						agentCancel()
+					}
 				}
 			case event, ok := <-oracleEvents:
 				if !ok {

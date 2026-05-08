@@ -1015,6 +1015,133 @@ func TestCtrlRNotInHelpMode(t *testing.T) {
 	}
 }
 
+func TestPromptQueuedWhileRunning(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+	m.running = true
+
+	// Submit prompt while running — should queue, not publish.
+	m = updateModel(t, m, runeKey('i'))
+	m = updateModel(t, m, runeKey('h'))
+	m = updateModel(t, m, runeKey('i'))
+	m = updateModel(t, m, keyMsg(tea.KeyEnter))
+
+	if len(m.promptQueue) != 1 || m.promptQueue[0] != "hi" {
+		t.Fatalf("promptQueue = %v, want [hi]", m.promptQueue)
+	}
+	if !strings.Contains(m.status, "queued") {
+		t.Fatalf("status = %q, want queued message", m.status)
+	}
+	if m.running != true {
+		t.Fatal("running should stay true when queueing")
+	}
+}
+
+func TestQueuedPromptFiresAfterDone(t *testing.T) {
+	bus := core.NewBus()
+	sub := bus.Subscribe(10)
+
+	m := NewModel(nil, bus)
+	m.width = 80
+	m.height = 24
+	m.running = true
+	m.promptQueue = []string{"next task"}
+
+	// EventDone should dequeue and publish next prompt.
+	m.applyEvent(core.AgentEvent{Type: core.EventDone, Message: "complete"})
+
+	events := drainTuiBus(sub)
+	hasUserPrompt := false
+	for _, ev := range events {
+		if ev.Type == core.EventUserPrompt && ev.Message == "next task" {
+			hasUserPrompt = true
+		}
+	}
+	if !hasUserPrompt {
+		t.Fatal("expected EventUserPrompt for dequeued prompt")
+	}
+	if m.running != true {
+		t.Fatal("running should be true after dequeueing")
+	}
+	if len(m.promptQueue) != 0 {
+		t.Fatalf("promptQueue should be empty after dequeue, got %v", m.promptQueue)
+	}
+	if !strings.Contains(m.status, "dequeued") {
+		t.Fatalf("status = %q, want dequeued message", m.status)
+	}
+}
+
+func TestCtrlGDuringRun(t *testing.T) {
+	bus := core.NewBus()
+	sub := bus.Subscribe(10)
+
+	m := NewModel(nil, bus)
+	m.width = 80
+	m.height = 24
+	m.running = true
+	m.promptQueue = []string{"should be cleared"}
+
+	m = updateModel(t, m, keyMsg(tea.KeyCtrlG))
+
+	if len(m.promptQueue) != 0 {
+		t.Fatalf("promptQueue should be cleared on interrupt, got %v", m.promptQueue)
+	}
+	if !strings.Contains(m.status, "interrupt") {
+		t.Fatalf("status = %q, want interrupt message", m.status)
+	}
+
+	events := drainTuiBus(sub)
+	hasInterrupt := false
+	for _, ev := range events {
+		if ev.Type == core.EventInterrupt {
+			hasInterrupt = true
+		}
+	}
+	if !hasInterrupt {
+		t.Fatal("expected EventInterrupt on ctrl+g during run")
+	}
+}
+
+func TestCtrlGDoesNothingWhenNotRunning(t *testing.T) {
+	bus := core.NewBus()
+	sub := bus.Subscribe(10)
+
+	m := NewModel(nil, bus)
+	m.width = 80
+	m.height = 24
+	m.running = false
+
+	prevStatus := m.status
+	m = updateModel(t, m, keyMsg(tea.KeyCtrlG))
+
+	if m.status != prevStatus {
+		t.Fatalf("ctrl+g should be no-op when not running, status changed from %q to %q", prevStatus, m.status)
+	}
+
+	events := drainTuiBus(sub)
+	if len(events) > 0 {
+		t.Fatal("no events should be published when ctrl+g is pressed while not running")
+	}
+}
+
+func TestEventAgentStarted(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+	m.running = false
+	m.lastError = "old error"
+
+	m.applyEvent(core.AgentEvent{Type: core.EventAgentStarted})
+
+	if !m.running {
+		t.Fatal("running should be true after EventAgentStarted")
+	}
+	if m.lastError != "" {
+		t.Fatalf("lastError should be cleared, got %q", m.lastError)
+	}
+}
+
 func numberedLines(count int) string {
 	lines := make([]string, count)
 	for i := range lines {
