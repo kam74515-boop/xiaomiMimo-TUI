@@ -327,6 +327,24 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 		}
 		loopConfig := agent.DefaultLoopConfig()
 		userPrompts := bus.Subscribe(8)
+		oracleEvents := bus.Subscribe(8)
+
+		// Track the most recent prompt and observations for oracle review.
+		lastPrompt := prompt
+		var recentObservations []core.Observation
+
+		// Collect observation events for oracle context.
+		obsSub := bus.Subscribe(32)
+		go func() {
+			for event := range obsSub {
+				if event.Type == core.EventObservation && event.Observation != nil {
+					recentObservations = append(recentObservations, *event.Observation)
+					if len(recentObservations) > 5 {
+						recentObservations = recentObservations[len(recentObservations)-5:]
+					}
+				}
+			}
+		}()
 
 		// Initial agent run with the startup prompt.
 		history, err := agent.Loop(ctx, prompt, client, executor, manager, toolRegistry.ToolSpecs(), bus, loopConfig, nil)
@@ -335,7 +353,7 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 			bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: "startup agent error: " + err.Error()}})
 		}
 
-		// Multi-turn: listen for user prompts from the TUI.
+		// Multi-turn: listen for user prompts and oracle review requests.
 		for {
 			select {
 			case <-ctx.Done():
@@ -345,6 +363,7 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 					return
 				}
 				if event.Type == core.EventUserPrompt && event.Message != "" {
+					lastPrompt = event.Message
 					nextHistory, loopErr := agent.Loop(ctx, event.Message, client, executor, manager, toolRegistry.ToolSpecs(), bus, loopConfig, history)
 					if loopErr != nil {
 						bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: "agent error: " + loopErr.Error()}})
@@ -354,6 +373,23 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 						continue
 					}
 					history = nextHistory
+				}
+			case event, ok := <-oracleEvents:
+				if !ok {
+					return
+				}
+				if event.Type == core.EventOracleReview {
+					goal := lastPrompt
+					if goal == "" {
+						goal = prompt
+					}
+					contextmap.RunOracleStep(manager, goal, recentObservations, bus)
+					bus.Publish(core.AgentEvent{
+						Type: core.EventObservation,
+						Observation: &core.Observation{
+							Summary: "oracle review triggered manually via ctrl+r — context placement re-evaluated",
+						},
+					})
 				}
 			}
 		}

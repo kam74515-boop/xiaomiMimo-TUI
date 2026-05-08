@@ -258,7 +258,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			case "ctrl+r":
 				if m.bus != nil {
-					event := core.NewEvent(core.EventType("oracle_review"))
+					event := core.NewEvent(core.EventOracleReview)
 					m.bus.Publish(event)
 					m.status = "oracle review requested"
 				}

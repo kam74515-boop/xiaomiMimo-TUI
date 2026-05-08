@@ -976,7 +976,7 @@ func TestCtrlRPublishesOracleReview(t *testing.T) {
 	events := drainTuiBus(sub)
 	hasOracleReview := false
 	for _, ev := range events {
-		if string(ev.Type) == "oracle_review" {
+		if ev.Type == core.EventOracleReview {
 			hasOracleReview = true
 		}
 	}

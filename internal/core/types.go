@@ -24,6 +24,9 @@ const (
 	EventDone           EventType = "done"
 	EventApprovalNeeded EventType = "approval_needed"
 	EventUserPrompt     EventType = "user_prompt"
+	EventOracleReview   EventType = "oracle_review"
+	EventInterrupt      EventType = "interrupt"
+	EventAgentStarted   EventType = "agent_started"
 )
 
 type ContextTier string
