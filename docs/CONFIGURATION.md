@@ -10,7 +10,7 @@ Environment variables always override config file values.
 
 ### `MIMO_BASE_URL`
 
-- **Default:** `https://api.xiaomimimo.com/v1`
+- **Default:** `https://token-plan-cn.xiaomimimo.com/v1`
 - **Description:** MiMo API endpoint URL. Must be an OpenAI-compatible `/v1` endpoint.
 
 ```sh
@@ -139,7 +139,7 @@ context_window = 1000000
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `base_url` | string | `https://api.xiaomimimo.com/v1` | MiMo API endpoint |
+| `base_url` | string | `https://token-plan-cn.xiaomimimo.com/v1` | MiMo API endpoint |
 | `api_key` | string | (empty) | API key. Prefer `MIMO_API_KEY` env var |
 | `model` | string | `mimo-v2.5-pro` | Model ID |
 | `mock` | bool | `false` | Force mock mode |
