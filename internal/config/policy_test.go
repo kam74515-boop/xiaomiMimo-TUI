@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -279,16 +280,57 @@ func TestLoadPolicyFileNotFoundReturnsDefaults(t *testing.T) {
 	}
 }
 
-func TestLoadPolicyInvalidToml(t *testing.T) {
+// P2-5: Verify that invalid TOML returns defaults with no error (warning is
+// logged to stderr). This matches LoadPolicy's behavior.
+func TestLoadPolicyInvalidTomlReturnsDefaults(t *testing.T) {
 	dir := t.TempDir()
 	policyPath := filepath.Join(dir, "policy.toml")
 	if err := os.WriteFile(policyPath, []byte("{{{invalid toml"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	_, err := loadPolicyFromPath(policyPath)
-	if err == nil {
-		t.Fatal("expected error for invalid toml")
+	cfg, err := loadPolicyFromPath(policyPath)
+	if err != nil {
+		t.Fatalf("expected no error (just a log warning), got: %v", err)
+	}
+	if cfg.Defaults.ReadOnly != "allow" {
+		t.Fatalf("read_only = %q, want allow (default)", cfg.Defaults.ReadOnly)
+	}
+	if cfg.Defaults.Destructive != "deny" {
+		t.Fatalf("destructive = %q, want deny (default)", cfg.Defaults.Destructive)
+	}
+}
+
+// P2-5: Verify that LoadPolicy logs a warning (not silently ignores) when
+// policy.toml has invalid syntax. We capture log output to verify.
+func TestLoadPolicyInvalidTomlLogsWarning(t *testing.T) {
+	dir := t.TempDir()
+	policyPath := filepath.Join(dir, "policy.toml")
+	if err := os.WriteFile(policyPath, []byte("{{{invalid toml"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Capture log output.
+	var buf strings.Builder
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	cfg, err := loadPolicyFromPath(policyPath)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "warning") {
+		t.Fatalf("expected log warning, got: %q", output)
+	}
+	if !strings.Contains(output, policyPath) {
+		t.Fatalf("log should mention the file path, got: %q", output)
+	}
+
+	// Verify defaults are returned.
+	if cfg.Defaults.Destructive != "deny" {
+		t.Fatalf("destructive = %q, want deny (default)", cfg.Defaults.Destructive)
 	}
 }
 
@@ -317,6 +359,7 @@ func TestParseBehavior(t *testing.T) {
 }
 
 // loadPolicyFromPath reads a policy file from an explicit path (used in tests).
+// Matches LoadPolicy behavior: logs a warning and returns defaults on parse error.
 func loadPolicyFromPath(path string) (PolicyConfig, error) {
 	cfg := DefaultPolicy()
 	data, err := os.ReadFile(path)
@@ -327,7 +370,8 @@ func loadPolicyFromPath(path string) (PolicyConfig, error) {
 		return cfg, err
 	}
 	if err := toml.Unmarshal(data, &cfg); err != nil {
-		return cfg, err
+		log.Printf("warning: policy config %s has invalid syntax, using defaults: %v", path, err)
+		return cfg, nil
 	}
 	return cfg, nil
 }
