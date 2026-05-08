@@ -640,10 +640,10 @@ func detectShellRisk(command string) core.SafetyGrade {
 		"rm ", "rmdir", "chmod", "chown", "sudo",
 		"git reset --hard", "git clean",
 		">/dev/null", ">/dev/null",
-		"curl ", "wget ",
 	}
 	shellMutationMarkers := []string{
 		"mv ", "cp ", "git ",
+		"curl ", "wget ",
 	}
 
 	// Check for curl/wget piped to sh.

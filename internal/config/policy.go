@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,7 +46,8 @@ func LoadPolicy() (PolicyConfig, error) {
 			continue
 		}
 		if err := toml.Unmarshal(data, &cfg); err != nil {
-			return cfg, fmt.Errorf("policy: %s: %w", path, err)
+			log.Printf("warning: policy config %s has invalid syntax, using defaults: %v", path, err)
+			return cfg, nil
 		}
 		return cfg, nil
 	}

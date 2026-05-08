@@ -137,6 +137,15 @@ All environment variables override config file values:
 
 ### Policy File
 
+Policy files are loaded in order (first found wins):
+
+1. `.mimo/policy.toml` (project-local)
+2. `~/.mimo-tui/policy.toml` (user-global)
+
+Note: policy.toml loading order is the reverse of config.toml -- project-local
+policy takes precedence over user-global policy. This lets projects define their
+own security rules while users maintain a global fallback.
+
 Create `.mimo/policy.toml` to control tool permissions:
 
 ```toml
