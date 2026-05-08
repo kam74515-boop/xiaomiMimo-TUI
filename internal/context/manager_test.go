@@ -2,6 +2,7 @@ package context
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,5 +100,66 @@ func TestExpiredUnpinnedItemsDropFromSnapshot(t *testing.T) {
 	}
 	if snapshot := manager.Snapshot(); len(snapshot.Items) != 1 || snapshot.UsedTokens != 10 {
 		t.Fatalf("pinned expired item should remain visible: %+v", snapshot)
+	}
+}
+
+func TestPromoteObservationSetsPlacementSourceTokensAndReason(t *testing.T) {
+	obs := core.Observation{
+		Summary:          "read target files",
+		StateDelta:       "captured current implementation",
+		RiskDelta:        "no new risk",
+		NextAffordances:  []string{"write focused tests", "apply small patch"},
+		ContextPlacement: core.TierArtifact,
+		ArtifactID:       "artifact-123",
+	}
+
+	item := PromoteObservation(" obs-1 ", obs)
+	if item.ID != "obs-1" {
+		t.Fatalf("id = %q, want obs-1", item.ID)
+	}
+	if item.Tier != core.TierArtifact {
+		t.Fatalf("tier = %q, want %q", item.Tier, core.TierArtifact)
+	}
+	if item.Source != ArtifactSource+"artifact-123" {
+		t.Fatalf("source = %q, want artifact source", item.Source)
+	}
+	if item.Title != obs.Summary {
+		t.Fatalf("title = %q, want %q", item.Title, obs.Summary)
+	}
+	wantTokens := EstimateTokens("read target files\ncaptured current implementation\nno new risk\nwrite focused tests\napply small patch")
+	if item.TokenEstimate != wantTokens {
+		t.Fatalf("token estimate = %d, want %d", item.TokenEstimate, wantTokens)
+	}
+	if !strings.Contains(item.Reason, "artifact context") || !strings.Contains(item.Reason, "artifact-123") {
+		t.Fatalf("reason = %q, want placement and artifact id", item.Reason)
+	}
+}
+
+func TestPromoteObservationPlacementDefaultsAndPreservesKnownTiers(t *testing.T) {
+	tests := []struct {
+		name      string
+		placement core.ContextTier
+		want      core.ContextTier
+	}{
+		{name: "default near", want: core.TierNear},
+		{name: "unknown near", placement: core.ContextTier("unknown"), want: core.TierNear},
+		{name: "near", placement: core.TierNear, want: core.TierNear},
+		{name: "anchor", placement: core.TierAnchor, want: core.TierAnchor},
+		{name: "artifact", placement: core.TierArtifact, want: core.TierArtifact},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			item := PromoteObservation("obs", core.Observation{
+				Summary:          "summary",
+				ContextPlacement: test.placement,
+			})
+			if item.Tier != test.want {
+				t.Fatalf("tier = %q, want %q", item.Tier, test.want)
+			}
+			if item.Source != ObservationSource {
+				t.Fatalf("source = %q, want %q", item.Source, ObservationSource)
+			}
+		})
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ const SessionsDir = ".mimo/sessions"
 
 var (
 	ErrInvalidSessionID = errors.New("session id is required")
+	ErrNoSessions       = errors.New("no usable replay sessions")
 	ErrWriterClosed     = errors.New("replay writer is closed")
 )
 
@@ -27,6 +29,18 @@ type Writer struct {
 	mu   sync.Mutex
 	file *os.File
 	path string
+}
+
+type SessionInfo struct {
+	ID            string
+	Path          string
+	Size          int64
+	ModTime       time.Time
+	EventCount    int
+	StartedAt     time.Time
+	LastEventAt   time.Time
+	LastEventType core.EventType
+	Err           error
 }
 
 func SessionPath(workspace, sessionID string) (string, error) {
@@ -42,6 +56,83 @@ func SessionPath(workspace, sessionID string) (string, error) {
 		name += ".jsonl"
 	}
 	return filepath.Join(workspace, SessionsDir, name), nil
+}
+
+func ListSessions(workspace string) ([]SessionInfo, error) {
+	if workspace == "" {
+		workspace = "."
+	}
+	dir := filepath.Join(workspace, SessionsDir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	sessions := make([]SessionInfo, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		fileInfo, err := entry.Info()
+		session := SessionInfo{
+			ID:   strings.TrimSuffix(entry.Name(), ".jsonl"),
+			Path: path,
+		}
+		if err != nil {
+			session.Err = err
+			sessions = append(sessions, session)
+			continue
+		}
+		session.Size = fileInfo.Size()
+		session.ModTime = fileInfo.ModTime()
+		events, err := ReadFile(path)
+		if err != nil {
+			session.Err = err
+			sessions = append(sessions, session)
+			continue
+		}
+		session.EventCount = len(events)
+		for _, event := range events {
+			if session.StartedAt.IsZero() && !event.Time.IsZero() {
+				session.StartedAt = event.Time
+			}
+			if !event.Time.IsZero() {
+				session.LastEventAt = event.Time
+			}
+			session.LastEventType = event.Type
+		}
+		sessions = append(sessions, session)
+	}
+
+	sort.SliceStable(sessions, func(i, j int) bool {
+		left := sessions[i].activityTime()
+		right := sessions[j].activityTime()
+		if !left.Equal(right) {
+			return left.After(right)
+		}
+		if !sessions[i].ModTime.Equal(sessions[j].ModTime) {
+			return sessions[i].ModTime.After(sessions[j].ModTime)
+		}
+		return sessions[i].ID > sessions[j].ID
+	})
+	return sessions, nil
+}
+
+func LatestSession(workspace string) (SessionInfo, error) {
+	sessions, err := ListSessions(workspace)
+	if err != nil {
+		return SessionInfo{}, err
+	}
+	for _, session := range sessions {
+		if session.Err == nil && session.EventCount > 0 {
+			return session, nil
+		}
+	}
+	return SessionInfo{}, ErrNoSessions
 }
 
 func NewWriter(workspace, sessionID string) (*Writer, error) {
@@ -150,4 +241,11 @@ func ReplayFile(ctx context.Context, path string, out chan<- core.AgentEvent) er
 		return err
 	}
 	return Replay(ctx, events, out)
+}
+
+func (s SessionInfo) activityTime() time.Time {
+	if !s.LastEventAt.IsZero() {
+		return s.LastEventAt
+	}
+	return s.ModTime
 }
