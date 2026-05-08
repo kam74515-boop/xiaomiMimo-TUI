@@ -2,6 +2,7 @@ package model
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -141,5 +142,65 @@ func TestAcceptCandidateRejectsUnregistered(t *testing.T) {
 	err := r.AcceptCandidate("ghost")
 	if !errors.Is(err, ErrNotRegistered) {
 		t.Fatalf("AcceptCandidate ghost error = %v, want ErrNotRegistered", err)
+	}
+}
+
+func TestDefaultRegistryHasThreeModels(t *testing.T) {
+	r := DefaultRegistry()
+	if n := r.Len(); n != 3 {
+		t.Fatalf("Len() = %d, want 3", n)
+	}
+
+	// mimo-v2.5-pro: default channel, accepted.
+	pro, ok := r.Get("mimo-v2.5-pro")
+	if !ok {
+		t.Fatal("mimo-v2.5-pro not found")
+	}
+	if pro.Channel != ChannelDefault {
+		t.Fatalf("mimo-v2.5-pro channel = %q, want default", pro.Channel)
+	}
+	if pro.ContextLimit != 1_000_000 {
+		t.Fatalf("mimo-v2.5-pro context limit = %d, want 1000000", pro.ContextLimit)
+	}
+	if !pro.Accepted {
+		t.Fatal("mimo-v2.5-pro should be accepted")
+	}
+
+	// mimo-v2.5-flash: candidate channel, not accepted.
+	flash, ok := r.Get("mimo-v2.5-flash")
+	if !ok {
+		t.Fatal("mimo-v2.5-flash not found")
+	}
+	if flash.Channel != ChannelCandidate {
+		t.Fatalf("mimo-v2.5-flash channel = %q, want candidate", flash.Channel)
+	}
+	if flash.ContextLimit != 128_000 {
+		t.Fatalf("mimo-v2.5-flash context limit = %d, want 128000", flash.ContextLimit)
+	}
+	if flash.Accepted {
+		t.Fatal("mimo-v2.5-flash should not be accepted")
+	}
+
+	// mimo-v2-pro: candidate channel, not accepted.
+	pro2, ok := r.Get("mimo-v2-pro")
+	if !ok {
+		t.Fatal("mimo-v2-pro not found")
+	}
+	if pro2.Channel != ChannelCandidate {
+		t.Fatalf("mimo-v2-pro channel = %q, want candidate", pro2.Channel)
+	}
+	if pro2.ContextLimit != 256_000 {
+		t.Fatalf("mimo-v2-pro context limit = %d, want 256000", pro2.ContextLimit)
+	}
+	if pro2.Accepted {
+		t.Fatal("mimo-v2-pro should not be accepted")
+	}
+
+	// Verify ListModels output contains all three model IDs.
+	output := r.ListModels()
+	for _, id := range []string{"mimo-v2.5-pro", "mimo-v2.5-flash", "mimo-v2-pro"} {
+		if !strings.Contains(output, id) {
+			t.Fatalf("ListModels() output does not contain %q", id)
+		}
 	}
 }

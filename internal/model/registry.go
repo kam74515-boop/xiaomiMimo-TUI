@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -14,7 +15,7 @@ const (
 	ChannelCandidate Channel = "candidate"
 	ChannelLabs      Channel = "labs"
 
-	DefaultMiMoBaseURL = "https://api.xiaomimimo.com/v1"
+	DefaultMiMoBaseURL = "https://token-plan-cn.xiaomimimo.com/v1"
 )
 
 // Info describes a registered MiMo model variant.
@@ -46,9 +47,25 @@ func DefaultRegistry() *Registry {
 		ID:           "mimo-v2.5-pro",
 		BaseURL:      DefaultMiMoBaseURL,
 		Channel:      ChannelDefault,
-		ContextLimit: 1000000,
+		ContextLimit: 1_000_000,
 		Description:  "Primary MiMo model — 1M context, multi-step agent loop.",
 		Accepted:     true,
+	})
+	r.Register(Info{
+		ID:           "mimo-v2.5-flash",
+		BaseURL:      DefaultMiMoBaseURL,
+		Channel:      ChannelCandidate,
+		ContextLimit: 128_000,
+		Description:  "Fast MiMo candidate — 128K context, low-latency responses.",
+		Accepted:     false,
+	})
+	r.Register(Info{
+		ID:           "mimo-v2-pro",
+		BaseURL:      DefaultMiMoBaseURL,
+		Channel:      ChannelCandidate,
+		ContextLimit: 256_000,
+		Description:  "MiMo v2 candidate — 256K context, improved reasoning.",
+		Accepted:     false,
 	})
 	r.defaultID = "mimo-v2.5-pro"
 	return r
@@ -125,6 +142,33 @@ func (r *Registry) AcceptCandidate(id string) error {
 	r.models[id] = info
 	r.defaultID = id
 	return nil
+}
+
+// Len returns the number of registered models.
+func (r *Registry) Len() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.models)
+}
+
+// ListModels returns a formatted table of registered models suitable for
+// printing to stdout.
+func (r *Registry) ListModels() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("%-24s %-12s %12s %-10s %s\n", "ID", "CHANNEL", "CTX_LIMIT", "ACCEPTED", "DESCRIPTION"))
+	for _, info := range r.models {
+		accepted := "no"
+		if info.Accepted {
+			accepted = "yes"
+		}
+		ctxLimit := fmt.Sprintf("%d", info.ContextLimit)
+		b.WriteString(fmt.Sprintf("%-24s %-12s %12s %-10s %s\n",
+			info.ID, string(info.Channel), ctxLimit, accepted, info.Description))
+	}
+	return b.String()
 }
 
 // ErrNotRegistered is returned when a model lookup fails.

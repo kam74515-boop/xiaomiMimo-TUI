@@ -15,6 +15,7 @@ import (
 	contextmap "mimo-tui/internal/context"
 	"mimo-tui/internal/core"
 	"mimo-tui/internal/eval"
+	"mimo-tui/internal/model"
 	"mimo-tui/internal/provider/mimo"
 	"mimo-tui/internal/replay"
 	sessionlog "mimo-tui/internal/session"
@@ -25,11 +26,23 @@ import (
 func main() {
 	opts := parseFlags()
 
+	// ----- model registry -----
+	registry := model.DefaultRegistry()
+
+	if opts.listModels {
+		fmt.Print(registry.ListModels())
+		return
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
 		os.Exit(1)
 	}
+
+	// Resolve the model ID through the registry, applying channel gating.
+	cfg.Provider.Model, cfg.Provider.BaseURL = resolveModel(registry, cfg.Provider.Model, cfg.Provider.BaseURL)
+
 	if opts.workspace != "" {
 		cfg.Runtime.Workspace = opts.workspace
 	}
@@ -37,7 +50,7 @@ func main() {
 		opts.sessionID = newSessionID()
 	}
 
-	events, ctxBus := liveEvents(context.Background(), cfg, promptFromArgs(), opts)
+	events, ctxBus := liveEvents(context.Background(), cfg, promptFromArgs(), opts, registry)
 	if opts.smoke {
 		if err := runSmoke(os.Stdout, events, opts.smokeTimeout); err != nil {
 			fmt.Fprintf(os.Stderr, "smoke: %v\n", err)
@@ -68,6 +81,7 @@ type cliOptions struct {
 	resumeLatest bool
 	eval         bool
 	evalSession  string
+	listModels   bool
 }
 
 func parseFlags() cliOptions {
@@ -79,6 +93,7 @@ func parseFlags() cliOptions {
 	flag.BoolVar(&opts.resumeLatest, "resume-latest", false, "load a compact summary of the latest usable session into the startup Context Map")
 	flag.BoolVar(&opts.eval, "eval", false, "extract and compare trajectories from session logs")
 	flag.StringVar(&opts.evalSession, "eval-session", "", "session ID to evaluate (default: latest)")
+	flag.BoolVar(&opts.listModels, "list-models", false, "print all registered models and exit")
 	flag.Parse()
 	return opts
 }
@@ -93,6 +108,48 @@ func promptFromArgs() string {
 		return "Give a concise MiMo Value Amplifier status report and explain the current tool/context architecture."
 	}
 	return prompt
+}
+
+// isLabsUnlocked returns true when the MIMO_LABS environment variable is
+// set to "1", "true", "yes", or "on".
+func isLabsUnlocked() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("MIMO_LABS"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// resolveModel applies the model registry to the configured model ID,
+// enforcing channel gating rules:
+//   - If the model is not registered, warn and use values as-is (forward compat).
+//   - If the model is in the labs channel and labs is not unlocked, fall back to
+//     the registry default.
+//   - If the model is a candidate, log a note and allow it.
+//   - If the model is the default, use the registered base URL.
+//
+// Returns (model, baseURL).
+func resolveModel(registry *model.Registry, configuredModel, configuredBaseURL string) (string, string) {
+	info, ok := registry.Get(configuredModel)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "mimo: model %q not in registry; using provider config as-is for forward compatibility\n", configuredModel)
+		return configuredModel, configuredBaseURL
+	}
+
+	if info.Channel == model.ChannelLabs && !isLabsUnlocked() {
+		def := registry.Default()
+		fmt.Fprintf(os.Stderr, "mimo: model %q is labs-only; set MIMO_LABS=1 to unlock. Falling back to default %q\n", configuredModel, def.ID)
+		return def.ID, def.BaseURL
+	}
+
+	if info.Channel == model.ChannelCandidate {
+		fmt.Fprintf(os.Stderr, "mimo: model %q is a candidate — use with awareness of potential instability\n", configuredModel)
+	}
+
+	if info.BaseURL != "" {
+		return info.ID, info.BaseURL
+	}
+	return info.ID, configuredBaseURL
 }
 
 func runSmoke(w io.Writer, events <-chan core.AgentEvent, timeout time.Duration) error {
@@ -171,7 +228,7 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliOptions) (<-chan core.AgentEvent, *core.Bus) {
+func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliOptions, registry *model.Registry) (<-chan core.AgentEvent, *core.Bus) {
 	bus := core.NewBus()
 	uiEvents := bus.Subscribe(256)
 
@@ -207,10 +264,10 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 			}
 		}()
 
-		registry := tools.NewDefaultRegistry(cfg.Runtime.Workspace)
+		toolRegistry := tools.NewDefaultRegistry(cfg.Runtime.Workspace)
 		approvalCh := make(chan core.ApprovalRequest, 8)
 		defer close(approvalCh)
-		executor := tools.NewExecutor(registry, bus, tools.WithApprovalChannel(approvalCh))
+		executor := tools.NewExecutor(toolRegistry, bus, tools.WithApprovalChannel(approvalCh))
 
 		// Bridge approval requests from the executor to the event bus.
 		go func() {
@@ -227,11 +284,14 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 		runBootstrapTools(ctx, executor, manager, bus)
 
 		client := mimo.New(cfg.Provider)
+		if info, ok := registry.Get(cfg.Provider.Model); ok {
+			client.SetModelInfo(info)
+		}
 		loopConfig := agent.DefaultLoopConfig()
 		userPrompts := bus.Subscribe(8)
 
 		// Initial agent run with the startup prompt.
-		history, err := agent.Loop(ctx, prompt, client, executor, manager, registry.ToolSpecs(), bus, loopConfig, nil)
+		history, err := agent.Loop(ctx, prompt, client, executor, manager, toolRegistry.ToolSpecs(), bus, loopConfig, nil)
 		if err != nil {
 			// Log error but continue to multi-turn listening so the user can retry.
 			bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: "startup agent error: " + err.Error()}})
@@ -247,7 +307,7 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 					return
 				}
 				if event.Type == core.EventUserPrompt && event.Message != "" {
-					nextHistory, loopErr := agent.Loop(ctx, event.Message, client, executor, manager, registry.ToolSpecs(), bus, loopConfig, history)
+					nextHistory, loopErr := agent.Loop(ctx, event.Message, client, executor, manager, toolRegistry.ToolSpecs(), bus, loopConfig, history)
 					if loopErr != nil {
 						bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: "agent error: " + loopErr.Error()}})
 						if len(nextHistory) > 0 {

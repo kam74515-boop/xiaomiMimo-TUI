@@ -13,6 +13,7 @@ import (
 
 	"mimo-tui/internal/config"
 	"mimo-tui/internal/core"
+	"mimo-tui/internal/model"
 )
 
 const (
@@ -21,11 +22,12 @@ const (
 )
 
 type Client struct {
-	baseURL string
-	apiKey  string
-	model   string
-	mock    bool
-	http    *http.Client
+	baseURL   string
+	apiKey    string
+	model     string
+	mock      bool
+	http      *http.Client
+	modelInfo model.Info
 }
 
 func New(cfg config.ProviderConfig) *Client {
@@ -54,6 +56,11 @@ func NewMock(model string) *Client {
 		Mock:    true,
 	}
 	return New(cfg)
+}
+
+// SetModelInfo attaches registry-level model metadata for use by the client.
+func (c *Client) SetModelInfo(info model.Info) {
+	c.modelInfo = info
 }
 
 func (c *Client) ChatStream(ctx context.Context, req core.ChatRequest) (<-chan core.ModelEvent, error) {
@@ -123,12 +130,12 @@ func (c *Client) mockStream(ctx context.Context, req core.ChatRequest) <-chan co
 	out := make(chan core.ModelEvent, 4)
 	go func() {
 		defer close(out)
-		for _, chunk := range mockChunks(req) {
+		for _, chunk := range c.mockChunks(req) {
 			if !sendModelEvent(ctx, out, core.ModelEvent{Delta: chunk}) {
 				return
 			}
 		}
-		if !sendModelEvent(ctx, out, core.ModelEvent{Usage: mockUsage(req)}) {
+		if !sendModelEvent(ctx, out, core.ModelEvent{Usage: c.mockUsage(req)}) {
 			return
 		}
 		sendModelEvent(ctx, out, core.ModelEvent{Done: true})
@@ -136,15 +143,20 @@ func (c *Client) mockStream(ctx context.Context, req core.ChatRequest) <-chan co
 	return out
 }
 
-func mockChunks(req core.ChatRequest) []string {
+func (c *Client) mockChunks(req core.ChatRequest) []string {
 	prompt := lastUserMessage(req.Messages)
 	if prompt == "" {
+		if c.modelInfo.ContextLimit > 0 {
+			return []string{fmt.Sprintf("MiMo mock response ready (context window: %d tokens).", c.modelInfo.ContextLimit)}
+		}
 		return []string{"MiMo mock response ready."}
 	}
-	return []string{
-		"MiMo mock response: ",
-		prompt,
+	chunks := []string{"MiMo mock response: "}
+	if c.modelInfo.ContextLimit > 0 {
+		chunks = append(chunks, fmt.Sprintf("[model=%s ctx=%d] ", c.modelInfo.ID, c.modelInfo.ContextLimit))
 	}
+	chunks = append(chunks, prompt)
+	return chunks
 }
 
 func lastUserMessage(messages []core.Message) string {
@@ -156,13 +168,13 @@ func lastUserMessage(messages []core.Message) string {
 	return ""
 }
 
-func mockUsage(req core.ChatRequest) *core.CostUpdate {
+func (c *Client) mockUsage(req core.ChatRequest) *core.CostUpdate {
 	inputTokens := 0
 	for _, msg := range req.Messages {
 		inputTokens += len(strings.Fields(msg.Content))
 	}
 	outputTokens := 0
-	for _, chunk := range mockChunks(req) {
+	for _, chunk := range c.mockChunks(req) {
 		outputTokens += len(strings.Fields(chunk))
 	}
 	return &core.CostUpdate{
