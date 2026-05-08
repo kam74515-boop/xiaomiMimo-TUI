@@ -55,6 +55,7 @@ func Builtins(workspace string, store *artifact.Store, summarizers map[string]Su
 		NewApplyPatchTool(workspace, store, s("apply_patch")),
 		NewGitStatusTool(workspace, store, s("git_status")),
 		NewRunTestTool(workspace, store, s("run_test")),
+		NewDiagTool(workspace, store, s("diagnostics")),
 	}
 }
 

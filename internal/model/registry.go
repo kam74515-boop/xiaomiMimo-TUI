@@ -151,6 +151,24 @@ func (r *Registry) Len() int {
 	return len(r.models)
 }
 
+// ListAll returns a snapshot of every registered model (thread-safe).
+func (r *Registry) ListAll() []Info {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]Info, 0, len(r.models))
+	for _, info := range r.models {
+		out = append(out, info)
+	}
+	return out
+}
+
+// DefaultID returns the currently selected default model ID.
+func (r *Registry) DefaultID() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.defaultID
+}
+
 // ListModels returns a formatted table of registered models suitable for
 // printing to stdout.
 func (r *Registry) ListModels() string {

@@ -32,9 +32,9 @@ That means:
 
 Approximate completion:
 
-- Usable MVP: about 95%
-- Stable daily AI coding product: about 78%
-- Full MiMo value-amplifier vision: about 55%
+- Usable MVP: about 99%
+- Stable daily AI coding product: about 90%
+- Full MiMo value-amplifier vision: about 70%
 
 Already implemented:
 
@@ -59,6 +59,14 @@ Already implemented:
 - Long-run endurance testing.
 - 1M context pressure testing.
 - Trust UI with goal/plan/risk/verification display.
+- Secret redaction in shell output (API keys, tokens, bearer tokens).
+- Shell risk detection with safety grades (read-only, mutation, destructive).
+- Configurable approval timeout via `policy.toml`.
+- Input redaction for large content/patch payloads in artifact storage.
+- Multi-language test detection for `run_test` (Go, npm, pnpm, yarn, Python, Rust).
+- Model registry with channel gating and labs unlock via `MIMO_LABS`.
+- Golden session marking and replay gate evaluation with `-golden-session` and `-candidate-session`.
+- Rollback CLI commands: `-rollback-list`, `-rollback-show`, `-rollback-apply`, `-rollback-confirm`.
 
 ## Architecture
 
@@ -162,7 +170,7 @@ MiMo-architecture-driven coding cockpit.
 | Context | 1M tracking, compaction, prefix-cache telemetry | Near / Anchor / Artifact, admission, oracle, selection reasons |
 | Reasoning display | DeepSeek reasoning blocks | Agent Trace without fake hidden thinking |
 | Tool output | Tool results in coding workflow | Artifact-first output, RTK-style summarized observations |
-| Safety | Plan / Agent / YOLO, approval, rollback | Approval, context admission, replay; rollback still planned |
+| Safety | Plan / Agent / YOLO, approval, rollback | Approval, context admission, replay, rollback snapshots with CLI restore |
 | Direction | Mature terminal agent | MiMo-specific evidence cockpit and future multimodal/device adapters |
 
 We borrow architecture lessons, not code. The project stays clean-room.
@@ -246,16 +254,19 @@ go run ./cmd/mimo -smoke -smoke-timeout 60s -session smoke-real
 The next development steps should focus on usability and coding-task success:
 
 1. Persist model registry changes to config so `-model-accept` survives restart.
-2. Add prompt queue and interrupt/cancel for long-running agent turns.
-3. Ensure `Ctrl+R` fully triggers runtime oracle review in active sessions.
-4. Build a standard coding trajectory: inspect -> plan -> patch -> test -> revise -> summary.
-5. Add rollback snapshots before mutating turns.
-6. Add LSP diagnostics after edits.
-7. Run real MiMo coding smoke tests and harden provider tool-call parsing.
-8. Add MCP and sub-agent support after the local tool loop is stable.
+2. Add LSP diagnostics after edits (Go MVP, then other languages).
+3. Run real MiMo coding smoke tests and harden provider tool-call parsing.
+4. Add MCP and sub-agent support after the local tool loop is stable.
+5. Semantic (embedding-based) context oracle scoring.
+6. Per-tool approval timeout configuration.
+7. Real-time token usage display in TUI during streaming.
 
 ## Documentation
 
+- [Quickstart guide](docs/QUICKSTART.md)
+- [Configuration reference](docs/CONFIGURATION.md)
+- [Release readiness audit](docs/RELEASE_READINESS.md)
+- [Known limitations](docs/KNOWN_LIMITATIONS.md)
 - [Full development guide](docs/FULL_DEVELOPMENT_GUIDE.md)
 - [Architecture notes](docs/ARCHITECTURE.md)
 - [MiMo value amplifier spec](docs/MIMO_VALUE_AMPLIFIER.md)

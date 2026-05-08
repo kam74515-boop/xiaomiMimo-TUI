@@ -28,8 +28,12 @@ import (
 func main() {
 	opts := parseFlags()
 
-	// ----- model registry -----
-	registry := model.DefaultRegistry()
+	// ----- model registry (persisted) -----
+	registry, err := config.LoadModelsConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load models config: %v\n", err)
+		os.Exit(1)
+	}
 
 	if opts.listModels {
 		fmt.Print(registry.ListModels())
@@ -728,6 +732,13 @@ func runGateAccept(cfg config.Config, opts cliOptions, registry *model.Registry)
 		return fmt.Errorf("accept candidate model %q: %w", modelID, err)
 	}
 	fmt.Printf("Model %q promoted to default channel.\n", modelID)
+
+	// Persist the updated registry to project-level .mimo/models.toml.
+	if err := config.SaveModelsConfig(registry); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to persist model registry: %v\n", err)
+	} else {
+		fmt.Println("Model registry saved to .mimo/models.toml")
+	}
 	return nil
 }
 
