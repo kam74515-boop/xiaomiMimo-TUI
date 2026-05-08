@@ -282,6 +282,335 @@ func drainTuiBus(ch <-chan core.AgentEvent) []core.AgentEvent {
 	}
 }
 
+func TestInputPromptEnterAndCancel(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+
+	// Press 'i' to enter prompt mode.
+	m = updateModel(t, m, runeKey('i'))
+	if m.inputMode != InputPrompt {
+		t.Fatalf("inputMode = %d, want InputPrompt", m.inputMode)
+	}
+	if m.textInput != "" {
+		t.Fatalf("textInput = %q, want empty", m.textInput)
+	}
+
+	// Type some text.
+	m = updateModel(t, m, runeKey('h'))
+	m = updateModel(t, m, runeKey('e'))
+	m = updateModel(t, m, runeKey('l'))
+	m = updateModel(t, m, runeKey('l'))
+	m = updateModel(t, m, runeKey('o'))
+	if m.textInput != "hello" {
+		t.Fatalf("textInput = %q, want hello", m.textInput)
+	}
+
+	// Press Enter to submit.
+	m = updateModel(t, m, keyMsg(tea.KeyEnter))
+	if m.inputMode != InputNone {
+		t.Fatalf("inputMode after Enter = %d, want InputNone", m.inputMode)
+	}
+	if !strings.Contains(m.chat, "user> hello") {
+		t.Fatalf("chat = %q, want to contain user> hello", m.chat)
+	}
+
+	// Test cancel: enter prompt mode again, type, Esc.
+	m = updateModel(t, m, runeKey('i'))
+	m = updateModel(t, m, runeKey('w'))
+	m = updateModel(t, m, runeKey('o'))
+	m = updateModel(t, m, runeKey('r'))
+	m = updateModel(t, m, runeKey('l'))
+	m = updateModel(t, m, runeKey('d'))
+	m = updateModel(t, m, keyMsg(tea.KeyEsc))
+	if m.inputMode != InputNone {
+		t.Fatalf("inputMode after Esc = %d, want InputNone", m.inputMode)
+	}
+	if m.textInput != "" {
+		t.Fatalf("textInput after cancel = %q, want empty", m.textInput)
+	}
+}
+
+func TestInputPromptEmptySubmit(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+
+	m = updateModel(t, m, runeKey('i'))
+	chatBefore := m.chat
+	// Press Enter with empty text.
+	m = updateModel(t, m, keyMsg(tea.KeyEnter))
+	if m.inputMode != InputNone {
+		t.Fatalf("inputMode after Enter = %d, want InputNone", m.inputMode)
+	}
+	if m.chat != chatBefore {
+		t.Fatalf("chat changed with empty prompt: %q -> %q", chatBefore, m.chat)
+	}
+}
+
+func TestInputPromptBackspace(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+
+	m = updateModel(t, m, runeKey('i'))
+	m = updateModel(t, m, runeKey('a'))
+	m = updateModel(t, m, runeKey('b'))
+	m = updateModel(t, m, runeKey('c'))
+	if m.textInput != "abc" {
+		t.Fatalf("textInput = %q, want abc", m.textInput)
+	}
+
+	m = updateModel(t, m, keyMsg(tea.KeyBackspace))
+	if m.textInput != "ab" {
+		t.Fatalf("textInput after backspace = %q, want ab", m.textInput)
+	}
+
+	m = updateModel(t, m, keyMsg(tea.KeyBackspace))
+	m = updateModel(t, m, keyMsg(tea.KeyBackspace))
+	if m.textInput != "" {
+		t.Fatalf("textInput after 3 backspaces = %q, want empty", m.textInput)
+	}
+
+	// Backspace on empty string should not crash.
+	m = updateModel(t, m, keyMsg(tea.KeyBackspace))
+	if m.textInput != "" {
+		t.Fatalf("textInput after backspace on empty = %q, want empty", m.textInput)
+	}
+}
+
+func TestInputPromptCursorMovement(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+
+	m = updateModel(t, m, runeKey('i'))
+	m = updateModel(t, m, runeKey('a'))
+	m = updateModel(t, m, runeKey('b'))
+	m = updateModel(t, m, runeKey('c'))
+	if m.cursorPos != 3 {
+		t.Fatalf("cursorPos = %d, want 3", m.cursorPos)
+	}
+
+	// Left moves cursor back.
+	m = updateModel(t, m, keyMsg(tea.KeyLeft))
+	if m.cursorPos != 2 {
+		t.Fatalf("cursorPos after left = %d, want 2", m.cursorPos)
+	}
+
+	// Right moves cursor forward.
+	m = updateModel(t, m, keyMsg(tea.KeyRight))
+	if m.cursorPos != 3 {
+		t.Fatalf("cursorPos after right = %d, want 3", m.cursorPos)
+	}
+
+	// Home and End.
+	m = updateModel(t, m, keyMsg(tea.KeyHome))
+	if m.cursorPos != 0 {
+		t.Fatalf("cursorPos after home = %d, want 0", m.cursorPos)
+	}
+	m = updateModel(t, m, keyMsg(tea.KeyEnd))
+	if m.cursorPos != 3 {
+		t.Fatalf("cursorPos after end = %d, want 3", m.cursorPos)
+	}
+}
+
+func TestInputPromptInsertAtCursor(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+
+	m = updateModel(t, m, runeKey('i'))
+	m = updateModel(t, m, runeKey('a'))
+	m = updateModel(t, m, runeKey('c'))
+
+	// Move cursor to beginning.
+	m = updateModel(t, m, keyMsg(tea.KeyHome))
+	// Insert 'x' at beginning.
+	m = updateModel(t, m, runeKey('x'))
+	if m.textInput != "xac" {
+		t.Fatalf("textInput = %q, want xac", m.textInput)
+	}
+	if m.cursorPos != 1 {
+		t.Fatalf("cursorPos = %d, want 1", m.cursorPos)
+	}
+}
+
+func TestNavigationDisabledInInputModes(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+	initialFocus := m.focus
+	initialScroll := m.scroll[chatPanel]
+
+	// Enter prompt mode.
+	m = updateModel(t, m, runeKey('i'))
+	if m.inputMode != InputPrompt {
+		t.Fatalf("inputMode = %d, want InputPrompt", m.inputMode)
+	}
+
+	// Tab should not change focus in prompt mode.
+	m = updateModel(t, m, keyMsg(tea.KeyTab))
+	if m.focus != initialFocus {
+		t.Fatalf("focus changed in prompt mode: %d -> %d", initialFocus, m.focus)
+	}
+
+	// Arrow keys should not scroll in prompt mode.
+	m = updateModel(t, m, keyMsg(tea.KeyDown))
+	if m.scroll[chatPanel] != initialScroll {
+		t.Fatalf("scroll changed in prompt mode: %d -> %d", initialScroll, m.scroll[chatPanel])
+	}
+}
+
+func TestApprovalNeededEventTransitionsToApproveMode(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+
+	resp := make(chan core.ApprovalDecision, 1)
+	m.applyEvent(core.AgentEvent{
+		Type:     core.EventApprovalNeeded,
+		ToolName: "shell",
+		Message:  "Approval needed for tool shell",
+		Approval: &core.ApprovalRequest{
+			ToolCall:   core.ToolCall{Name: "shell"},
+			Permission: core.PermissionRequest{Behavior: core.PermissionAsk, Reason: "shell commands can mutate"},
+			Response:   resp,
+		},
+	})
+
+	if m.inputMode != InputApprove {
+		t.Fatalf("inputMode = %d, want InputApprove", m.inputMode)
+	}
+	if m.pendingApproval.ToolCall.Name != "shell" {
+		t.Fatalf("pending tool = %q, want shell", m.pendingApproval.ToolCall.Name)
+	}
+}
+
+func TestApprovalApproveSendsDecision(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+
+	resp := make(chan core.ApprovalDecision, 1)
+	m.inputMode = InputApprove
+	m.pendingApproval = core.ApprovalRequest{
+		ToolCall:   core.ToolCall{Name: "shell"},
+		Permission: core.PermissionRequest{Behavior: core.PermissionAsk},
+		Response:   resp,
+	}
+
+	m = updateModel(t, m, runeKey('y'))
+	if m.inputMode != InputNone {
+		t.Fatalf("inputMode after y = %d, want InputNone", m.inputMode)
+	}
+
+	select {
+	case decision := <-resp:
+		if !decision.Allowed {
+			t.Fatal("decision.Allowed = false, want true")
+		}
+	default:
+		t.Fatal("no decision sent on response channel")
+	}
+}
+
+func TestApprovalDenySendsDecision(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+
+	resp := make(chan core.ApprovalDecision, 1)
+	m.inputMode = InputApprove
+	m.pendingApproval = core.ApprovalRequest{
+		ToolCall:   core.ToolCall{Name: "shell"},
+		Permission: core.PermissionRequest{Behavior: core.PermissionAsk},
+		Response:   resp,
+	}
+
+	m = updateModel(t, m, runeKey('n'))
+	if m.inputMode != InputNone {
+		t.Fatalf("inputMode after n = %d, want InputNone", m.inputMode)
+	}
+
+	select {
+	case decision := <-resp:
+		if decision.Allowed {
+			t.Fatal("decision.Allowed = true, want false")
+		}
+	default:
+		t.Fatal("no decision sent on response channel")
+	}
+}
+
+func TestApprovalEscCancels(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+
+	resp := make(chan core.ApprovalDecision, 1)
+	m.inputMode = InputApprove
+	m.pendingApproval = core.ApprovalRequest{
+		ToolCall:   core.ToolCall{Name: "shell"},
+		Permission: core.PermissionRequest{Behavior: core.PermissionAsk},
+		Response:   resp,
+	}
+
+	m = updateModel(t, m, keyMsg(tea.KeyEsc))
+	if m.inputMode != InputNone {
+		t.Fatalf("inputMode after esc = %d, want InputNone", m.inputMode)
+	}
+
+	select {
+	case decision := <-resp:
+		if decision.Allowed {
+			t.Fatal("decision.Allowed = true, want false")
+		}
+	default:
+		t.Fatal("no decision sent on response channel")
+	}
+}
+
+func TestViewShowsInputBarInPromptMode(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+
+	// Normal mode: no input bar.
+	view := m.View()
+	if strings.Contains(view, "PROMPT>") {
+		t.Fatal("view should not contain PROMPT> in normal mode")
+	}
+
+	// Enter prompt mode.
+	m.inputMode = InputPrompt
+	m.textInput = "test"
+	m.cursorPos = 4
+	view = m.View()
+	if !strings.Contains(view, "PROMPT>") {
+		t.Fatal("view should contain PROMPT> in prompt mode")
+	}
+}
+
+func TestViewShowsInputBarInApproveMode(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+
+	m.inputMode = InputApprove
+	m.pendingApproval = core.ApprovalRequest{
+		ToolCall:   core.ToolCall{Name: "write_file"},
+		Permission: core.PermissionRequest{Behavior: core.PermissionAsk},
+	}
+	view := m.View()
+	if !strings.Contains(view, "APPROVE?") {
+		t.Fatal("view should contain APPROVE? in approve mode")
+	}
+	if !strings.Contains(view, "write_file") {
+		t.Fatal("view should contain the tool name in approve mode")
+	}
+}
+
 func numberedLines(count int) string {
 	lines := make([]string, count)
 	for i := range lines {
