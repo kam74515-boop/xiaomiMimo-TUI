@@ -110,6 +110,9 @@ func Run(events <-chan core.AgentEvent, bus *core.Bus, modelName string, mockMod
 	m := NewModel(events, bus)
 	m.modelName = modelName
 	m.mockMode = mockMode
+	if mockMode {
+		m.chat = "MOCK MODE — set MIMO_API_KEY for real MiMo\n"
+	}
 	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	return err
 }
@@ -243,11 +246,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focus = (m.focus + 1) % panelCount
 				m.status = "focused " + panelNames[m.focus]
 				return m, nil
-			case "i":
+			case "i", "/":
 				m.inputMode = InputPrompt
 				m.textInput = ""
 				m.cursorPos = 0
 				m.status = "PROMPT> type your message, Enter to submit, Esc to cancel"
+				return m, nil
+			case "ctrl+l":
+				m.chat = ""
+				m.status = "chat cleared"
+				return m, nil
+			case "ctrl+r":
+				if m.bus != nil {
+					event := core.NewEvent(core.EventType("oracle_review"))
+					m.bus.Publish(event)
+					m.status = "oracle review requested"
+				}
 				return m, nil
 			}
 
@@ -811,7 +825,7 @@ func (m Model) renderFooter(width int) string {
 	if m.showHelp {
 		controls = "? close help | esc close | q quit"
 	} else {
-		controls = "tab focus | i prompt | ? help | up/down scroll | pgup/pgdn | home/end | q quit"
+		controls = "tab focus | i/ prompt | ctrl+l clear | ctrl+r oracle | ? help | up/down scroll | pgup/pgdn | home/end | q quit"
 	}
 
 	left := modelInfo + " | "
@@ -849,7 +863,9 @@ func helpContent() string {
 	return strings.TrimSpace(`
 Controls
   tab: focus next panel
-  i: enter prompt input mode
+  i or /: enter prompt input mode
+  ctrl+l: clear chat display
+  ctrl+r: request context oracle review
   up/down: scroll focused panel
   pgup/pgdn: scroll focused panel by page
   home/end: jump focused panel
@@ -857,8 +873,8 @@ Controls
   q or ctrl+c: quit
 
 Input Modes
-  Prompt (i): type a message, Enter to submit, Esc to cancel
-  Approve: y to allow tool, n to deny, Esc to cancel
+  Prompt (i or /): type a message, Enter to submit, Esc to cancel
+  Approve (auto): y to allow tool, n to deny, Esc to cancel
 
 Panels
   Context Map: evidence and context budget by tier
