@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	contextmap "mimo-tui/internal/context"
 	"mimo-tui/internal/core"
 )
 
@@ -236,14 +237,70 @@ type fakeContextManager struct {
 	upserted []core.ContextItem
 }
 
-func (m *fakeContextManager) Upsert(item core.ContextItem) (core.ContextSnapshot, error) {
-	m.upserted = append(m.upserted, item)
+func (m *fakeContextManager) Add(item core.ContextItem) (core.ContextSnapshot, error) {
 	m.items = append(m.items, item)
 	return core.ContextSnapshot{WindowTokens: 1000000, Items: m.items}, nil
 }
 
+func (m *fakeContextManager) Update(item core.ContextItem) (core.ContextSnapshot, error) {
+	for i, existing := range m.items {
+		if existing.ID == item.ID {
+			m.items[i] = item
+			return core.ContextSnapshot{WindowTokens: 1000000, Items: m.items}, nil
+		}
+	}
+	return core.ContextSnapshot{WindowTokens: 1000000, Items: m.items}, contextmap.ErrItemNotFound
+}
+
+func (m *fakeContextManager) Upsert(item core.ContextItem) (core.ContextSnapshot, error) {
+	m.upserted = append(m.upserted, item)
+	for i, existing := range m.items {
+		if existing.ID == item.ID {
+			m.items[i] = item
+			return core.ContextSnapshot{WindowTokens: 1000000, Items: m.items}, nil
+		}
+	}
+	m.items = append(m.items, item)
+	return core.ContextSnapshot{WindowTokens: 1000000, Items: m.items}, nil
+}
+
+func (m *fakeContextManager) Remove(id string) (core.ContextSnapshot, error) {
+	for i, item := range m.items {
+		if item.ID == id {
+			m.items = append(m.items[:i], m.items[i+1:]...)
+			return core.ContextSnapshot{WindowTokens: 1000000, Items: m.items}, nil
+		}
+	}
+	return core.ContextSnapshot{WindowTokens: 1000000, Items: m.items}, contextmap.ErrItemNotFound
+}
+
+func (m *fakeContextManager) Pin(id string) (core.ContextSnapshot, error) {
+	for i, item := range m.items {
+		if item.ID == id {
+			m.items[i].Pinned = true
+			return core.ContextSnapshot{WindowTokens: 1000000, Items: m.items}, nil
+		}
+	}
+	return core.ContextSnapshot{WindowTokens: 1000000, Items: m.items}, contextmap.ErrItemNotFound
+}
+
+func (m *fakeContextManager) Unpin(id string) (core.ContextSnapshot, error) {
+	for i, item := range m.items {
+		if item.ID == id {
+			m.items[i].Pinned = false
+			return core.ContextSnapshot{WindowTokens: 1000000, Items: m.items}, nil
+		}
+	}
+	return core.ContextSnapshot{WindowTokens: 1000000, Items: m.items}, contextmap.ErrItemNotFound
+}
+
 func (m *fakeContextManager) Snapshot() core.ContextSnapshot {
 	return core.ContextSnapshot{WindowTokens: 1000000, Items: m.items}
+}
+
+func (m *fakeContextManager) AutoBudget() contextmap.AutoBudgetResult {
+	// By default, no evictions in tests.
+	return contextmap.AutoBudgetResult{}
 }
 
 func TestLoopSingleStep(t *testing.T) {

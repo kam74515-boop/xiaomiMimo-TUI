@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	contextmap "mimo-tui/internal/context"
 	"mimo-tui/internal/core"
 )
 
@@ -24,8 +25,14 @@ type ToolExecutor interface {
 // ContextManager is the interface the agent loop uses to track context.
 // Implemented by context.Manager.
 type ContextManager interface {
+	Add(item core.ContextItem) (core.ContextSnapshot, error)
+	Update(item core.ContextItem) (core.ContextSnapshot, error)
 	Upsert(item core.ContextItem) (core.ContextSnapshot, error)
+	Remove(id string) (core.ContextSnapshot, error)
+	Pin(id string) (core.ContextSnapshot, error)
+	Unpin(id string) (core.ContextSnapshot, error)
 	Snapshot() core.ContextSnapshot
+	AutoBudget() contextmap.AutoBudgetResult
 }
 
 type CriticalThinkingPolicy struct {
@@ -277,6 +284,18 @@ func Loop(
 			publishTrace(bus, toolTrace)
 		}
 
+		// Enforce context budget after tool execution.
+		budgetResult := ctxMgr.AutoBudget()
+		if len(budgetResult.Evicted) > 0 || budgetResult.Warning != "" {
+			note := fmt.Sprintf("context auto-budget: evicted %d item(s)", len(budgetResult.Evicted))
+			if budgetResult.Warning != "" {
+				note += "; " + budgetResult.Warning
+			}
+			publishNote(bus, note)
+			// Publish refreshed context snapshot after evictions.
+			publishContext(bus, ctxMgr.Snapshot())
+		}
+
 		stepTrace.Status = core.TraceDone
 		stepTrace.EndedAt = time.Now()
 		stepTrace.Revision = fmt.Sprintf("Step %d complete; %d tool call(s) executed.", step+1, len(toolCalls))
@@ -513,6 +532,12 @@ func publishDone(bus *core.Bus) {
 func publishContext(bus *core.Bus, snapshot core.ContextSnapshot) {
 	event := core.NewEvent(core.EventContextUpdate)
 	event.Context = &snapshot
+	bus.Publish(event)
+}
+
+func publishNote(bus *core.Bus, note string) {
+	event := core.NewEvent(core.EventObservation)
+	event.Observation = &core.Observation{Summary: note}
 	bus.Publish(event)
 }
 

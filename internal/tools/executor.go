@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"mimo-tui/internal/core"
 )
@@ -10,9 +11,10 @@ import (
 const permissionDeniedExitCode = 126
 
 type Executor struct {
-	registry *Registry
-	bus      *core.Bus
-	policy   ExecutorPolicy
+	registry   *Registry
+	bus        *core.Bus
+	policy     ExecutorPolicy
+	ApprovalCh chan<- core.ApprovalRequest
 }
 
 type ExecutorPolicy struct {
@@ -46,6 +48,12 @@ func WithAllowedAskTools(names ...string) ExecutorOption {
 	}
 }
 
+func WithApprovalChannel(ch chan<- core.ApprovalRequest) ExecutorOption {
+	return func(executor *Executor) {
+		executor.ApprovalCh = ch
+	}
+}
+
 func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolResult, core.Observation) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -71,16 +79,71 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 	}
 
 	permission := tool.Permission(call.Input)
-	if allowed, reason := e.policy.allows(tool.Name(), permission); !allowed {
-		result := core.ToolResult{
-			Content:  fmt.Sprintf("tool %s was not executed: %s", tool.Name(), reason),
-			ExitCode: permissionDeniedExitCode,
-			Error:    reason,
+
+	// If the tool asks for permission, there is an approval channel, and the tool
+	// is not already whitelisted, request user approval via the channel.
+	if permission.Behavior == core.PermissionAsk && e.ApprovalCh != nil && !e.policy.isAllowedAsk(tool.Name()) {
+		req := core.ApprovalRequest{
+			ToolCall:   call,
+			Permission: permission,
+			Response:   make(chan core.ApprovalDecision, 1),
 		}
-		observation := executorObservation(tool.Name(), result)
-		e.publishResult(call, result)
-		e.publishObservation(call, observation)
-		return result, observation
+		select {
+		case e.ApprovalCh <- req:
+		default:
+			result := core.ToolResult{
+				Content:  fmt.Sprintf("tool %s approval channel full", tool.Name()),
+				ExitCode: permissionDeniedExitCode,
+				Error:    "approval channel is full; cannot request approval",
+			}
+			observation := executorObservation(tool.Name(), result)
+			e.publishResult(call, result)
+			e.publishObservation(call, observation)
+			return result, observation
+		}
+		e.publishApprovalNeeded(call, req)
+
+		select {
+		case decision := <-req.Response:
+			if !decision.Allowed {
+				reason := decision.Reason
+				if reason == "" {
+					reason = "user denied tool execution"
+				}
+				result := core.ToolResult{
+					Content:  fmt.Sprintf("tool %s was not executed: %s", tool.Name(), reason),
+					ExitCode: permissionDeniedExitCode,
+					Error:    reason,
+				}
+				observation := executorObservation(tool.Name(), result)
+				e.publishResult(call, result)
+				e.publishObservation(call, observation)
+				return result, observation
+			}
+			// Approved: fall through to normal execution.
+		case <-time.After(30 * time.Second):
+			result := core.ToolResult{
+				Content:  fmt.Sprintf("tool %s approval timed out", tool.Name()),
+				ExitCode: permissionDeniedExitCode,
+				Error:    "approval timed out after 30s",
+			}
+			observation := executorObservation(tool.Name(), result)
+			e.publishResult(call, result)
+			e.publishObservation(call, observation)
+			return result, observation
+		}
+	} else {
+		if allowed, reason := e.policy.allows(tool.Name(), permission); !allowed {
+			result := core.ToolResult{
+				Content:  fmt.Sprintf("tool %s was not executed: %s", tool.Name(), reason),
+				ExitCode: permissionDeniedExitCode,
+				Error:    reason,
+			}
+			observation := executorObservation(tool.Name(), result)
+			e.publishResult(call, result)
+			e.publishObservation(call, observation)
+			return result, observation
+		}
 	}
 
 	result := tool.Run(ctx, call.Input)
@@ -90,6 +153,10 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 	normalizeObservation(&observation, result)
 	e.publishObservation(call, observation)
 	return result, observation
+}
+
+func (p ExecutorPolicy) isAllowedAsk(name string) bool {
+	return p.AllowedAskTools != nil && p.AllowedAskTools[name]
 }
 
 func (p ExecutorPolicy) allows(name string, permission core.PermissionRequest) (bool, string) {
@@ -134,6 +201,18 @@ func (e *Executor) publishResult(call core.ToolCall, result core.ToolResult) {
 	event.ToolCall = &call
 	event.Message = result.Content
 	event.Err = result.Error
+	e.bus.Publish(event)
+}
+
+func (e *Executor) publishApprovalNeeded(call core.ToolCall, req core.ApprovalRequest) {
+	if e == nil || e.bus == nil {
+		return
+	}
+	event := core.NewEvent(core.EventApprovalNeeded)
+	event.ToolName = call.Name
+	event.ToolCall = &call
+	event.Approval = &req
+	event.Message = "Approval needed for tool " + call.Name
 	e.bus.Publish(event)
 }
 

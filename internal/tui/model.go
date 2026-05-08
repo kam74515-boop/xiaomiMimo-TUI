@@ -28,6 +28,14 @@ var panelNames = []string{
 	"Tool Cockpit",
 }
 
+type InputMode int
+
+const (
+	InputNone InputMode = iota
+	InputPrompt
+	InputApprove
+)
+
 type toolRun struct {
 	Name      string
 	Status    string
@@ -44,13 +52,14 @@ type Model struct {
 	focus  focusPanel
 	scroll [panelCount]int
 
-	context    core.ContextSnapshot
-	hasContext bool
-	chat       string
-	trace      []core.TraceStep
-	traceIndex map[string]int
-	tools      []toolRun
-	notes      []string
+	context             core.ContextSnapshot
+	hasContext          bool
+	selectedContextItem int // index into context.Items; -1 means none selected
+	chat                string
+	trace               []core.TraceStep
+	traceIndex          map[string]int
+	tools               []toolRun
+	notes               []string
 
 	cost    core.CostUpdate
 	hasCost bool
@@ -58,29 +67,38 @@ type Model struct {
 	status       string
 	sourceClosed bool
 	showHelp     bool
+
+	bus *core.Bus // optional, for publishing context commands back to the event bus
+
+	inputMode       InputMode
+	textInput       string
+	cursorPos       int
+	pendingApproval core.ApprovalRequest
 }
 
 type agentEventMsg core.AgentEvent
 
 type eventSourceClosedMsg struct{}
 
-func NewModel(events <-chan core.AgentEvent) Model {
+func NewModel(events <-chan core.AgentEvent, bus *core.Bus) Model {
 	if events == nil {
 		ch := make(chan core.AgentEvent)
 		close(ch)
 		events = ch
 	}
 	return Model{
-		events:     events,
-		width:      100,
-		height:     32,
-		traceIndex: make(map[string]int),
-		status:     "waiting for agent events",
+		events:              events,
+		bus:                 bus,
+		width:               100,
+		height:              32,
+		selectedContextItem: -1,
+		traceIndex:          make(map[string]int),
+		status:              "waiting for agent events",
 	}
 }
 
-func Run(events <-chan core.AgentEvent) error {
-	_, err := tea.NewProgram(NewModel(events), tea.WithAltScreen()).Run()
+func Run(events <-chan core.AgentEvent, bus *core.Bus) error {
+	_, err := tea.NewProgram(NewModel(events, bus), tea.WithAltScreen()).Run()
 	return err
 }
 
@@ -118,9 +136,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.focus = (m.focus + 1) % panelCount
 			m.status = "focused " + panelNames[m.focus]
 			return m, nil
-		case "up", "down", "pgup", "pgdown", "home", "end":
-			m.scrollFocused(key)
-			return m, nil
+		}
+
+		if m.focus == contextPanel {
+			switch key {
+			case "j", "down":
+				m.moveContextSelection(1)
+				return m, nil
+			case "k", "up":
+				m.moveContextSelection(-1)
+				return m, nil
+			case "p":
+				m.toggleContextPin()
+				return m, nil
+			case "d":
+				m.removeContextItem()
+				return m, nil
+			case "pgup", "pgdown", "home", "end":
+				m.scrollFocused(key)
+				return m, nil
+			}
+		} else {
+			switch key {
+			case "up", "down", "pgup", "pgdown", "home", "end":
+				m.scrollFocused(key)
+				return m, nil
+			}
 		}
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -234,6 +275,56 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 		}
 		m.status = "received " + string(event.Type)
 	}
+}
+
+func (m *Model) moveContextSelection(delta int) {
+	if !m.hasContext || len(m.context.Items) == 0 {
+		return
+	}
+	m.selectedContextItem += delta
+	if m.selectedContextItem < 0 {
+		m.selectedContextItem = len(m.context.Items) - 1
+	} else if m.selectedContextItem >= len(m.context.Items) {
+		m.selectedContextItem = 0
+	}
+}
+
+func (m *Model) toggleContextPin() {
+	if m.bus == nil || !m.hasContext {
+		return
+	}
+	idx := m.selectedContextItem
+	if idx < 0 || idx >= len(m.context.Items) {
+		return
+	}
+	item := m.context.Items[idx]
+	eventType := core.EventContextUnpin
+	if !item.Pinned {
+		eventType = core.EventContextPin
+	}
+	ev := core.NewEvent(eventType)
+	ev.Message = item.ID
+	m.bus.Publish(ev)
+	m.status = fmt.Sprintf("toggle pin for %s", fallback(item.Title, item.ID))
+}
+
+func (m *Model) removeContextItem() {
+	if m.bus == nil || !m.hasContext {
+		return
+	}
+	idx := m.selectedContextItem
+	if idx < 0 || idx >= len(m.context.Items) {
+		return
+	}
+	item := m.context.Items[idx]
+	if item.Pinned {
+		m.status = fmt.Sprintf("cannot remove pinned item %s", fallback(item.Title, item.ID))
+		return
+	}
+	ev := core.NewEvent(core.EventContextRemove)
+	ev.Message = item.ID
+	m.bus.Publish(ev)
+	m.status = fmt.Sprintf("remove item %s", fallback(item.Title, item.ID))
 }
 
 func (m *Model) upsertTrace(step core.TraceStep) {
@@ -399,31 +490,96 @@ func (m Model) contextContent() string {
 	used := m.context.UsedTokens
 	window := maxInt(m.context.WindowTokens, 1)
 	var b strings.Builder
-	fmt.Fprintf(&b, "tokens: %d / %d (%d%%)\n", used, window, used*100/window)
-	fmt.Fprintf(&b, "pollution risk: %s\n", fallback(m.context.PollutionRisk, "unknown"))
 
+	fmt.Fprintf(&b, "tokens: %d / %d (%d%%)\n", used, window, used*100/window)
+
+	// Color-code pollution risk.
+	riskColor := lipgloss.Color("252")
+	switch m.context.PollutionRisk {
+	case "low":
+		riskColor = lipgloss.Color("42") // green
+	case "warning":
+		riskColor = lipgloss.Color("220") // yellow
+	case "over_window":
+		riskColor = lipgloss.Color("196") // red
+	}
+	riskLine := fmt.Sprintf("pollution risk: %s", fallback(m.context.PollutionRisk, "unknown"))
+	fmt.Fprintf(&b, "%s\n", lipgloss.NewStyle().Foreground(riskColor).Render(riskLine))
+
+	// Bar chart for token usage across tiers.
+	nearT, anchorT, artifactT := 0, 0, 0
+	for _, item := range m.context.Items {
+		switch item.Tier {
+		case core.TierNear:
+			nearT += item.TokenEstimate
+		case core.TierAnchor:
+			anchorT += item.TokenEstimate
+		case core.TierArtifact:
+			artifactT += item.TokenEstimate
+		}
+	}
+	renderTierBar(&b, "NEAR:", nearT, window)
+	renderTierBar(&b, "ANCHOR:", anchorT, window)
+	renderTierBar(&b, "ARTIFACT:", artifactT, window)
+
+	// Item listing with selection highlighting.
+	itemIdx := 0
 	for _, tier := range []core.ContextTier{core.TierNear, core.TierAnchor, core.TierArtifact} {
-		fmt.Fprintf(&b, "\n%s\n", strings.ToUpper(string(tier)))
+		b.WriteByte('\n')
+		b.WriteString(strings.ToUpper(string(tier)))
+		b.WriteByte('\n')
 		count := 0
 		for _, item := range m.context.Items {
 			if item.Tier != tier {
 				continue
 			}
 			count++
+			isSelected := itemIdx == m.selectedContextItem
+
 			pin := " "
 			if item.Pinned {
 				pin = "*"
 			}
-			fmt.Fprintf(&b, "%s %5d %s\n", pin, item.TokenEstimate, fallback(item.Title, item.ID))
-			if item.Reason != "" {
-				fmt.Fprintf(&b, "  %s\n", item.Reason)
+			cursor := " "
+			if isSelected {
+				cursor = ">"
 			}
+			line := fmt.Sprintf("%s%s %5d %s", cursor, pin, item.TokenEstimate, fallback(item.Title, item.ID))
+
+			if isSelected {
+				line = lipgloss.NewStyle().Reverse(true).Render(line)
+			}
+			b.WriteString(line)
+			b.WriteByte('\n')
+
+			if item.Reason != "" {
+				reasonLine := fmt.Sprintf("  %s", item.Reason)
+				if isSelected {
+					reasonLine = lipgloss.NewStyle().Reverse(true).Render(reasonLine)
+				}
+				b.WriteString(reasonLine)
+				b.WriteByte('\n')
+			}
+			itemIdx++
 		}
 		if count == 0 {
 			b.WriteString("  empty\n")
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func renderTierBar(b *strings.Builder, label string, tierTokens, windowTokens int) {
+	pct := 0
+	if windowTokens > 0 {
+		pct = tierTokens * 100 / windowTokens
+	}
+	filled := pct / 10
+	if filled > 10 {
+		filled = 10
+	}
+	bar := strings.Repeat("\u2588", filled) + strings.Repeat("\u2591", 10-filled)
+	fmt.Fprintf(b, "\n%-9s %s %d%%", label, bar, pct)
 }
 
 func (m Model) traceContent() string {
@@ -500,7 +656,7 @@ func renderHeader(width int, status string, closed bool, focusName, scroll strin
 }
 
 func renderFooter(width int, showHelp bool) string {
-	line := "tab focus | ? help | up/down scroll | pgup/pgdn | home/end | q quit"
+	line := "tab focus | ? help | j/k select | p pin | d delete | pgup/pgdn scroll | q quit"
 	if showHelp {
 		line = "? close help | esc close | q quit"
 	}
@@ -526,7 +682,10 @@ func helpContent() string {
 	return strings.TrimSpace(`
 Controls
   tab: focus next panel
-  up/down: scroll focused panel
+  up/down: scroll focused panel (list panels)
+  j/k: move cursor in context panel
+  p: pin/unpin selected context item
+  d: delete selected context item (not pinned)
   pgup/pgdn: scroll focused panel by page
   home/end: jump focused panel
   ?: toggle help

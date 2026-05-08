@@ -14,6 +14,7 @@ import (
 	"mimo-tui/internal/config"
 	contextmap "mimo-tui/internal/context"
 	"mimo-tui/internal/core"
+	"mimo-tui/internal/eval"
 	"mimo-tui/internal/provider/mimo"
 	"mimo-tui/internal/replay"
 	sessionlog "mimo-tui/internal/session"
@@ -36,7 +37,7 @@ func main() {
 		opts.sessionID = newSessionID()
 	}
 
-	events := liveEvents(context.Background(), cfg, promptFromArgs(), opts)
+	events, ctxBus := liveEvents(context.Background(), cfg, promptFromArgs(), opts)
 	if opts.smoke {
 		if err := runSmoke(os.Stdout, events, opts.smokeTimeout); err != nil {
 			fmt.Fprintf(os.Stderr, "smoke: %v\n", err)
@@ -45,7 +46,15 @@ func main() {
 		return
 	}
 
-	if err := tui.Run(events); err != nil {
+	if opts.eval {
+		if err := runEval(cfg, opts); err != nil {
+			fmt.Fprintf(os.Stderr, "eval: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if err := tui.Run(events, ctxBus); err != nil {
 		fmt.Fprintf(os.Stderr, "run tui: %v\n", err)
 		os.Exit(1)
 	}
@@ -57,6 +66,8 @@ type cliOptions struct {
 	workspace    string
 	sessionID    string
 	resumeLatest bool
+	eval         bool
+	evalSession  string
 }
 
 func parseFlags() cliOptions {
@@ -66,6 +77,8 @@ func parseFlags() cliOptions {
 	flag.StringVar(&opts.workspace, "workspace", "", "workspace directory; defaults to config runtime.workspace")
 	flag.StringVar(&opts.sessionID, "session", "", "session id for .mimo/sessions event log")
 	flag.BoolVar(&opts.resumeLatest, "resume-latest", false, "load a compact summary of the latest usable session into the startup Context Map")
+	flag.BoolVar(&opts.eval, "eval", false, "extract and compare trajectories from session logs")
+	flag.StringVar(&opts.evalSession, "eval-session", "", "session ID to evaluate (default: latest)")
 	flag.Parse()
 	return opts
 }
@@ -158,7 +171,7 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliOptions) <-chan core.AgentEvent {
+func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliOptions) (<-chan core.AgentEvent, *core.Bus) {
 	bus := core.NewBus()
 	uiEvents := bus.Subscribe(256)
 
@@ -169,6 +182,30 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 		if opts.resumeLatest {
 			publishResumeSummary(cfg, manager, bus)
 		}
+
+		// Subscribe to TUI context commands (pin / unpin / remove).
+		cmdSub := bus.Subscribe(64)
+		go func() {
+			for event := range cmdSub {
+				switch event.Type {
+				case core.EventContextPin:
+					snapshot, err := manager.Pin(event.Message)
+					if err == nil {
+						publishContextSnapshot(snapshot, bus)
+					}
+				case core.EventContextUnpin:
+					snapshot, err := manager.Unpin(event.Message)
+					if err == nil {
+						publishContextSnapshot(snapshot, bus)
+					}
+				case core.EventContextRemove:
+					snapshot, err := manager.Remove(event.Message)
+					if err == nil {
+						publishContextSnapshot(snapshot, bus)
+					}
+				}
+			}
+		}()
 
 		registry := tools.NewDefaultRegistry(cfg.Runtime.Workspace)
 		executor := tools.NewExecutor(registry, bus)
@@ -181,7 +218,7 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 		}
 	}()
 
-	return uiEvents
+	return uiEvents, bus
 }
 
 func persistEvents(ctx context.Context, workspace, sessionID string, events <-chan core.AgentEvent) {
@@ -259,4 +296,63 @@ func publishObservation(observation core.Observation, bus *core.Bus) {
 	event := core.NewEvent(core.EventObservation)
 	event.Observation = &observation
 	bus.Publish(event)
+}
+
+func runEval(cfg config.Config, opts cliOptions) error {
+	// 1. Find the target session.
+	var target replay.SessionInfo
+	if opts.evalSession != "" {
+		sessions, err := replay.ListSessions(cfg.Runtime.Workspace)
+		if err != nil {
+			return fmt.Errorf("list sessions: %w", err)
+		}
+		found := false
+		for _, s := range sessions {
+			if s.ID == opts.evalSession {
+				target = s
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("session %q not found", opts.evalSession)
+		}
+	} else {
+		var err error
+		target, err = replay.LatestSession(cfg.Runtime.Workspace)
+		if err != nil {
+			return fmt.Errorf("find latest session: %w", err)
+		}
+	}
+
+	// 2. Read events and extract trajectory.
+	events, err := replay.ReadFile(target.Path)
+	if err != nil {
+		return fmt.Errorf("read session %s: %w", target.ID, err)
+	}
+
+	traj := eval.ExtractTrajectory(events)
+	traj.SessionID = target.ID
+	fmt.Print(eval.FormatTrajectory(traj))
+
+	// 3. If a specific session was requested, compare with the latest.
+	if opts.evalSession != "" {
+		latest, err := replay.LatestSession(cfg.Runtime.Workspace)
+		if err != nil {
+			return fmt.Errorf("find latest session for comparison: %w", err)
+		}
+		if latest.ID != target.ID {
+			latestEvents, err := replay.ReadFile(latest.Path)
+			if err != nil {
+				return fmt.Errorf("read latest session %s: %w", latest.ID, err)
+			}
+			latestTraj := eval.ExtractTrajectory(latestEvents)
+			latestTraj.SessionID = latest.ID
+
+			fmt.Println("\n--- Comparison ---")
+			fmt.Print(eval.CompareTrajectories(traj, latestTraj))
+		}
+	}
+
+	return nil
 }

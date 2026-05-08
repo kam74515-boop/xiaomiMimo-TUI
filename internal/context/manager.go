@@ -2,6 +2,7 @@ package context
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -24,6 +25,8 @@ var (
 	ErrDuplicateItem = errors.New("context item already exists")
 	ErrItemNotFound  = errors.New("context item not found")
 	ErrInvalidItemID = errors.New("context item id is required")
+
+	SafeBudgetRatio = 0.85
 )
 
 type TokenTotals struct {
@@ -283,9 +286,116 @@ func pollutionRisk(windowTokens, usedTokens int) string {
 	switch {
 	case usedTokens > windowTokens:
 		return PollutionOverWindow
-	case float64(usedTokens)/float64(windowTokens) >= 0.85:
+	case float64(usedTokens)/float64(windowTokens) >= SafeBudgetRatio:
 		return PollutionWarning
 	default:
 		return PollutionLow
 	}
+}
+
+// AutoBudgetResult holds the outcome of an automatic context budget enforcement pass.
+type AutoBudgetResult struct {
+	Evicted []string // IDs of items removed
+	Warning string   // e.g. "Near tier at 95% - consider pinning critical items"
+}
+
+// AutoBudget evicts non-pinned Near items when pollution risk exceeds the safe
+// budget ratio. Expired non-pinned Near items are evicted first, followed by the
+// oldest non-pinned Near items by insertion order. Pinned items and Anchor items
+// are never auto-evicted.
+func (m *Manager) AutoBudget() AutoBudgetResult {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	totals := m.totalsLocked()
+	risk := pollutionRisk(m.windowTokens, totals.UsedTokens)
+	if risk == PollutionLow {
+		return AutoBudgetResult{}
+	}
+
+	result := AutoBudgetResult{}
+	safeBoundary := int(float64(m.windowTokens) * SafeBudgetRatio)
+	if safeBoundary < 1 {
+		safeBoundary = 1
+	}
+
+	evict := m.collectNearEvictionCandidatesLocked()
+	// Phase 1: evict expired non-pinned Near items first.
+	for i := 0; i < len(evict) && totals.UsedTokens > safeBoundary; {
+		item := evict[i]
+		if !expired(item, m.now()) {
+			i++
+			continue
+		}
+		totals.UsedTokens -= item.TokenEstimate
+		result.Evicted = append(result.Evicted, item.ID)
+		delete(m.items, item.ID)
+		m.removeOrderEntryLocked(item.ID)
+		evict = append(evict[:i], evict[i+1:]...)
+	}
+
+	// Phase 2: if still over safe boundary, evict oldest non-pinned Near items
+	// by insertion order.
+	nearIndex := 0
+	for nearIndex < len(evict) && totals.UsedTokens > safeBoundary {
+		item := evict[nearIndex]
+		totals.UsedTokens -= item.TokenEstimate
+		result.Evicted = append(result.Evicted, item.ID)
+		delete(m.items, item.ID)
+		m.removeOrderEntryLocked(item.ID)
+		nearIndex++
+	}
+
+	if risk == PollutionOverWindow {
+		pct := 0
+		if m.windowTokens > 0 {
+			pct = (totals.UsedTokens) * 100 / m.windowTokens
+		}
+		result.Warning = formatBudgetWarning(pct, len(result.Evicted))
+	} else if risk == PollutionWarning {
+		pct := 0
+		if m.windowTokens > 0 {
+			pct = (totals.UsedTokens) * 100 / m.windowTokens
+		}
+		result.Warning = formatBudgetWarning(pct, len(result.Evicted))
+	}
+
+	return result
+}
+
+// collectNearEvictionCandidatesLocked returns non-pinned Near items in insertion
+// order. The caller must hold m.mu.
+func (m *Manager) collectNearEvictionCandidatesLocked() []core.ContextItem {
+	now := m.now()
+	candidates := make([]core.ContextItem, 0)
+	for _, id := range m.order {
+		item, ok := m.items[id]
+		if !ok || item.Pinned || item.Tier != core.TierNear {
+			continue
+		}
+		// Skip items that are already expired (they would be dropped naturally
+		// from the snapshot, but we also evict them explicitly in phase 1).
+		_ = now // passed for clarity; expired check done in caller
+		candidates = append(candidates, item)
+	}
+	return candidates
+}
+
+func (m *Manager) removeOrderEntryLocked(id string) {
+	for i, entry := range m.order {
+		if entry == id {
+			m.order = append(m.order[:i], m.order[i+1:]...)
+			return
+		}
+	}
+}
+
+func formatBudgetWarning(pctUsed int, evicted int) string {
+	if evicted == 0 {
+		return ""
+	}
+	if pctUsed >= 100 {
+		return fmt.Sprintf("Near tier at %d%% - evicted %d item(s); consider pinning critical items", pctUsed, evicted)
+	}
+	return fmt.Sprintf("Near tier at %d%% - evicted %d item(s); consider pinning critical items", pctUsed, evicted)
 }

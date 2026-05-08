@@ -11,7 +11,7 @@ import (
 )
 
 func TestApplyEventUpdatesModelState(t *testing.T) {
-	m := NewModel(nil)
+	m := NewModel(nil, nil)
 
 	m.applyEvent(core.AgentEvent{Type: core.EventMessageDelta, Message: "hello"})
 	if m.chat != "hello" {
@@ -48,7 +48,7 @@ func TestApplyEventUpdatesModelState(t *testing.T) {
 }
 
 func TestFocusedPanelScrollBounds(t *testing.T) {
-	m := NewModel(nil)
+	m := NewModel(nil, nil)
 	m.width = 80
 	m.height = 20
 	m.focus = chatPanel
@@ -97,7 +97,7 @@ func TestFocusedPanelScrollBounds(t *testing.T) {
 }
 
 func TestHelpToggle(t *testing.T) {
-	m := NewModel(nil)
+	m := NewModel(nil, nil)
 	m.width = 80
 	m.height = 24
 	m.focus = chatPanel

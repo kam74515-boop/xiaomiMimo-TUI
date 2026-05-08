@@ -9,16 +9,20 @@ import (
 type EventType string
 
 const (
-	EventMessageDelta  EventType = "message_delta"
-	EventToolStart     EventType = "tool_start"
-	EventToolResult    EventType = "tool_result"
-	EventObservation   EventType = "observation"
-	EventContextUpdate EventType = "context_update"
-	EventRiskUpdate    EventType = "risk_update"
-	EventCostUpdate    EventType = "cost_update"
-	EventTraceUpdate   EventType = "trace_update"
-	EventError         EventType = "error"
-	EventDone          EventType = "done"
+	EventMessageDelta   EventType = "message_delta"
+	EventToolStart      EventType = "tool_start"
+	EventToolResult     EventType = "tool_result"
+	EventObservation    EventType = "observation"
+	EventContextUpdate  EventType = "context_update"
+	EventContextPin     EventType = "context_pin"
+	EventContextUnpin   EventType = "context_unpin"
+	EventContextRemove  EventType = "context_remove"
+	EventRiskUpdate     EventType = "risk_update"
+	EventCostUpdate     EventType = "cost_update"
+	EventTraceUpdate    EventType = "trace_update"
+	EventError          EventType = "error"
+	EventDone           EventType = "done"
+	EventApprovalNeeded EventType = "approval_needed"
 )
 
 type ContextTier string
@@ -89,6 +93,7 @@ type AgentEvent struct {
 	Observation *Observation     `json:"observation,omitempty"`
 	Cost        *CostUpdate      `json:"cost,omitempty"`
 	Err         string           `json:"error,omitempty"`
+	Approval    *ApprovalRequest `json:"-"`
 }
 
 type CostUpdate struct {
@@ -158,6 +163,17 @@ const (
 type PermissionRequest struct {
 	Behavior PermissionBehavior `json:"behavior"`
 	Reason   string             `json:"reason"`
+}
+
+type ApprovalRequest struct {
+	ToolCall   ToolCall              `json:"tool_call"`
+	Permission PermissionRequest     `json:"permission"`
+	Response   chan ApprovalDecision `json:"-"`
+}
+
+type ApprovalDecision struct {
+	Allowed bool   `json:"allowed"`
+	Reason  string `json:"reason"`
 }
 
 type ToolInput map[string]any
