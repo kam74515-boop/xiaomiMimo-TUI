@@ -234,6 +234,202 @@ func TestChatStreamUsesMockFallbackWithoutAPIKey(t *testing.T) {
 	}
 }
 
+func TestNormalizeRequestSwitchesToMultimodalModelForMedia(t *testing.T) {
+	t.Setenv("MIMO_MULTIMODAL_MODEL", "")
+	client := New(config.ProviderConfig{Model: "mimo-v2.5-pro", Mock: true})
+	req := client.normalizeRequest(core.ChatRequest{
+		Messages: []core.Message{
+			{
+				Role: "user",
+				ContentParts: []core.ContentPart{
+					{Type: "image_url", ImageURL: &core.ImageURLPart{URL: "data:image/png;base64,abc"}},
+					{Type: "text", Text: "describe"},
+				},
+			},
+		},
+	})
+
+	if req.Model != DefaultMultimodalModel {
+		t.Fatalf("model = %q, want %q for media input", req.Model, DefaultMultimodalModel)
+	}
+}
+
+func TestNormalizeRequestKeepsMultimodalModel(t *testing.T) {
+	client := New(config.ProviderConfig{Model: "mimo-v2-omni", Mock: true})
+	req := client.normalizeRequest(core.ChatRequest{
+		Messages: []core.Message{
+			{
+				Role: "user",
+				ContentParts: []core.ContentPart{
+					{Type: "input_audio", InputAudio: &core.InputAudioPart{Data: "https://example.com/a.wav"}},
+				},
+			},
+		},
+	})
+
+	if req.Model != "mimo-v2-omni" {
+		t.Fatalf("model = %q, want mimo-v2-omni", req.Model)
+	}
+}
+
+func TestChatStreamEncodesMultimodalContentArray(t *testing.T) {
+	var got map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	client := New(config.ProviderConfig{
+		BaseURL: server.URL,
+		APIKey:  "key",
+		Model:   "mimo-v2.5-pro",
+	})
+	events, err := client.ChatStream(context.Background(), core.ChatRequest{
+		Messages: []core.Message{
+			{
+				Role: "user",
+				ContentParts: []core.ContentPart{
+					{Type: "image_url", ImageURL: &core.ImageURLPart{URL: "data:image/png;base64,abc"}},
+					{Type: "text", Text: "describe"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ChatStream returned error: %v", err)
+	}
+	_ = collectModelEvents(t, events)
+
+	if got["model"] != DefaultMultimodalModel {
+		t.Fatalf("model = %#v, want multimodal fallback", got["model"])
+	}
+	messages, ok := got["messages"].([]any)
+	if !ok || len(messages) != 1 {
+		t.Fatalf("messages = %#v", got["messages"])
+	}
+	first, ok := messages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("first message = %#v", messages[0])
+	}
+	content, ok := first["content"].([]any)
+	if !ok || len(content) != 2 {
+		t.Fatalf("content = %#v, want two content parts", first["content"])
+	}
+}
+
+func TestChatStreamRetriesWithoutWebSearchWhenPluginDisabled(t *testing.T) {
+	var requests []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var got map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		requests = append(requests, got)
+		if len(requests) == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":{"message":"web search tool found in the request body, but webSearchEnabled is false"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"fallback\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	client := New(config.ProviderConfig{
+		BaseURL: server.URL,
+		APIKey:  "key",
+		Model:   "mimo-v2.5-pro",
+	})
+	events, err := client.ChatStream(context.Background(), core.ChatRequest{
+		Messages: []core.Message{{Role: "system", Content: "system"}, {Role: "user", Content: "latest news"}},
+		Tools:    []core.ToolSpec{{Type: "web_search", MaxKeyword: 3, Limit: 1}},
+	})
+	if err != nil {
+		t.Fatalf("ChatStream returned error: %v", err)
+	}
+	var content string
+	for _, event := range collectModelEvents(t, events) {
+		if event.Err != nil {
+			t.Fatalf("unexpected event error: %v", event.Err)
+		}
+		content += event.Delta
+	}
+	if content != "fallback" {
+		t.Fatalf("content = %q, want fallback", content)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests = %d, want retry without web_search", len(requests))
+	}
+	firstTools := requests[0]["tools"].([]any)
+	if len(firstTools) != 1 {
+		t.Fatalf("first tools = %#v", firstTools)
+	}
+	if secondTools, ok := requests[1]["tools"].([]any); ok && len(secondTools) != 0 {
+		t.Fatalf("second tools = %#v, want web_search stripped", secondTools)
+	}
+	messages := requests[1]["messages"].([]any)
+	systemMessage := messages[0].(map[string]any)["content"].(string)
+	if !strings.Contains(systemMessage, "Web Search Plugin is not enabled") {
+		t.Fatalf("fallback system message missing runtime note: %q", systemMessage)
+	}
+
+	requests = nil
+	events, err = client.ChatStream(context.Background(), core.ChatRequest{
+		Messages: []core.Message{{Role: "system", Content: "system"}, {Role: "user", Content: "another turn"}},
+		Tools:    []core.ToolSpec{{Type: "web_search", MaxKeyword: 3, Limit: 1}},
+	})
+	if err != nil {
+		t.Fatalf("second ChatStream returned error: %v", err)
+	}
+	_ = collectModelEvents(t, events)
+	if len(requests) != 1 {
+		t.Fatalf("second turn requests = %d, want cached disabled state to avoid retry", len(requests))
+	}
+	if secondTools, ok := requests[0]["tools"].([]any); ok && len(secondTools) != 0 {
+		t.Fatalf("cached-disabled request tools = %#v, want web_search stripped", secondTools)
+	}
+}
+
+func TestChatStreamDoesNotRetryForcedWebSearchWhenPluginDisabled(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":{"message":"web search tool found in the request body, but webSearchEnabled is false"}}`))
+	}))
+	defer server.Close()
+
+	client := New(config.ProviderConfig{
+		BaseURL: server.URL,
+		APIKey:  "key",
+		Model:   "mimo-v2.5-pro",
+	})
+	events, err := client.ChatStream(context.Background(), core.ChatRequest{
+		Messages: []core.Message{{Role: "user", Content: "latest news"}},
+		Tools:    []core.ToolSpec{{Type: "web_search", ForceSearch: true}},
+	})
+	if err != nil {
+		t.Fatalf("ChatStream returned error: %v", err)
+	}
+	var gotErr error
+	for _, event := range collectModelEvents(t, events) {
+		if event.Err != nil {
+			gotErr = event.Err
+		}
+	}
+	if gotErr == nil || !strings.Contains(gotErr.Error(), "webSearchEnabled is false") {
+		t.Fatalf("error = %v, want disabled web search error", gotErr)
+	}
+	if requestCount != 1 {
+		t.Fatalf("request count = %d, want no retry for forced search", requestCount)
+	}
+}
+
 func writeSSEChunk(t *testing.T, w http.ResponseWriter, chunk any) {
 	t.Helper()
 	data, err := json.Marshal(chunk)

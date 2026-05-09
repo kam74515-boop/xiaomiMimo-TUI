@@ -10,8 +10,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"mimo-tui/internal/config"
@@ -20,8 +22,9 @@ import (
 )
 
 const (
-	DefaultBaseURL = model.DefaultMiMoBaseURL
-	DefaultModel   = "mimo-v2.5-pro"
+	DefaultBaseURL         = model.DefaultMiMoBaseURL
+	DefaultModel           = "mimo-v2.5-pro"
+	DefaultMultimodalModel = "mimo-v2.5"
 )
 
 type Client struct {
@@ -31,6 +34,8 @@ type Client struct {
 	mock      bool
 	http      *http.Client
 	modelInfo model.Info
+
+	webSearchDisabled atomic.Bool
 }
 
 func New(cfg config.ProviderConfig) *Client {
@@ -101,7 +106,31 @@ func (c *Client) ChatStream(ctx context.Context, req core.ChatRequest) (<-chan c
 
 		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 			retryAfter := resp.Header.Get("Retry-After")
-			sendModelEvent(ctx, out, core.ModelEvent{Err: formatHTTPError(resp.StatusCode, retryAfter, readErrorBody(resp.Body))})
+			bodyText := readErrorBody(resp.Body)
+			if isWebSearchDisabledError(bodyText) && requestHasNonForcedWebSearch(req) {
+				c.webSearchDisabled.Store(true)
+				resp.Body.Close()
+				fallbackReq := stripNativeWebSearch(req)
+				fallbackReq = addWebSearchDisabledNote(fallbackReq)
+				fallbackBody, marshalErr := json.Marshal(fallbackReq)
+				if marshalErr != nil {
+					sendModelEvent(ctx, out, core.ModelEvent{Err: fmt.Errorf("mimo: encode fallback chat request: %w", marshalErr)})
+					return
+				}
+				resp, err = c.doWithRetry(ctx, fallbackBody)
+				if err != nil {
+					sendModelEvent(ctx, out, core.ModelEvent{Err: err})
+					return
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+					readEventStream(ctx, resp.Body, out)
+					return
+				}
+				retryAfter = resp.Header.Get("Retry-After")
+				bodyText = readErrorBody(resp.Body)
+			}
+			sendModelEvent(ctx, out, core.ModelEvent{Err: formatHTTPError(resp.StatusCode, retryAfter, bodyText)})
 			return
 		}
 
@@ -113,6 +142,12 @@ func (c *Client) ChatStream(ctx context.Context, req core.ChatRequest) (<-chan c
 func (c *Client) normalizeRequest(req core.ChatRequest) core.ChatRequest {
 	if strings.TrimSpace(req.Model) == "" {
 		req.Model = c.model
+	}
+	if requestHasMedia(req) && !supportsMultimodalInput(req.Model) {
+		req.Model = multimodalFallbackModel()
+	}
+	if c.webSearchDisabled.Load() && requestHasNonForcedWebSearch(req) {
+		req = addWebSearchDisabledNote(stripNativeWebSearch(req))
 	}
 	req.Stream = true
 	return req
@@ -162,7 +197,7 @@ func (c *Client) mockChunks(req core.ChatRequest) []string {
 func lastUserMessage(messages []core.Message) string {
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "user" {
-			return strings.TrimSpace(messages[i].Content)
+			return strings.TrimSpace(messages[i].TextContent())
 		}
 	}
 	return ""
@@ -171,7 +206,7 @@ func lastUserMessage(messages []core.Message) string {
 func (c *Client) mockUsage(req core.ChatRequest) *core.CostUpdate {
 	inputTokens := 0
 	for _, msg := range req.Messages {
-		inputTokens += len(strings.Fields(msg.Content))
+		inputTokens += len(strings.Fields(msg.TextContent()))
 	}
 	outputTokens := 0
 	for _, chunk := range c.mockChunks(req) {
@@ -182,6 +217,76 @@ func (c *Client) mockUsage(req core.ChatRequest) *core.CostUpdate {
 		OutputTokens: outputTokens,
 		TotalTokens:  inputTokens + outputTokens,
 	}
+}
+
+func requestHasMedia(req core.ChatRequest) bool {
+	for _, msg := range req.Messages {
+		for _, part := range msg.ContentParts {
+			switch part.Type {
+			case "image_url", "input_audio", "video_url":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func requestHasNonForcedWebSearch(req core.ChatRequest) bool {
+	for _, tool := range req.Tools {
+		if tool.Type == "web_search" {
+			return !tool.ForceSearch
+		}
+	}
+	return false
+}
+
+func stripNativeWebSearch(req core.ChatRequest) core.ChatRequest {
+	tools := make([]core.ToolSpec, 0, len(req.Tools))
+	for _, tool := range req.Tools {
+		if tool.Type == "web_search" {
+			continue
+		}
+		tools = append(tools, tool)
+	}
+	req.Tools = tools
+	return req
+}
+
+func addWebSearchDisabledNote(req core.ChatRequest) core.ChatRequest {
+	const note = "Runtime note: the MiMo API key rejected native web_search because the Web Search Plugin is not enabled for this platform account. Answer without claiming live web access, and tell the user to enable the MiMo Web Search Plugin if current online information is required."
+	if len(req.Messages) > 0 && req.Messages[0].Role == "system" {
+		req.Messages[0].Content = strings.TrimSpace(req.Messages[0].Content + "\n\n" + note)
+		return req
+	}
+	req.Messages = append([]core.Message{{Role: "system", Content: note}}, req.Messages...)
+	return req
+}
+
+func isWebSearchDisabledError(body string) bool {
+	body = strings.ToLower(body)
+	return strings.Contains(body, "websearchenabled is false") ||
+		strings.Contains(body, "web search plugin") && strings.Contains(body, "not") && strings.Contains(body, "enabled")
+}
+
+func supportsMultimodalInput(modelID string) bool {
+	switch strings.TrimSpace(modelID) {
+	case "mimo-v2.5", "mimo-v2-omni":
+		return true
+	default:
+		return false
+	}
+}
+
+func multimodalFallbackModel() string {
+	modelID := strings.TrimSpace(configEnv("MIMO_MULTIMODAL_MODEL"))
+	if modelID == "" {
+		return DefaultMultimodalModel
+	}
+	return modelID
+}
+
+func configEnv(name string) string {
+	return strings.TrimSpace(strings.Trim(os.Getenv(name), `"`))
 }
 
 func sendModelEvent(ctx context.Context, out chan<- core.ModelEvent, event core.ModelEvent) bool {

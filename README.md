@@ -26,6 +26,13 @@ That means:
 - MTP streaming becomes perceived momentum: chat deltas, tool progress, trace, and cost update together.
 - Agentic RL becomes visible `goal -> plan -> action -> observation -> revision` traces.
 - Model updates go through `default / candidate / labs` channels and replay gates.
+- Native Web Search is offered to MiMo by default as the platform `web_search`
+  tool; if the API key has not enabled the Web Search Plugin, the provider
+  detects the platform rejection, retries without search, and prevents false
+  "live web" claims.
+- Multimodal prompts become real MiMo content parts: local or URL image/audio/video
+  references are attached as `image_url`, `input_audio`, or `video_url` instead
+  of being reduced to text workflow instructions.
 - Raw tool output never enters the model context directly; it is stored as an artifact first.
 - Skills, MCP servers, tools, and sub-agents appear in the right-side activity
   dashboards. Background delegation stays visible and replayable without turning
@@ -64,6 +71,11 @@ Already implemented:
 - Bubble Tea / Lip Gloss TUI with a transcript-first coding flow plus Context Map, Agent Trace, and Tool Cockpit dashboards.
 - Multi-turn agent loop wired from TUI prompt input via `EventUserPrompt`.
 - OpenAI-compatible MiMo SSE streaming client with mock fallback.
+- Native MiMo web_search injection, plugin-disabled fallback, and multimodal
+  content-part request encoding.
+- Automatic multimodal model fallback: media inputs switch from `mimo-v2.5-pro`
+  to `mimo-v2.5` by default because the current MiMo API rejects image input on
+  `mimo-v2.5-pro`; override with `MIMO_MULTIMODAL_MODEL` if the platform changes.
 - Structured HTTP errors, retry/backoff, and streaming parser tests.
 - Model registry with `default`, `candidate`, and `labs` channels.
 - Replay gate with golden sessions and trajectory comparison.

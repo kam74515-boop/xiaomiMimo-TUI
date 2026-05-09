@@ -62,6 +62,60 @@ export MIMO_LABS=1
 export MIMO_MAX_STEPS=50
 ```
 
+### `MIMO_WEB_SEARCH`
+
+- **Default:** enabled in auto mode
+- **Description:** Controls MiMo's native `web_search` tool injection. Set to
+  `0`, `false`, `off`, or `disabled` to disable. Set to `force` to send
+  `force_search=true`. If the platform account has not enabled the Web Search
+  Plugin, the provider retries non-forced requests without `web_search` and adds
+  a runtime note so the model does not claim live web access.
+
+```sh
+export MIMO_WEB_SEARCH=force
+```
+
+### `MIMO_WEB_SEARCH_MAX_KEYWORD`
+
+- **Default:** `3`
+- **Description:** Maximum search keywords per MiMo web-search round.
+
+```sh
+export MIMO_WEB_SEARCH_MAX_KEYWORD=3
+```
+
+### `MIMO_WEB_SEARCH_LIMIT`
+
+- **Default:** `3`
+- **Description:** Search result limit for MiMo native web search.
+
+```sh
+export MIMO_WEB_SEARCH_LIMIT=3
+```
+
+### `MIMO_MULTIMODAL_MODEL`
+
+- **Default:** `mimo-v2.5`
+- **Description:** Model used when a user prompt contains image/audio/video
+  content parts and the configured model is not a currently supported MiMo
+  multimodal-input model. As of the current MiMo API behavior, `mimo-v2.5-pro`
+  supports web search but rejects image input; media prompts therefore fall back
+  to `mimo-v2.5` unless this variable is set.
+
+```sh
+export MIMO_MULTIMODAL_MODEL="mimo-v2.5"
+```
+
+### `MIMO_MEDIA_MAX_MB`
+
+- **Default:** `50`
+- **Description:** Maximum local media file size to inline as a Base64 data URI.
+  Larger media files should be provided as public URLs.
+
+```sh
+export MIMO_MEDIA_MAX_MB=50
+```
+
 ---
 
 ## CLI Flags

@@ -95,6 +95,10 @@ func BuildSystemPrompt() string {
 	return strings.Join([]string{
 		"You are MiMo inside a developer TUI coding agent.",
 		"Act as a careful coding collaborator: explain assumptions, stream useful progress, and keep the trace honest.",
+		"MiMo capability profile: MiMo supports agentic coding, long-context reasoning, native web/deep search, and native multimodal understanding for text, image, video, and audio in multimodal-capable models. Do not say that MiMo lacks web search or image/audio/video understanding.",
+		"Runtime capability contract: this TUI wires MiMo web_search by default and converts user-provided media paths or URLs into MiMo multimodal content parts. If a specific media file or URL is missing, ask for that input; do not deny the underlying MiMo capability.",
+		"For web requests: use the native web_search capability when current or external information is needed. Do not fabricate search results.",
+		"For image/video/audio requests: inspect the attached multimodal content when it is present. If the user only says an image/audio/video exists but provides no path, URL, or attachment, ask for the concrete media reference.",
 		"Tools are available and will be executed. When you call a tool, its result will be fed back to you so you can continue reasoning.",
 		"Keep raw tool output out of context; summarize results into observations before using them.",
 		"When you are finished, provide a final answer without calling any more tools.",
@@ -152,7 +156,7 @@ func Loop(
 			{Role: "system", Content: BuildSystemPrompt()},
 		}
 	}
-	messages = append(messages, core.Message{Role: "user", Content: prompt})
+	messages = append(messages, BuildUserMessage(prompt))
 
 	for step := 0; step < config.MaxSteps; step++ {
 		select {
@@ -181,7 +185,7 @@ func Loop(
 		events, err := client.ChatStream(stepCtx, core.ChatRequest{
 			Messages: messages,
 			Stream:   true,
-			Tools:    toolSpecs,
+			Tools:    augmentToolSpecs(toolSpecs),
 		})
 		if err != nil {
 			stepCancel()
@@ -375,9 +379,10 @@ func RunOnce(ctx context.Context, prompt string, client core.ModelClient, bus *c
 	events, err := client.ChatStream(ctx, core.ChatRequest{
 		Messages: []core.Message{
 			{Role: "system", Content: BuildSystemPrompt()},
-			{Role: "user", Content: prompt},
+			BuildUserMessage(prompt),
 		},
 		Stream: true,
+		Tools:  augmentToolSpecs(nil),
 	})
 	if err != nil {
 		step.Status = core.TraceFailed

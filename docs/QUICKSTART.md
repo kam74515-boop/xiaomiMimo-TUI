@@ -135,6 +135,24 @@ All environment variables override config file values:
 | `MIMO_MOCK` | (unset) | Set to `1`/`true`/`yes` to force mock mode |
 | `MIMO_LABS` | (unset) | Set to `1`/`true`/`yes` to unlock labs-channel models |
 | `MIMO_MAX_STEPS` | (unset) | Override max agent loop steps |
+| `MIMO_WEB_SEARCH` | enabled | Native MiMo `web_search`; set `0` to disable or `force` to force search |
+| `MIMO_MULTIMODAL_MODEL` | `mimo-v2.5` | Fallback model for image/audio/video prompts |
+| `MIMO_MEDIA_MAX_MB` | `50` | Max local media file size inlined as Base64 |
+
+### Native Web And Media Inputs
+
+MiMo-TUI treats MiMo web search and multimodal input as runtime capabilities,
+not manual workflows.
+
+- Web search is offered to the MiMo API by default through the native
+  `web_search` tool. If your platform account has not enabled the MiMo Web
+  Search Plugin, non-forced requests are retried without search and the model is
+  told not to claim live web access.
+- Image/audio/video paths or URLs in your prompt are attached as MiMo content
+  parts. Example: `帮我看看 /absolute/path/screenshot.png` or
+  `分析这个视频 https://example.com/demo.mp4`.
+- The current API rejects image input on `mimo-v2.5-pro`, so media prompts
+  automatically use `mimo-v2.5` unless `MIMO_MULTIMODAL_MODEL` is set.
 
 ### Policy File
 

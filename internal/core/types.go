@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -182,10 +183,73 @@ type CostUpdate struct {
 }
 
 type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	Role         string        `json:"role"`
+	Content      string        `json:"content"`
+	ContentParts []ContentPart `json:"-"`
+	ToolCallID   string        `json:"tool_call_id,omitempty"`
+	ToolCalls    []ToolCall    `json:"tool_calls,omitempty"`
+}
+
+type ContentPart struct {
+	Type            string          `json:"type"`
+	Text            string          `json:"text,omitempty"`
+	ImageURL        *ImageURLPart   `json:"image_url,omitempty"`
+	InputAudio      *InputAudioPart `json:"input_audio,omitempty"`
+	VideoURL        *VideoURLPart   `json:"video_url,omitempty"`
+	FPS             float64         `json:"fps,omitempty"`
+	MediaResolution string          `json:"media_resolution,omitempty"`
+}
+
+type ImageURLPart struct {
+	URL string `json:"url"`
+}
+
+type InputAudioPart struct {
+	Data string `json:"data"`
+}
+
+type VideoURLPart struct {
+	URL string `json:"url"`
+}
+
+func (m Message) TextContent() string {
+	if strings.TrimSpace(m.Content) != "" {
+		return m.Content
+	}
+	var parts []string
+	for _, part := range m.ContentParts {
+		switch part.Type {
+		case "text":
+			if strings.TrimSpace(part.Text) != "" {
+				parts = append(parts, part.Text)
+			}
+		case "image_url":
+			parts = append(parts, "[image]")
+		case "input_audio":
+			parts = append(parts, "[audio]")
+		case "video_url":
+			parts = append(parts, "[video]")
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, " "))
+}
+
+func (m Message) MarshalJSON() ([]byte, error) {
+	content := any(m.Content)
+	if len(m.ContentParts) > 0 {
+		content = m.ContentParts
+	}
+	out := map[string]any{
+		"role":    m.Role,
+		"content": content,
+	}
+	if m.ToolCallID != "" {
+		out["tool_call_id"] = m.ToolCallID
+	}
+	if len(m.ToolCalls) > 0 {
+		out["tool_calls"] = m.ToolCalls
+	}
+	return json.Marshal(out)
 }
 
 type ChatRequest struct {
@@ -263,8 +327,42 @@ func (tc *ToolCall) UnmarshalJSON(data []byte) error {
 }
 
 type ToolSpec struct {
-	Type     string           `json:"type"`
-	Function ToolFunctionSpec `json:"function"`
+	Type         string             `json:"type"`
+	Function     ToolFunctionSpec   `json:"function,omitempty"`
+	MaxKeyword   int                `json:"max_keyword,omitempty"`
+	ForceSearch  bool               `json:"force_search,omitempty"`
+	Limit        int                `json:"limit,omitempty"`
+	UserLocation *WebSearchLocation `json:"user_location,omitempty"`
+}
+
+type WebSearchLocation struct {
+	Type    string `json:"type"`
+	Country string `json:"country,omitempty"`
+	Region  string `json:"region,omitempty"`
+	City    string `json:"city,omitempty"`
+}
+
+func (s ToolSpec) MarshalJSON() ([]byte, error) {
+	if s.Type == "" || s.Type == "function" || s.Function.Name != "" {
+		return json.Marshal(map[string]any{
+			"type":     "function",
+			"function": s.Function,
+		})
+	}
+	out := map[string]any{"type": s.Type}
+	if s.MaxKeyword > 0 {
+		out["max_keyword"] = s.MaxKeyword
+	}
+	if s.ForceSearch {
+		out["force_search"] = true
+	}
+	if s.Limit > 0 {
+		out["limit"] = s.Limit
+	}
+	if s.UserLocation != nil {
+		out["user_location"] = s.UserLocation
+	}
+	return json.Marshal(out)
 }
 
 type ToolFunctionSpec struct {
