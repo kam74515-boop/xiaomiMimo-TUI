@@ -69,6 +69,23 @@ func TestCursorTrackingWriterAppendsLatestCursorSequence(t *testing.T) {
 	}
 }
 
+func TestCursorTrackingWriterPreservesTerminalDescriptor(t *testing.T) {
+	var out bytes.Buffer
+	writer := cursorTrackingWriter{
+		Writer: &out,
+		fd: func() uintptr {
+			return 42
+		},
+	}
+
+	if got := writer.Fd(); got != 42 {
+		t.Fatalf("Fd() = %d, want wrapped terminal descriptor", got)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil", err)
+	}
+}
+
 func TestApplyEventUpdatesModelState(t *testing.T) {
 	m := NewModel(nil, nil)
 
@@ -193,7 +210,7 @@ func TestTabOpensDashboardBesideTranscript(t *testing.T) {
 	}
 }
 
-func TestToolEventsStayOutOfTranscriptButApprovalEnters(t *testing.T) {
+func TestToolAndApprovalEventsStayOutOfTranscript(t *testing.T) {
 	m := NewModel(nil, nil)
 	m.width = 120
 	m.height = 32
@@ -208,18 +225,16 @@ func TestToolEventsStayOutOfTranscriptButApprovalEnters(t *testing.T) {
 		},
 	})
 
-	for _, noisy := range []string{"TOOL read_file [running]", "TOOL read_file [done]", "read 120 lines"} {
+	for _, noisy := range []string{"TOOL read_file [running]", "TOOL read_file [done]", "read 120 lines", "APPROVAL apply_patch", "workspace mutation"} {
 		if strings.Contains(m.chat, noisy) {
-			t.Fatalf("transcript = %q, should not contain noisy tool event %q", m.chat, noisy)
+			t.Fatalf("transcript = %q, should not contain noisy event %q", m.chat, noisy)
 		}
 	}
 	if len(m.tools) != 1 || m.tools[0].Name != "read_file" || m.tools[0].Status != "done" {
 		t.Fatalf("tools = %#v, want read_file tracked in cockpit", m.tools)
 	}
-	for _, want := range []string{"APPROVAL apply_patch", "workspace mutation"} {
-		if !strings.Contains(m.chat, want) {
-			t.Fatalf("transcript = %q, want %q", m.chat, want)
-		}
+	if m.inputMode != InputApprove || m.pendingApproval.ToolCall.Name != "apply_patch" {
+		t.Fatalf("approval state = mode %d request %#v, want pending approval outside transcript", m.inputMode, m.pendingApproval)
 	}
 }
 
@@ -237,6 +252,24 @@ func TestDuplicateToolStartIsCollapsed(t *testing.T) {
 	}
 	if len(m.tools) != 1 {
 		t.Fatalf("tools len = %d, want one running tool", len(m.tools))
+	}
+}
+
+func TestFailedToolResultStaysOutOfTranscript(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 120
+	m.height = 32
+
+	m.applyEvent(core.AgentEvent{Type: core.EventToolStart, ToolName: "shell", Message: "command=ls -la"})
+	m.applyEvent(core.AgentEvent{Type: core.EventToolResult, ToolName: "shell", Err: "exit status 1"})
+
+	for _, noisy := range []string{"TOOL shell [failed]", "exit status 1"} {
+		if strings.Contains(m.chat, noisy) {
+			t.Fatalf("transcript = %q, should not contain failed tool bookkeeping %q", m.chat, noisy)
+		}
+	}
+	if len(m.tools) != 1 || m.tools[0].Status != "failed" {
+		t.Fatalf("tools = %#v, want failed shell tracked outside transcript", m.tools)
 	}
 }
 

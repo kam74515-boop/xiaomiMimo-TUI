@@ -144,7 +144,32 @@ func (s *terminalCursorState) Clear() {
 
 type cursorTrackingWriter struct {
 	io.Writer
-	state *terminalCursorState
+	reader io.Reader
+	fd     func() uintptr
+	state  *terminalCursorState
+}
+
+var _ interface {
+	io.ReadWriteCloser
+	Fd() uintptr
+} = cursorTrackingWriter{}
+
+func (w cursorTrackingWriter) Read(p []byte) (int, error) {
+	if w.reader == nil {
+		return 0, io.EOF
+	}
+	return w.reader.Read(p)
+}
+
+func (w cursorTrackingWriter) Close() error {
+	return nil
+}
+
+func (w cursorTrackingWriter) Fd() uintptr {
+	if w.fd == nil {
+		return 0
+	}
+	return w.fd()
 }
 
 func (w cursorTrackingWriter) Write(p []byte) (int, error) {
@@ -195,6 +220,8 @@ func Run(events <-chan core.AgentEvent, bus *core.Bus, modelName string, mockMod
 	}
 	_, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithOutput(cursorTrackingWriter{
 		Writer: os.Stdout,
+		reader: os.Stdout,
+		fd:     os.Stdout.Fd,
 		state:  cursorState,
 	})).Run()
 	return err
@@ -838,9 +865,6 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 		m.status = "tool started: " + toolName
 	case core.EventToolResult:
 		m.finishTool(event)
-		if event.Err != "" {
-			m.appendToolTranscript("failed", fallback(event.ToolName, "tool"), compactTranscriptDetail(event.Err))
-		}
 		m.status = "tool finished: " + fallback(event.ToolName, "tool")
 	case core.EventActivityUpdate:
 		if event.Activity != nil {
@@ -914,7 +938,6 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 			if timeoutSeconds <= 0 {
 				timeoutSeconds = defaultApprovalCountdownSeconds
 			}
-			m.appendApprovalTranscript(*event.Approval)
 			m.inputMode = InputApprove
 			m.pendingApproval = *event.Approval
 			m.textInput = ""
@@ -994,9 +1017,13 @@ func (m *Model) upsertTrace(step core.TraceStep) {
 
 func (m *Model) finishTool(event core.AgentEvent) {
 	name := fallback(event.ToolName, "tool")
+	status := "done"
+	if event.Err != "" {
+		status = "failed"
+	}
 	for i := len(m.tools) - 1; i >= 0; i-- {
 		if m.tools[i].Name == name && m.tools[i].Status == "running" {
-			m.tools[i].Status = "done"
+			m.tools[i].Status = status
 			m.tools[i].Detail = fallback(event.Message, event.Err)
 			m.tools[i].EndedAt = eventTime(event)
 			return
@@ -1004,7 +1031,7 @@ func (m *Model) finishTool(event core.AgentEvent) {
 	}
 	m.tools = append(m.tools, toolRun{
 		Name:    name,
-		Status:  "done",
+		Status:  status,
 		Detail:  fallback(event.Message, event.Err),
 		EndedAt: eventTime(event),
 	})
@@ -1199,20 +1226,6 @@ func (m *Model) appendObservationTranscriptIfUseful(summary string) {
 		return
 	}
 	m.appendObservationTranscript(summary)
-}
-
-func (m *Model) appendApprovalTranscript(req core.ApprovalRequest) {
-	m.assistantStreaming = false
-	reason := req.Permission.Reason
-	if reason == "" {
-		reason = "tool requires explicit permission"
-	}
-	body := reason
-	if inputSummary := approvalInputSummary(req.ToolCall.Input); inputSummary != "" {
-		body += "\n" + inputSummary
-	}
-	m.appendTranscriptBlock("APPROVAL "+fallback(req.ToolCall.Name, "tool"), body)
-	m.scrollTranscriptToBottom()
 }
 
 func compactTranscriptDetail(text string) string {
