@@ -104,7 +104,11 @@ func main() {
 		opts.sessionID = newSessionID()
 	}
 
-	events, ctxBus := liveEvents(context.Background(), cfg, promptFromArgs(), opts, registry)
+	prompt := promptFromArgs()
+	if opts.smoke && strings.TrimSpace(prompt) == "" {
+		prompt = defaultSmokePrompt()
+	}
+	events, ctxBus := liveEvents(context.Background(), cfg, prompt, opts, registry)
 	if opts.smoke {
 		if err := runSmoke(os.Stdout, events, opts.smokeTimeout); err != nil {
 			fmt.Fprintf(os.Stderr, "smoke: %v\n", err)
@@ -182,11 +186,11 @@ func newSessionID() string {
 }
 
 func promptFromArgs() string {
-	prompt := strings.TrimSpace(strings.Join(flag.Args(), " "))
-	if prompt == "" {
-		return "Give a concise MiMo Value Amplifier status report and explain the current tool/context architecture."
-	}
-	return prompt
+	return strings.TrimSpace(strings.Join(flag.Args(), " "))
+}
+
+func defaultSmokePrompt() string {
+	return "Give a concise MiMo Value Amplifier status report and explain the current tool/context architecture."
 }
 
 // isLabsUnlocked returns true when the MIMO_LABS environment variable is
