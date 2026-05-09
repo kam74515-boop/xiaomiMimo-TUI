@@ -145,6 +145,55 @@ func TestApplyEventUpdatesModelState(t *testing.T) {
 	}
 }
 
+func TestAssistantStreamingRendersAnimatedHeader(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 120
+	m.height = 32
+	m.running = true
+	m.loadingFrame = 2
+
+	m.applyEvent(core.AgentEvent{Type: core.EventMessageDelta, Message: "hello"})
+
+	view := m.View()
+	for _, want := range []string{"Transcript", "streaming", "✦ MiMo", "hello"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("view = %q, want streaming assistant decoration %q", view, want)
+		}
+	}
+	if strings.Contains(m.chat, "✦ MiMo") || strings.Contains(m.chat, "streaming") {
+		t.Fatalf("raw chat = %q, should keep undecorated transcript storage", m.chat)
+	}
+}
+
+func TestAssistantDoneRendersStableHeader(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 120
+	m.height = 32
+
+	m.applyEvent(core.AgentEvent{Type: core.EventMessageDelta, Message: "done"})
+	m.applyEvent(core.AgentEvent{Type: core.EventDone})
+
+	view := m.View()
+	if !strings.Contains(view, "✦ MiMo") || !strings.Contains(view, "done") {
+		t.Fatalf("view = %q, want stable assistant decoration", view)
+	}
+	if strings.Contains(view, "streaming") {
+		t.Fatalf("view = %q, should not show streaming after done", view)
+	}
+}
+
+func TestPulseAnimatesWhileAssistantStreaming(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.assistantStreaming = true
+	m.loadingFrame = 0
+
+	m = updateModel(t, m, pulseMsg{})
+
+	if m.loadingFrame != 1 {
+		t.Fatalf("loadingFrame = %d, want animation tick while assistant streams", m.loadingFrame)
+	}
+}
+
 func TestFocusedPanelScrollBounds(t *testing.T) {
 	m := NewModel(nil, nil)
 	m.width = 80

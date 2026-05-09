@@ -477,7 +477,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, approvalTick()
 
 	case pulseMsg:
-		if m.running {
+		if m.running || m.assistantStreaming {
 			m.loadingFrame++
 		}
 		return m, pulseTick()
@@ -1167,10 +1167,7 @@ func userPromptBlock(prompt string, queued bool) string {
 		}
 		lines[i] = "  " + line
 	}
-	return lipgloss.NewStyle().
-		Foreground(lipgloss.Color("39")).
-		Bold(true).
-		Render(strings.Join(lines, "\n"))
+	return strings.Join(lines, "\n")
 }
 
 func (m *Model) appendAssistantDelta(delta string) {
@@ -1367,7 +1364,9 @@ func (m Model) renderTranscript(width, height int) string {
 
 func (m Model) transcriptTitle(width int) string {
 	title := "Transcript"
-	if m.running {
+	if m.assistantStreaming {
+		title += " " + m.loadingGlyph() + " streaming"
+	} else if m.running {
 		title += " " + m.loadingGlyph() + " working"
 	}
 	title += " | " + m.scrollPosition(chatPanel)
@@ -1507,6 +1506,13 @@ func (m Model) scrollPosition(panel focusPanel) string {
 }
 
 func (m Model) panelLines(panel focusPanel, width int) []string {
+	if panel == chatPanel {
+		lines := m.transcriptLines(width)
+		if len(lines) == 0 {
+			return []string{""}
+		}
+		return lines
+	}
 	lines := wrapText(m.panelContent(panel), width)
 	if len(lines) == 0 {
 		return []string{""}
@@ -1530,6 +1536,106 @@ func (m Model) panelContent(panel focusPanel) string {
 	default:
 		return ""
 	}
+}
+
+func (m Model) transcriptLines(width int) []string {
+	content := strings.TrimRight(m.chat, "\n")
+	if content == "" {
+		return wrapText("waiting for message_delta events", width)
+	}
+	rawLines := strings.Split(content, "\n")
+	lastAssistantHeader := -1
+	for i, line := range rawLines {
+		if ansi.Strip(line) == "MIMO" {
+			lastAssistantHeader = i
+		}
+	}
+
+	inAssistant := false
+	inUser := false
+	lines := make([]string, 0, len(rawLines))
+	for i, line := range rawLines {
+		plain := strings.TrimSpace(ansi.Strip(line))
+		switch {
+		case plain == "MIMO":
+			live := m.assistantStreaming && i == lastAssistantHeader
+			lines = append(lines, m.assistantHeader(live))
+			inAssistant = true
+			inUser = false
+		case strings.HasPrefix(plain, "■ "):
+			lines = append(lines, styleWrappedLines(line, width, userPromptStyle())...)
+			inAssistant = false
+			inUser = true
+		case isTranscriptControlHeader(plain):
+			lines = append(lines, wrapText(line, width)...)
+			inAssistant = false
+			inUser = false
+		case inAssistant && plain != "":
+			live := m.assistantStreaming && i > lastAssistantHeader
+			lines = append(lines, styleWrappedLines(line, width, m.assistantBodyStyle(live))...)
+		case inUser && plain != "":
+			lines = append(lines, styleWrappedLines(line, width, userPromptStyle())...)
+		default:
+			lines = append(lines, wrapText(line, width)...)
+		}
+	}
+	return lines
+}
+
+func (m Model) assistantHeader(live bool) string {
+	label := "✦ MiMo"
+	if live {
+		label = fmt.Sprintf("✦ MiMo %s streaming", m.loadingGlyph())
+	}
+	return lipgloss.NewStyle().
+		Foreground(lipgloss.Color("75")).
+		Bold(true).
+		Render(label)
+}
+
+func (m Model) assistantBodyStyle(live bool) lipgloss.Style {
+	color := lipgloss.Color("252")
+	if live {
+		color = m.streamAccentColor()
+	}
+	return lipgloss.NewStyle().Foreground(color)
+}
+
+func (m Model) streamAccentColor() lipgloss.Color {
+	colors := []lipgloss.Color{"159", "123", "87", "81", "117", "153"}
+	return colors[m.loadingFrame%len(colors)]
+}
+
+func isTranscriptControlHeader(line string) bool {
+	if line == "" {
+		return false
+	}
+	if strings.HasPrefix(line, "■ ") {
+		return true
+	}
+	for _, prefix := range []string{"SYSTEM", "ERROR", "OBSERVATION", "ACTIVITY ", "TOOL "} {
+		if strings.HasPrefix(line, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func userPromptStyle() lipgloss.Style {
+	return lipgloss.NewStyle().
+		Foreground(lipgloss.Color("39")).
+		Bold(true)
+}
+
+func styleWrappedLines(line string, width int, style lipgloss.Style) []string {
+	lines := wrapText(line, width)
+	for i, wrapped := range lines {
+		if wrapped == "" {
+			continue
+		}
+		lines[i] = style.Render(wrapped)
+	}
+	return lines
 }
 
 func (m Model) contextContent() string {
