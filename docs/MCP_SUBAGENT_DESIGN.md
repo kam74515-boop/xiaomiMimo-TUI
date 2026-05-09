@@ -7,6 +7,19 @@ This document describes the MVP architecture for two related features:
 1. **MCP (Model Context Protocol) server integration** — allowing MiMo-TUI to discover and invoke tools provided by external MCP servers.
 2. **Sub-agent task abstraction** — a data model for decomposing complex goals into delegatable sub-tasks with tracked steps.
 
+The current phase is a **visibility skeleton**, not a complete MCP or
+sub-agent runtime. MiMo-TUI should first make the future control plane visible:
+configured MCP servers, possible external tools, delegated task records, status
+changes, artifacts, and safety decisions must be expressible as activity events
+and dashboard rows. Real MCP transport and real sub-agent execution are future
+implementation work.
+
+This is intentional product sequencing. MiMo-TUI differs from Claude Code-style
+background delegation by refusing to make delegated work feel invisible. Even
+before external transports are live, the UI and replay model should establish
+that tools, skills, MCP calls, and sub-agents are observable, reviewable, and
+kept out of the main transcript unless their summarized result is relevant.
+
 ## Architecture
 
 ### MCP Config Layer
@@ -71,6 +84,24 @@ pending → running → done
 
 Helper methods (`AddStep`, `CompleteStep`, `FailStep`, `Start`, `Complete`, `Fail`) enforce valid state transitions.
 
+### Activity Visibility Layer
+
+Every MCP and sub-agent capability should have an activity representation that
+can be rendered in the right-side dashboard and persisted to replay logs.
+
+Activity rows should cover:
+
+- MCP config discovery: server name, enabled state, command summary, trust tier
+- MCP tool visibility: server, tool name, schema availability, permission grade
+- MCP call request: caller, arguments summary, approval state, artifact id
+- sub-agent delegation: task id, parent id, goal, status, owner, isolation boundary
+- sub-agent step update: action, observation summary, tool/MCP usage, failure reason
+- merge decision: accepted, rejected, needs review, blocked by policy
+
+The main transcript should only receive concise markers and final summaries.
+Raw MCP payloads, sub-agent logs, step-by-step tool output, and failure detail
+belong in artifacts plus Activity Timeline / Sub-agent Observatory views.
+
 ## What's Implemented (MVP)
 
 | Component | Status | Notes |
@@ -84,6 +115,16 @@ Helper methods (`AddStep`, `CompleteStep`, `FailStep`, `Start`, `Complete`, `Fai
 | `SubAgentStep` data model | Done | Status tracking per step |
 | Config tests | Done | Load, default, validate, invalid TOML |
 | Tool tests | Done | Interface, safety, permission, run stub, summarize, name collision |
+
+## Current Phase Boundary
+
+| Area | Current boundary | Later implementation |
+|------|------------------|----------------------|
+| MCP transport | Config and placeholder tools are visible | stdio JSON-RPC process management, `tools/list`, `tools/call` |
+| MCP execution | `ExternalTool.Run()` remains a stub | real request/response, streaming, cancellation, retries |
+| Sub-agent runtime | Task and step data model exists | scheduler, isolated worktrees, context windows, result merge |
+| Dashboard | Activity model should describe rows and replay needs | live Activity Timeline and Sub-agent Observatory rendering |
+| Replay | Events should be designed to persist safely | deterministic replay and filtered export of activity logs |
 
 ## What's NOT Implemented (Future)
 
@@ -115,6 +156,32 @@ Helper methods (`AddStep`, `CompleteStep`, `FailStep`, `Start`, `Complete`, `Fai
 1. **Resource exhaustion:** Unbounded sub-agent spawning could exhaust memory/tokens. Mitigation: enforce a maximum task depth and concurrent task limit.
 2. **Context pollution:** Sub-agents with shared context could corrupt each other's state. Mitigation: isolate sub-agent context windows.
 3. **Recursive delegation:** A sub-agent could spawn sub-agents indefinitely. Mitigation: enforce a maximum nesting depth (e.g., 3 levels).
+
+## Safety and Privacy Boundaries
+
+- **Transcript boundary:** The main transcript receives concise status markers
+  and final summaries only. Detailed tool output, MCP payloads, sub-agent logs,
+  and intermediate failures stay in artifacts and dashboards.
+- **Artifact boundary:** Raw external data is stored as artifacts first. Only a
+  bounded, redacted observation may be admitted into Near or Anchor context.
+- **Approval boundary:** MCP tools and sub-agent actions that can mutate files,
+  run shell commands, call networks, or touch external accounts require explicit
+  permission policy evaluation before execution.
+- **Server trust boundary:** MCP server config is not proof of trust. Server
+  command, arguments, environment, network behavior, and exposed tool schemas
+  must be shown or summarized before use.
+- **Worktree boundary:** Sub-agent file writes should happen in an isolated
+  worktree or declared workspace boundary when runtime support lands. Merge into
+  the parent task must be visible and reviewable.
+- **Context boundary:** Sub-agent context is separate by default. Only selected
+  result summaries and evidence references should be merged into the parent
+  context.
+- **Secret boundary:** Environment variables, tokens, cookies, credentials,
+  private file paths, and account identifiers must be redacted from activity
+  summaries unless the user explicitly opens the raw artifact.
+- **Export boundary:** Replay and activity log export must support filtering or
+  redaction so sharing a session does not leak secrets, private workspace data,
+  or third-party account metadata.
 
 ## Testing Strategy
 

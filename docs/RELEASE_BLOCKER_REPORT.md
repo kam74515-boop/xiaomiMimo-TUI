@@ -9,11 +9,11 @@ Audit date: 2026-05-08. Auditor: automated codebase audit.
 
 | Severity | Count | Status |
 |----------|-------|--------|
-| P0 (must fix) | 0 | -- |
-| P1 (should fix) | 2 | open |
-| P2 (nice to have) | 8 | open |
+| P0 (must fix) | 0 | none |
+| P1 (should fix) | 0 | fixed |
+| P2 (nice to have) | 1 | deferred |
 
-**Verdict: No P0 blockers. Two P1 issues should be addressed before tagging 1.0.**
+**Verdict: No P0 or P1 blockers remain. 1.0 is release-ready from this audit.**
 
 All build/test/vet/smoke validation passes cleanly:
 
@@ -27,59 +27,41 @@ MIMO_MOCK=1 smoke      -- PASS (events=16)
 
 ---
 
-## P1 Issues (Should Fix for 1.0)
+## P1 Issues (Fixed)
 
-### P1-1: Incomplete secret redaction across tool outputs
+### P1-1: Incomplete secret redaction across tool outputs -- FIXED
 
-**Location:** `internal/tools/readtools.go` (rgTool, gitDiffTool, gitLogTool),
-`internal/tools/builtins.go` (readFileTool)
+**Location:** `internal/tools/builtins.go`, `internal/tools/readtools.go`,
+`internal/tools/redact_test.go`
 
-**Description:** Only `shellTool.runCommand()` calls `redactSecrets()` on
-stdout/stderr before storing artifacts. The following tools store raw bytes
-directly without redaction:
+**Resolution:** `redactSecrets()` now covers artifact payloads for:
 
-- `rg` -- search results may contain API keys from config files
-- `git_diff` -- diffs may show API key changes
-- `git_log` -- commit messages may reference secrets
-- `read_file` -- file content stored verbatim
-- `list_dir` -- directory listings (low risk, filenames only)
+- `shell`
+- `run_test`
+- `rg`
+- `read_file`
+- `git_status`
+- `git_diff`
+- `git_log`
 
-If the agent searches or reads files containing secrets, those secrets will be
-stored in `.mimo/artifacts/` and potentially visible to anyone with filesystem
-access.
-
-**Impact:** API keys or tokens could leak into artifact storage if the agent
-reads files containing them (e.g., `.env`, `config.toml` with embedded keys).
-
-**Recommended fix:** Apply `redactSecrets()` to stdout/stderr bytes in
-`runGitCommand()` (covers `git_diff`, `git_log`, `git_status`) and in each
-tool's `Run()` method. Alternatively, apply redaction at the artifact store
-write boundary.
+`internal/tools/redact_test.go` verifies representative secrets are redacted
+before storage.
 
 ---
 
-### P1-2: Config documentation URL inconsistency
+### P1-2: Config documentation URL inconsistency -- FIXED
 
-**Location:** `docs/QUICKSTART.md` line 129 vs `docs/CONFIGURATION.md` line 13
+**Location:** `internal/config/config.go`, `internal/provider/mimo/client.go`,
+`docs/QUICKSTART.md`, `docs/CONFIGURATION.md`
 
-**Description:** QUICKSTART.md documents the default `MIMO_BASE_URL` as
-`https://token-plan-cn.xiaomimimo.com/v1` in the environment variable table,
-while CONFIGURATION.md and the actual code default to
-`https://api.xiaomimimo.com/v1`. The "Run with Real MiMo" section in
-QUICKSTART.md uses the token-plan URL as an example export, which is correct
-for that context, but the env var table's "Default" column is misleading.
-
-**Impact:** Users following the env var table may configure the wrong endpoint.
-
-**Recommended fix:** Change QUICKSTART.md env var table default to
-`https://api.xiaomimimo.com/v1` to match CONFIGURATION.md and code. Keep the
-token-plan URL in the "Run with Real MiMo" example section.
+**Resolution:** Code and documentation now use
+`https://token-plan-cn.xiaomimimo.com/v1` as the default endpoint.
 
 ---
 
 ## P2 Issues (Nice to Have)
 
-### P2-1: Ctrl+C not documented as quit key in QUICKSTART.md
+### P2-1: Ctrl+C not documented as quit key in QUICKSTART.md -- FIXED
 
 **Location:** `docs/QUICKSTART.md` TUI Controls table, `README.md` TUI Controls
 
@@ -87,12 +69,11 @@ token-plan URL in the "Run with Real MiMo" example section.
 in `internal/tui/model.go` line 141). QUICKSTART.md only lists `q`. README.md
 lists `q or Ctrl+C` which is correct. QUICKSTART should match.
 
-**Recommended fix:** Add `Ctrl+C` to the QUICKSTART.md TUI controls table as an
-alternative quit key.
+**Resolution:** QUICKSTART documents `q` and `Ctrl+C` as quit keys.
 
 ---
 
-### P2-2: Ctrl+G interrupt not documented in QUICKSTART.md
+### P2-2: Ctrl+G interrupt not documented in QUICKSTART.md -- FIXED
 
 **Location:** `docs/QUICKSTART.md` TUI Controls table
 
@@ -101,12 +82,11 @@ run (`internal/tui/model.go` line 283). This is documented in the TUI help
 overlay (`?` key) but not in QUICKSTART.md or CONFIGURATION.md keybinding
 tables.
 
-**Recommended fix:** Add `Ctrl+G` to the QUICKSTART.md and CONFIGURATION.md
-TUI controls tables.
+**Resolution:** QUICKSTART documents `Ctrl+G` as the running-agent interrupt.
 
 ---
 
-### P2-3: KNOWN_LIMITATIONS.md contradicts implemented code for model persistence
+### P2-3: KNOWN_LIMITATIONS.md contradicts implemented code for model persistence -- FIXED
 
 **Location:** `docs/KNOWN_LIMITATIONS.md` lines 80-98
 
@@ -119,13 +99,12 @@ is implemented.
 
 **Impact:** Users are told a feature is missing when it actually works.
 
-**Recommended fix:** Update KNOWN_LIMITATIONS.md to reflect that model
-persistence IS implemented. Change the status to "Implemented" or remove the
-section entirely.
+**Resolution:** `docs/KNOWN_LIMITATIONS.md` now marks model registry
+persistence as implemented.
 
 ---
 
-### P2-4: ARCHITECTURE.md tool count is wrong
+### P2-4: ARCHITECTURE.md tool count is wrong -- FIXED
 
 **Location:** `docs/ARCHITECTURE.md` line 14
 
@@ -133,11 +112,11 @@ section entirely.
 shell, rg, read_file, list_dir, git_diff, git_log, artifact_read, write_file,
 apply_patch, git_status, run_test, diagnostics.
 
-**Recommended fix:** Change "11" to "12".
+**Resolution:** `docs/ARCHITECTURE.md` now says 12 built-in tools.
 
 ---
 
-### P2-5: Policy config load error silently ignored
+### P2-5: Policy config load error silently ignored -- FIXED
 
 **Location:** `cmd/mimo/main.go` line 340
 
@@ -148,12 +127,12 @@ is used without warning.
 
 **Impact:** Users may think their custom policy is active when it is not.
 
-**Recommended fix:** Log a warning to stderr when `LoadPolicy()` returns an
-error but the file exists.
+**Resolution:** `LoadPolicy()` logs a warning and safely falls back to defaults
+when a policy file has invalid syntax.
 
 ---
 
-### P2-6: `detectShellRisk` false positives for curl/wget
+### P2-6: `detectShellRisk` false positives for curl/wget -- FIXED
 
 **Location:** `internal/tools/builtins.go` lines 633-651
 
@@ -166,9 +145,8 @@ as `SafetyDestructive`, even benign read-only fetches like
 **Impact:** Benign HTTP fetch commands are blocked by default policy
 (destructive = deny).
 
-**Recommended fix:** Move `curl`/`wget` from `destructiveMarkers` to
-`shellMutationMarkers` unless they appear with `| sh` or `| bash` (which is
-already handled separately).
+**Resolution:** Plain `curl`/`wget` are `shell_mutation`; `curl | sh` and
+similar piped installer patterns remain destructive.
 
 ---
 
@@ -189,7 +167,7 @@ benefit from unit tests.
 
 ---
 
-### P2-8: QUICKSTART.md policy.toml path ordering is backwards
+### P2-8: QUICKSTART.md policy.toml path ordering is backwards -- FIXED
 
 **Location:** `docs/QUICKSTART.md` lines 106-108 vs `internal/config/policy.go`
 lines 68-74
@@ -203,8 +181,8 @@ implies the same ordering applies to policy.toml, while the code checks
 `.mimo/policy.toml` first (project-local wins). CONFIGURATION.md correctly
 documents both orderings separately.
 
-**Recommended fix:** In QUICKSTART.md, clarify that policy.toml loading order
-differs from config.toml (project-local policy wins over user-global policy).
+**Resolution:** QUICKSTART now documents config layering separately from
+policy first-found precedence.
 
 ---
 
@@ -222,7 +200,7 @@ differs from config.toml (project-local policy wins over user-global policy).
 | Session resume and history | PASS |
 | Context compression and oracle | PASS |
 | Model registry and channel gating | PASS |
-| TUI keybindings match docs | PASS (minor P2s) |
+| TUI keybindings match docs | PASS |
 | Artifact store write/read | PASS |
 | Event bus pub/sub | PASS |
 | Mock mode smoke test | PASS |

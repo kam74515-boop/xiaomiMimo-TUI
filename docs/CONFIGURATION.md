@@ -114,10 +114,10 @@ All flags are passed to `go run ./cmd/mimo [flags] [prompt]`.
 
 ### Location
 
-Config files are loaded in order (first found wins):
+Config files are layered in order. Later files override earlier values:
 
 1. `~/.mimo-tui/config.toml` (user-global)
-2. `.mimo/config.toml` (project-local)
+2. `.mimo/config.toml` (project-local, wins over global)
 
 ### Format
 
@@ -157,10 +157,10 @@ context_window = 1000000
 
 ### Location
 
-Policy files are loaded in order (first found wins):
+Policy files use first-found precedence:
 
 1. `.mimo/policy.toml` (project-local)
-2. `~/.mimo-tui/policy.toml` (user-global)
+2. `~/.mimo-tui/policy.toml` (user-global fallback)
 
 ### Format
 

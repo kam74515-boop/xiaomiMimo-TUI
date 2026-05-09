@@ -106,6 +106,41 @@ func TestExternalToolSummarize(t *testing.T) {
 	}
 }
 
+func TestExternalToolPublishesIdentifiableMCPStubActivity(t *testing.T) {
+	tool := NewExternalTool("github", "list_repos", "List repos", nil, ".")
+	registry := NewRegistry()
+	if err := registry.Register(tool); err != nil {
+		t.Fatal(err)
+	}
+	bus := core.NewBus()
+	events := bus.Subscribe(10)
+	executor := NewExecutor(registry, bus, WithAllowedAskTools(tool.Name()))
+
+	result, _ := executor.Execute(context.Background(), core.ToolCall{
+		ID:    "call-mcp",
+		Name:  tool.Name(),
+		Input: core.ToolInput{"visibility": "private"},
+	})
+	if result.ExitCode != 0 {
+		t.Fatalf("MCP stub should remain a successful placeholder result, got %+v", result)
+	}
+
+	activities := activityEvents(drainEvents(events))
+	if len(activities) != 2 {
+		t.Fatalf("expected running and stub activities, got %+v", activities)
+	}
+	stub := activities[1]
+	if stub.Kind != core.ActivityMCP || stub.Status != core.ActivityBlocked {
+		t.Fatalf("stub activity should be identifiable as blocked MCP work: %+v", stub)
+	}
+	if stub.ServerName != "github" || stub.ToolName != "list_repos" {
+		t.Fatalf("stub activity missing MCP metadata: %+v", stub)
+	}
+	if !strings.Contains(stub.Summary, "stub") || !strings.Contains(stub.Detail, "github") || !strings.Contains(stub.Detail, "list_repos") {
+		t.Fatalf("stub activity summary/detail should explain the inactive MCP connection: %+v", stub)
+	}
+}
+
 func TestExternalToolNameCollision(t *testing.T) {
 	// Two tools from different servers should not collide.
 	gh := NewExternalTool("github", "search", "Search GitHub", nil, ".")

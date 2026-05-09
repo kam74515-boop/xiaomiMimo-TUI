@@ -1,21 +1,80 @@
 package tui
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/mattn/go-runewidth"
 
 	"mimo-tui/internal/core"
 )
+
+func TestTerminalCursorTracksPromptInputPosition(t *testing.T) {
+	state := &terminalCursorState{}
+	m := NewModel(nil, nil)
+	m.cursorState = state
+	m.width = 120
+	m.height = 32
+	m.inputMode = InputPrompt
+	m.textInput = "你好"
+	m.cursorPos = 2
+
+	_ = m.View()
+
+	sequence := state.Sequence()
+	if !strings.Contains(sequence, "\x1b[?25h") {
+		t.Fatalf("cursor sequence = %q, want show cursor", sequence)
+	}
+	if !strings.Contains(sequence, "\x1b[") || !strings.HasSuffix(sequence, "H") {
+		t.Fatalf("cursor sequence = %q, want cursor position", sequence)
+	}
+	if got, want := m.inputCursorColumn(120), 3+runewidth.StringWidth("› 你好"); got != want {
+		t.Fatalf("input cursor column = %d, want %d", got, want)
+	}
+}
+
+func TestTerminalCursorHiddenWhenInputInactive(t *testing.T) {
+	state := &terminalCursorState{}
+	m := NewModel(nil, nil)
+	m.cursorState = state
+	m.width = 120
+	m.height = 32
+	m.inputMode = InputNone
+
+	_ = m.View()
+
+	if got := state.Sequence(); got != "\x1b[?25l" {
+		t.Fatalf("cursor sequence = %q, want hidden cursor", got)
+	}
+}
+
+func TestCursorTrackingWriterAppendsLatestCursorSequence(t *testing.T) {
+	var out bytes.Buffer
+	state := &terminalCursorState{}
+	state.Set("CURSOR")
+	writer := cursorTrackingWriter{Writer: &out, state: state}
+
+	n, err := writer.Write([]byte("frame"))
+	if err != nil {
+		t.Fatalf("Write returned error: %v", err)
+	}
+	if n != len("frame") {
+		t.Fatalf("Write n = %d, want %d", n, len("frame"))
+	}
+	if got := out.String(); got != "frameCURSOR" {
+		t.Fatalf("output = %q, want frame plus cursor sequence", got)
+	}
+}
 
 func TestApplyEventUpdatesModelState(t *testing.T) {
 	m := NewModel(nil, nil)
 
 	m.applyEvent(core.AgentEvent{Type: core.EventMessageDelta, Message: "hello"})
-	if m.chat != "hello" {
-		t.Fatalf("chat = %q, want hello", m.chat)
+	if !strings.Contains(m.chat, "MIMO") || !strings.Contains(m.chat, "hello") {
+		t.Fatalf("chat = %q, want transcript assistant block", m.chat)
 	}
 
 	m.applyEvent(core.AgentEvent{
@@ -93,6 +152,277 @@ func TestFocusedPanelScrollBounds(t *testing.T) {
 	m.clampAllScrolls()
 	if m.scroll[chatPanel] != 0 {
 		t.Fatalf("chat scroll after content shrink = %d, want 0", m.scroll[chatPanel])
+	}
+}
+
+func TestDefaultViewIsTranscriptFirst(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 120
+	m.height = 32
+	m.chat = numberedLines(80)
+
+	view := m.View()
+	if m.focus != chatPanel {
+		t.Fatalf("default focus = %d, want chatPanel transcript", m.focus)
+	}
+	if !strings.Contains(view, "Transcript") {
+		t.Fatal("default view should render the Transcript title")
+	}
+	if !strings.Contains(view, "MiMo / 1M") || !strings.Contains(view, "Agent Cockpit") {
+		t.Fatal("wide default view should keep the right dashboard visible")
+	}
+}
+
+func TestTabOpensDashboardBesideTranscript(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 120
+	m.height = 32
+	m.chat = "MIMO\n  hello"
+
+	m = updateModel(t, m, keyMsg(tea.KeyTab))
+	view := m.View()
+
+	if m.focus != tracePanel {
+		t.Fatalf("focus after tab = %d, want tracePanel", m.focus)
+	}
+	if !strings.Contains(view, "Transcript") {
+		t.Fatal("dashboard view should keep transcript visible")
+	}
+	if !strings.Contains(view, "Agent Trace") {
+		t.Fatal("dashboard view should show the focused dashboard panel")
+	}
+}
+
+func TestToolEventsStayOutOfTranscriptButApprovalEnters(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 120
+	m.height = 32
+
+	m.applyEvent(core.AgentEvent{Type: core.EventToolStart, ToolName: "read_file", Message: "path=README.md"})
+	m.applyEvent(core.AgentEvent{Type: core.EventToolResult, ToolName: "read_file", Message: "read 120 lines"})
+	m.applyEvent(core.AgentEvent{
+		Type: core.EventApprovalNeeded,
+		Approval: &core.ApprovalRequest{
+			ToolCall:   core.ToolCall{Name: "apply_patch", Input: core.ToolInput{"path": "main.go"}},
+			Permission: core.PermissionRequest{Behavior: core.PermissionAsk, Reason: "workspace mutation"},
+		},
+	})
+
+	for _, noisy := range []string{"TOOL read_file [running]", "TOOL read_file [done]", "read 120 lines"} {
+		if strings.Contains(m.chat, noisy) {
+			t.Fatalf("transcript = %q, should not contain noisy tool event %q", m.chat, noisy)
+		}
+	}
+	if len(m.tools) != 1 || m.tools[0].Name != "read_file" || m.tools[0].Status != "done" {
+		t.Fatalf("tools = %#v, want read_file tracked in cockpit", m.tools)
+	}
+	for _, want := range []string{"APPROVAL apply_patch", "workspace mutation"} {
+		if !strings.Contains(m.chat, want) {
+			t.Fatalf("transcript = %q, want %q", m.chat, want)
+		}
+	}
+}
+
+func TestDuplicateToolStartIsCollapsed(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 120
+	m.height = 32
+
+	call := &core.ToolCall{Name: "rg", Input: core.ToolInput{"pattern": "TODO"}}
+	m.applyEvent(core.AgentEvent{Type: core.EventToolStart, ToolName: "rg", ToolCall: call})
+	m.applyEvent(core.AgentEvent{Type: core.EventToolStart, ToolName: "rg", ToolCall: call, Message: "Starting tool rg"})
+
+	if strings.Contains(m.chat, "TOOL rg [running]") {
+		t.Fatalf("chat=%q, tool start should stay out of transcript", m.chat)
+	}
+	if len(m.tools) != 1 {
+		t.Fatalf("tools len = %d, want one running tool", len(m.tools))
+	}
+}
+
+func TestActivityUpdateRecordsAndMergesWithoutTranscriptNoise(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 120
+	m.height = 32
+
+	m.applyEvent(core.AgentEvent{
+		Type: core.EventActivityUpdate,
+		Activity: &core.ActivityEvent{
+			ID:      "skill-1",
+			Kind:    core.ActivitySkill,
+			Name:    "github:gh-fix-ci",
+			Status:  core.ActivityRunning,
+			Summary: "checking failed checks",
+		},
+	})
+	m.applyEvent(core.AgentEvent{
+		Type: core.EventActivityUpdate,
+		Activity: &core.ActivityEvent{
+			ID:      "skill-1",
+			Status:  core.ActivityDone,
+			Summary: "found failing check logs",
+		},
+	})
+
+	if len(m.activities) != 1 {
+		t.Fatalf("activities len = %d, want merged single activity", len(m.activities))
+	}
+	if got := m.activities[0]; got.Kind != core.ActivitySkill || got.Name != "github:gh-fix-ci" || got.Status != core.ActivityDone || got.Summary != "found failing check logs" {
+		t.Fatalf("activity = %+v, want preserved skill identity with updated status/summary", got)
+	}
+	if strings.TrimSpace(m.chat) != "" {
+		t.Fatalf("chat = %q, ordinary activity should stay out of transcript", m.chat)
+	}
+}
+
+func TestActivityVizShowsSubagentAndMCPActivity(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 140
+	m.height = 40
+
+	m.applyEvent(core.AgentEvent{
+		Type: core.EventActivityUpdate,
+		Activity: &core.ActivityEvent{
+			ID:      "agent-1",
+			Kind:    core.ActivitySubAgent,
+			Name:    "reviewer",
+			Title:   "audit TUI activity visibility",
+			Status:  core.ActivityRunning,
+			Summary: "reading model.go",
+			Role:    "reviewer",
+		},
+	})
+	m.applyEvent(core.AgentEvent{
+		Type: core.EventActivityUpdate,
+		Activity: &core.ActivityEvent{
+			ID:         "mcp-1",
+			Kind:       core.ActivityMCP,
+			ServerName: "github",
+			ToolName:   "pull_request_review_threads",
+			Status:     core.ActivityRunning,
+			Summary:    "loading unresolved review threads",
+		},
+	})
+	m.applyEvent(core.AgentEvent{
+		Type: core.EventActivityUpdate,
+		Activity: &core.ActivityEvent{
+			ID:      "skill-1",
+			Kind:    core.ActivitySkill,
+			Name:    "github:gh-address-comments",
+			Status:  core.ActivityDone,
+			Summary: "mapped review comments",
+		},
+	})
+
+	viz := m.renderActivityViz(100, 24)
+	for _, want := range []string{
+		"Activity 3 total / 2 running / 0 failed",
+		"Counts tool 0 skill 1 mcp 1 sub 1",
+		"Subagent reviewer running",
+		"Step: reading model.go",
+		"MCP/Skill gh-address-comments, github/pull_request_review_threads",
+		"- MCP github/pull_request_review_threads running",
+	} {
+		if !strings.Contains(viz, want) {
+			t.Fatalf("activity viz = %q, want %q", viz, want)
+		}
+	}
+}
+
+func TestToolContentIncludesActivityTimeline(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 120
+	m.height = 40
+
+	m.applyEvent(core.AgentEvent{
+		Type: core.EventActivityUpdate,
+		Activity: &core.ActivityEvent{
+			ID:        "agent-1",
+			Kind:      core.ActivitySubAgent,
+			Name:      "builder",
+			Title:     "implement activity dashboard",
+			Status:    core.ActivityRunning,
+			Summary:   "patching model.go",
+			ModelName: "mimo-coder",
+			Role:      "builder",
+		},
+	})
+	m.applyEvent(core.AgentEvent{
+		Type: core.EventActivityUpdate,
+		Activity: &core.ActivityEvent{
+			ID:         "mcp-1",
+			Kind:       core.ActivityMCP,
+			ServerName: "filesystem",
+			ToolName:   "read_file",
+			Status:     core.ActivityDone,
+			Summary:    "read tests",
+		},
+	})
+
+	content := m.toolContent()
+	for _, want := range []string{
+		"Activity Timeline",
+		"[running] subagent builder",
+		"goal: implement activity dashboard",
+		"step: patching model.go",
+		"model: mimo-coder",
+		"[done] mcp filesystem/read_file",
+		"mcp: filesystem",
+		"tool: read_file",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("tool content = %q, want %q", content, want)
+		}
+	}
+}
+
+func TestFailedActivityAddsRecoverableTranscriptSummary(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 120
+	m.height = 32
+
+	m.applyEvent(core.AgentEvent{
+		Type: core.EventActivityUpdate,
+		Activity: &core.ActivityEvent{
+			ID:         "mcp-1",
+			Kind:       core.ActivityMCP,
+			ServerName: "filesystem",
+			ToolName:   "write_file",
+			Status:     core.ActivityFailed,
+			Summary:    "permission denied: cannot write internal/core/types.go",
+			Reason:     "policy blocked writes outside tui files",
+		},
+	})
+
+	for _, want := range []string{
+		"ACTIVITY mcp filesystem/write_file [failed]",
+		"permission denied: cannot write internal/core/types.go",
+		"reason: policy blocked writes outside tui files",
+		"next: check permissions or approve the required action",
+	} {
+		if !strings.Contains(m.chat, want) {
+			t.Fatalf("chat = %q, want failed activity summary %q", m.chat, want)
+		}
+	}
+}
+
+func TestArtifactObservationStaysOutOfTranscript(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 120
+	m.height = 32
+
+	m.applyEvent(core.AgentEvent{
+		Type: core.EventObservation,
+		Observation: &core.Observation{
+			Summary: "artifact art-123: tool=read_file kind=content exit=0 files=1\ncontent.txt: 26007 bytes; large payload kept in artifact art-123\nlarge_files=1 remain artifact-backed",
+		},
+	})
+
+	if strings.TrimSpace(m.chat) != "" {
+		t.Fatalf("chat = %q, should not show raw artifact bookkeeping", m.chat)
+	}
+	if len(m.notes) != 1 {
+		t.Fatalf("notes len = %d, want artifact observation stored in notes", len(m.notes))
 	}
 }
 
@@ -287,8 +617,8 @@ func TestInputPromptEnterAndCancel(t *testing.T) {
 	m.width = 80
 	m.height = 24
 
-	// Press 'i' to enter prompt mode.
-	m = updateModel(t, m, runeKey('i'))
+	// Press '/' to enter prompt mode.
+	m = updateModel(t, m, runeKey('/'))
 	if m.inputMode != InputPrompt {
 		t.Fatalf("inputMode = %d, want InputPrompt", m.inputMode)
 	}
@@ -311,12 +641,12 @@ func TestInputPromptEnterAndCancel(t *testing.T) {
 	if m.inputMode != InputNone {
 		t.Fatalf("inputMode after Enter = %d, want InputNone", m.inputMode)
 	}
-	if !strings.Contains(m.chat, "user> hello") {
-		t.Fatalf("chat = %q, want to contain user> hello", m.chat)
+	if !strings.Contains(m.chat, "USER") || !strings.Contains(m.chat, "hello") {
+		t.Fatalf("chat = %q, want to contain USER hello block", m.chat)
 	}
 
 	// Test cancel: enter prompt mode again, type, Esc.
-	m = updateModel(t, m, runeKey('i'))
+	m = updateModel(t, m, runeKey('/'))
 	m = updateModel(t, m, runeKey('w'))
 	m = updateModel(t, m, runeKey('o'))
 	m = updateModel(t, m, runeKey('r'))
@@ -331,12 +661,40 @@ func TestInputPromptEnterAndCancel(t *testing.T) {
 	}
 }
 
-func TestInputPromptEmptySubmit(t *testing.T) {
+func TestDirectTypingStartsPromptMode(t *testing.T) {
 	m := NewModel(nil, nil)
 	m.width = 80
 	m.height = 24
 
 	m = updateModel(t, m, runeKey('i'))
+	if m.inputMode != InputPrompt {
+		t.Fatalf("inputMode = %d, want InputPrompt", m.inputMode)
+	}
+	if m.textInput != "i" {
+		t.Fatalf("textInput = %q, want first typed rune", m.textInput)
+	}
+}
+
+func TestDirectTypingAllowsQAsText(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+
+	m = updateModel(t, m, runeKey('q'))
+	if m.inputMode != InputPrompt {
+		t.Fatalf("inputMode = %d, want InputPrompt", m.inputMode)
+	}
+	if m.textInput != "q" {
+		t.Fatalf("textInput = %q, want q", m.textInput)
+	}
+}
+
+func TestInputPromptEmptySubmit(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+
+	m = updateModel(t, m, runeKey('/'))
 	chatBefore := m.chat
 	// Press Enter with empty text.
 	m = updateModel(t, m, keyMsg(tea.KeyEnter))
@@ -357,7 +715,7 @@ func TestInputPromptPublishesUserPromptEvent(t *testing.T) {
 	m.height = 24
 
 	// Enter prompt mode, type, and submit.
-	m = updateModel(t, m, runeKey('i'))
+	m = updateModel(t, m, runeKey('/'))
 	m = updateModel(t, m, runeKey('h'))
 	m = updateModel(t, m, runeKey('i'))
 	m = updateModel(t, m, keyMsg(tea.KeyEnter))
@@ -383,7 +741,7 @@ func TestInputPromptBackspace(t *testing.T) {
 	m.width = 80
 	m.height = 24
 
-	m = updateModel(t, m, runeKey('i'))
+	m = updateModel(t, m, runeKey('/'))
 	m = updateModel(t, m, runeKey('a'))
 	m = updateModel(t, m, runeKey('b'))
 	m = updateModel(t, m, runeKey('c'))
@@ -414,7 +772,7 @@ func TestInputPromptCursorMovement(t *testing.T) {
 	m.width = 80
 	m.height = 24
 
-	m = updateModel(t, m, runeKey('i'))
+	m = updateModel(t, m, runeKey('/'))
 	m = updateModel(t, m, runeKey('a'))
 	m = updateModel(t, m, runeKey('b'))
 	m = updateModel(t, m, runeKey('c'))
@@ -450,7 +808,7 @@ func TestInputPromptInsertAtCursor(t *testing.T) {
 	m.width = 80
 	m.height = 24
 
-	m = updateModel(t, m, runeKey('i'))
+	m = updateModel(t, m, runeKey('/'))
 	m = updateModel(t, m, runeKey('a'))
 	m = updateModel(t, m, runeKey('c'))
 
@@ -474,7 +832,7 @@ func TestNavigationDisabledInInputModes(t *testing.T) {
 	initialScroll := m.scroll[chatPanel]
 
 	// Enter prompt mode.
-	m = updateModel(t, m, runeKey('i'))
+	m = updateModel(t, m, runeKey('/'))
 	if m.inputMode != InputPrompt {
 		t.Fatalf("inputMode = %d, want InputPrompt", m.inputMode)
 	}
@@ -531,14 +889,50 @@ func TestApprovalApproveSendsDecision(t *testing.T) {
 	}
 
 	m = updateModel(t, m, runeKey('y'))
+	if m.inputMode != InputApprove {
+		t.Fatalf("inputMode after y = %d, want InputApprove before Enter", m.inputMode)
+	}
+	if m.textInput != "y" {
+		t.Fatalf("approval input after y = %q, want y", m.textInput)
+	}
+
+	m = updateModel(t, m, keyMsg(tea.KeyEnter))
 	if m.inputMode != InputNone {
-		t.Fatalf("inputMode after y = %d, want InputNone", m.inputMode)
+		t.Fatalf("inputMode after y+Enter = %d, want InputNone", m.inputMode)
 	}
 
 	select {
 	case decision := <-resp:
 		if !decision.Allowed {
 			t.Fatal("decision.Allowed = false, want true")
+		}
+	default:
+		t.Fatal("no decision sent on response channel")
+	}
+}
+
+func TestApprovalEnterSendsDecision(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+
+	resp := make(chan core.ApprovalDecision, 1)
+	m.inputMode = InputApprove
+	m.pendingApproval = core.ApprovalRequest{
+		ToolCall:   core.ToolCall{Name: "shell"},
+		Permission: core.PermissionRequest{Behavior: core.PermissionAsk},
+		Response:   resp,
+	}
+
+	m = updateModel(t, m, keyMsg(tea.KeyEnter))
+	if m.inputMode != InputNone {
+		t.Fatalf("inputMode after Enter = %d, want InputNone", m.inputMode)
+	}
+
+	select {
+	case decision := <-resp:
+		if !decision.Allowed {
+			t.Fatal("Enter approval decision.Allowed = false, want true")
 		}
 	default:
 		t.Fatal("no decision sent on response channel")
@@ -559,8 +953,16 @@ func TestApprovalDenySendsDecision(t *testing.T) {
 	}
 
 	m = updateModel(t, m, runeKey('n'))
+	if m.inputMode != InputApprove {
+		t.Fatalf("inputMode after n = %d, want InputApprove before Enter", m.inputMode)
+	}
+	if m.textInput != "n" {
+		t.Fatalf("approval input after n = %q, want n", m.textInput)
+	}
+
+	m = updateModel(t, m, keyMsg(tea.KeyEnter))
 	if m.inputMode != InputNone {
-		t.Fatalf("inputMode after n = %d, want InputNone", m.inputMode)
+		t.Fatalf("inputMode after n+Enter = %d, want InputNone", m.inputMode)
 	}
 
 	select {
@@ -606,10 +1008,13 @@ func TestViewShowsInputBarInPromptMode(t *testing.T) {
 	m.width = 80
 	m.height = 24
 
-	// Normal mode: no input bar.
+	// Normal mode: persistent input bar, but no legacy PROMPT> prefix.
 	view := m.View()
 	if strings.Contains(view, "PROMPT>") {
 		t.Fatal("view should not contain PROMPT> in normal mode")
+	}
+	if !strings.Contains(view, "type a message") {
+		t.Fatal("view should show persistent input placeholder in normal mode")
 	}
 
 	// Enter prompt mode.
@@ -617,8 +1022,8 @@ func TestViewShowsInputBarInPromptMode(t *testing.T) {
 	m.textInput = "test"
 	m.cursorPos = 4
 	view = m.View()
-	if !strings.Contains(view, "PROMPT>") {
-		t.Fatal("view should contain PROMPT> in prompt mode")
+	if !strings.Contains(view, "test") {
+		t.Fatal("view should contain typed prompt text in prompt mode")
 	}
 }
 
@@ -633,11 +1038,14 @@ func TestViewShowsInputBarInApproveMode(t *testing.T) {
 		Permission: core.PermissionRequest{Behavior: core.PermissionAsk},
 	}
 	view := m.View()
-	if !strings.Contains(view, "APPROVE?") {
-		t.Fatal("view should contain APPROVE? in approve mode")
+	if !strings.Contains(view, "approval") {
+		t.Fatal("view should contain approval mode in approve mode")
 	}
 	if !strings.Contains(view, "write_file") {
 		t.Fatal("view should contain the tool name in approve mode")
+	}
+	if !strings.Contains(view, "type y + Enter") {
+		t.Fatal("view should explain typeable approval")
 	}
 }
 
@@ -652,7 +1060,7 @@ func TestRunningStateTransitions(t *testing.T) {
 	}
 
 	// Enter prompt mode, type, and submit: running should become true.
-	m = updateModel(t, m, runeKey('i'))
+	m = updateModel(t, m, runeKey('/'))
 	m = updateModel(t, m, runeKey('t'))
 	m = updateModel(t, m, runeKey('e'))
 	m = updateModel(t, m, runeKey('s'))
@@ -744,8 +1152,8 @@ func TestApprovalShowsToolDescription(t *testing.T) {
 	}
 
 	view := m.View()
-	if !strings.Contains(view, "APPROVE?") {
-		t.Fatal("view should contain APPROVE?")
+	if !strings.Contains(view, "approval") {
+		t.Fatal("view should contain approval prompt")
 	}
 	if !strings.Contains(view, "10s") {
 		t.Fatal("view should contain timeout hint")
@@ -756,8 +1164,8 @@ func TestApprovalShowsToolDescription(t *testing.T) {
 	if !strings.Contains(view, "file writes can mutate the workspace") {
 		t.Fatal("view should contain permission reason")
 	}
-	if !strings.Contains(view, "[y/n]") {
-		t.Fatal("view should contain [y/n] prompt")
+	if !strings.Contains(view, "type y + Enter") {
+		t.Fatal("view should contain typeable approval prompt")
 	}
 
 	// Test with missing reason: should still show tool name.
@@ -774,6 +1182,31 @@ func TestApprovalShowsToolDescription(t *testing.T) {
 	view2 := m2.View()
 	if !strings.Contains(view2, "shell") {
 		t.Fatal("view should contain tool name shell even without reason")
+	}
+}
+
+func TestApprovalUsesRequestTimeout(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width = 80
+	m.height = 24
+
+	m.applyEvent(core.AgentEvent{
+		Type: core.EventApprovalNeeded,
+		Approval: &core.ApprovalRequest{
+			ToolCall:       core.ToolCall{Name: "shell"},
+			Permission:     core.PermissionRequest{Behavior: core.PermissionAsk, Reason: "custom timeout"},
+			TimeoutSeconds: 45,
+		},
+	})
+
+	if m.approvalCountdown != 45 || m.approvalCountdownMax != 45 {
+		t.Fatalf("approval countdown = %d/%d, want 45/45", m.approvalCountdown, m.approvalCountdownMax)
+	}
+	if !strings.Contains(m.status, "45s") {
+		t.Fatalf("status = %q, want custom timeout", m.status)
+	}
+	if !strings.Contains(m.View(), "45s") {
+		t.Fatal("approval view should render request timeout")
 	}
 }
 
@@ -1037,6 +1470,7 @@ func TestContextShowsSelectionReason(t *testing.T) {
 	m := NewModel(nil, nil)
 	m.width = 100
 	m.height = 40
+	m.focus = contextPanel
 	m.hasContext = true
 	m.context = core.ContextSnapshot{
 		WindowTokens: 1000,
@@ -1280,7 +1714,7 @@ func TestPromptQueuedWhileRunning(t *testing.T) {
 	m.running = true
 
 	// Submit prompt while running — should queue, not publish.
-	m = updateModel(t, m, runeKey('i'))
+	m = updateModel(t, m, runeKey('/'))
 	m = updateModel(t, m, runeKey('h'))
 	m = updateModel(t, m, runeKey('i'))
 	m = updateModel(t, m, keyMsg(tea.KeyEnter))
@@ -1439,8 +1873,8 @@ func TestStatusLineRenders(t *testing.T) {
 	// Running state.
 	m.running = true
 	statusLine = m.renderStatusLine(100)
-	if !strings.Contains(statusLine, "running") {
-		t.Fatalf("status line = %q, want to contain running", statusLine)
+	if !strings.Contains(statusLine, "working") {
+		t.Fatalf("status line = %q, want to contain working", statusLine)
 	}
 
 	// Default model name.

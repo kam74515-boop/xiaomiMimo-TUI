@@ -27,6 +27,28 @@ That means:
 - Agentic RL becomes visible `goal -> plan -> action -> observation -> revision` traces.
 - Model updates go through `default / candidate / labs` channels and replay gates.
 - Raw tool output never enters the model context directly; it is stored as an artifact first.
+- Skills, MCP servers, tools, and sub-agents appear in the right-side activity
+  dashboards. Background delegation stays visible and replayable without turning
+  the main transcript into a noisy operations log.
+
+## Visibility Model
+
+MiMo-TUI is designed so delegation is not a black box. When the agent uses a
+tool, loads a skill, discovers an MCP server, or delegates work to a sub-agent,
+that activity belongs in the event log and the dashboard.
+
+The main transcript stays quiet: it should contain the user request, MiMo's
+answer, concise tool / observation markers, and the final synthesis. The
+right-side dashboard is where users inspect operational detail:
+
+- tools: approval state, command summary, result status, artifact links
+- skills: discovered, loaded, applied, skipped, or blocked
+- MCP: configured servers, discovered tools, pending calls, safety state
+- sub-agents: delegated goal, current step, worktree boundary, merge status
+
+This is the intended difference from Claude Code-style background delegation:
+MiMo-TUI can delegate in the background, but the delegation trail remains
+visible, replayable, and reviewable without polluting the primary conversation.
 
 ## Current Status
 
@@ -39,7 +61,7 @@ Approximate completion:
 Already implemented:
 
 - Go single-binary CLI: `cmd/mimo`.
-- Bubble Tea / Lip Gloss TUI with Context Map, Chat Stream, Agent Trace, Tool Cockpit.
+- Bubble Tea / Lip Gloss TUI with a transcript-first coding flow plus Context Map, Agent Trace, and Tool Cockpit dashboards.
 - Multi-turn agent loop wired from TUI prompt input via `EventUserPrompt`.
 - OpenAI-compatible MiMo SSE streaming client with mock fallback.
 - Structured HTTP errors, retry/backoff, and streaming parser tests.
@@ -50,7 +72,7 @@ Already implemented:
 - Tool registry, permissions, approval flow, and artifact-backed raw output.
 - RTK-style budget-aware summarizers for built-in tools.
 - JSONL session replay, resume skeleton, and trajectory eval.
-- Prompt queue with FIFO ordering and Ctrl+C interrupt.
+- Prompt queue with FIFO ordering and Ctrl+G interrupt.
 - Session resume with history reconstruction and context restoration.
 - Context compression with ReplacedBy lineage tracking.
 - Policy.toml integration with allowlist/denylist/require_confirm.
@@ -75,7 +97,7 @@ flowchart TD
     User["Developer / Terminal User"]
 
     CLI["cmd/mimo\nCLI flags, config, runtime wiring"]
-    TUI["internal/tui\nBubble Tea UI\nContext Map / Chat / Trace / Tool Cockpit"]
+    TUI["internal/tui\nBubble Tea UI\nTranscript + Context / Trace / Tool dashboards"]
     Bus["internal/core.Bus\nAgentEvent event bus"]
 
     Agent["internal/agent\nmulti-turn agent loop\nplan -> tool -> observation -> revision"]
@@ -145,7 +167,7 @@ user prompt
   -> raw output -> artifact
   -> budget-aware summarizer -> observation
   -> Context.Admit
-  -> Context Map / Agent Trace / Tool Cockpit
+  -> inline transcript + Context Map / Agent Trace / Tool Cockpit
   -> replay JSONL
 ```
 
@@ -221,14 +243,17 @@ export MIMO_LABS=1
 
 ## TUI Controls
 
-- `i` or `/`: enter prompt input mode.
+- Type normally: start prompt input in the persistent bottom bar.
+- `/`: enter prompt input mode explicitly.
 - `Enter`: submit prompt.
 - `Esc`: cancel prompt/help/approval.
-- `Tab`: switch panel focus.
+- `Tab` / `Shift+Tab`: switch transcript and dashboard views.
+- Right-side dashboard views show Context Map, Agent Trace, Tool Cockpit, and
+  activity timelines for tools, skills, MCP, and sub-agents as they are wired.
 - `Ctrl+L`: clear chat display.
 - `Ctrl+R`: request context oracle review.
 - `?`: toggle help.
-- `q` or `Ctrl+C`: quit.
+- `Ctrl+C`: quit.
 
 ## Validation
 
@@ -251,15 +276,16 @@ go run ./cmd/mimo -smoke -smoke-timeout 60s -session smoke-real
 
 ## Next Priorities
 
-The next development steps should focus on usability and coding-task success:
+The next development steps should focus on moving from local 1.0 readiness to
+multi-language, multi-agent production use:
 
-1. Persist model registry changes to config so `-model-accept` survives restart.
-2. Add LSP diagnostics after edits (Go MVP, then other languages).
-3. Run real MiMo coding smoke tests and harden provider tool-call parsing.
-4. Add MCP and sub-agent support after the local tool loop is stable.
-5. Semantic (embedding-based) context oracle scoring.
-6. Per-tool approval timeout configuration.
-7. Real-time token usage display in TUI during streaming.
+1. Implement real MCP stdio transport and remote server discovery.
+2. Wire sub-agent task execution with isolated worktrees and trace merge.
+3. Upgrade the Go diagnostics tool into a real LSP-backed diagnostics layer.
+4. Add Node.js, Python, and Rust diagnostics and benchmark suites.
+5. Add semantic context oracle scoring with embeddings or MiMo review scoring.
+6. Add per-tool and per-safety-grade approval timeout configuration.
+7. Display provider token usage and cost estimates during streaming when available.
 
 ## Documentation
 

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -18,18 +17,43 @@ func maskAPIKeyTest(s string) string {
 	return s[:8] + "..."
 }
 
-// repoRoot returns the absolute path to the worktree root directory.
-func repoRoot(t *testing.T) string {
-	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("cannot determine test file path")
+func realE2EEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("MIMO_RUN_REAL_E2E"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
-	// internal/eval/benchmark/e2e_real_test.go -> repo root
-	root := filepath.Join(filepath.Dir(thisFile), "..", "..", "..")
+}
+
+// realE2EWorkspace creates a disposable Go workspace for live tests. Real E2E
+// tasks are allowed to write files, so they must never run in the repo root.
+func realE2EWorkspace(t *testing.T) string {
+	t.Helper()
+
+	root := t.TempDir()
+	files := map[string]string{
+		"go.mod": "module real-e2e\n\ngo 1.21\n",
+		"main.go": `package main
+
+func NewWidget() string {
+	return "widget"
+}
+
+func main() {}
+`,
+		"README.md": "# Real E2E Fixture\n\nDisposable workspace for MiMo live E2E tests.\n",
+	}
+	for name, content := range files {
+		path := filepath.Join(root, name)
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("write fixture %s: %v", name, err)
+		}
+	}
+
 	abs, err := filepath.Abs(root)
 	if err != nil {
-		t.Fatalf("cannot resolve repo root: %v", err)
+		t.Fatalf("cannot resolve E2E workspace: %v", err)
 	}
 	return abs
 }
@@ -82,11 +106,16 @@ func realE2ETasks() []E2ETask {
 
 // TestRealMiMoE2E runs the full E2E benchmark against the live MiMo API.
 //
-// It is skipped when MIMO_API_KEY is not set in the environment.
+// It is skipped unless MIMO_RUN_REAL_E2E=1 and MIMO_API_KEY are set in the
+// environment.
 // The base URL defaults to https://token-plan-cn.xiaomimimo.com/v1 and
 // the model defaults to mimo-v2.5-pro unless overridden by MIMO_BASE_URL
 // and MIMO_MODEL respectively.
 func TestRealMiMoE2E(t *testing.T) {
+	if !realE2EEnabled() {
+		t.Skip("set MIMO_RUN_REAL_E2E=1 to run live MiMo E2E tests")
+	}
+
 	apiKey := strings.TrimSpace(os.Getenv("MIMO_API_KEY"))
 	if apiKey == "" {
 		t.Skip("MIMO_API_KEY not set; skipping real E2E test")
@@ -102,7 +131,7 @@ func TestRealMiMoE2E(t *testing.T) {
 		model = "mimo-v2.5-pro"
 	}
 
-	ws := repoRoot(t)
+	ws := realE2EWorkspace(t)
 	t.Logf("Real E2E: base_url=%s model=%s key=%s workspace=%s", baseURL, model, maskAPIKeyTest(apiKey), ws)
 
 	cfg := E2EConfig{
@@ -169,6 +198,10 @@ func TestRealMiMoE2E(t *testing.T) {
 // without the full agent loop. Useful for verifying the SSE parser works with the
 // live API even if tool execution has issues.
 func TestRealMiMoE2E_StreamingOnly(t *testing.T) {
+	if !realE2EEnabled() {
+		t.Skip("set MIMO_RUN_REAL_E2E=1 to run live MiMo streaming test")
+	}
+
 	apiKey := strings.TrimSpace(os.Getenv("MIMO_API_KEY"))
 	if apiKey == "" {
 		t.Skip("MIMO_API_KEY not set; skipping streaming-only test")
@@ -184,7 +217,7 @@ func TestRealMiMoE2E_StreamingOnly(t *testing.T) {
 		model = "mimo-v2.5-pro"
 	}
 
-	ws := repoRoot(t)
+	ws := realE2EWorkspace(t)
 	t.Logf("Streaming test: base_url=%s model=%s key=%s", baseURL, model, maskAPIKeyTest(apiKey))
 
 	// Run only the simple_question task which doesn't need tools.

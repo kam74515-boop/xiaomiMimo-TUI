@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	"github.com/pelletier/go-toml/v2"
+
+	"mimo-tui/internal/model"
 )
 
 type Config struct {
@@ -26,13 +28,13 @@ type RuntimeConfig struct {
 }
 
 func Default() Config {
-	baseURL := envOrDefault("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
-	model := envOrDefault("MIMO_MODEL", "mimo-v2.5-pro")
+	baseURL := envOrDefault("MIMO_BASE_URL", model.DefaultMiMoBaseURL)
+	modelID := envOrDefault("MIMO_MODEL", "mimo-v2.5-pro")
 	return Config{
 		Provider: ProviderConfig{
 			BaseURL: baseURL,
 			APIKey:  os.Getenv("MIMO_API_KEY"),
-			Model:   model,
+			Model:   modelID,
 			Mock:    envBool("MIMO_MOCK") || os.Getenv("MIMO_API_KEY") == "",
 		},
 		Runtime: RuntimeConfig{

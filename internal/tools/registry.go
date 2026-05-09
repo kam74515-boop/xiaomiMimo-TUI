@@ -23,6 +23,16 @@ func NewRegistry() *Registry {
 // echoes the raw result content.
 func NewDefaultRegistry(workspace string, factory ...func(*artifact.Store) map[string]Summarizer) *Registry {
 	store := artifact.NewStore(workspace)
+	return NewDefaultRegistryWithStore(workspace, store, factory...)
+}
+
+// NewDefaultRegistryWithStore creates a Registry using a caller-provided
+// artifact store. Use this when other runtime components, such as the tool
+// executor, must write artifacts into the same store.
+func NewDefaultRegistryWithStore(workspace string, store *artifact.Store, factory ...func(*artifact.Store) map[string]Summarizer) *Registry {
+	if store == nil {
+		store = artifact.NewStore(workspace)
+	}
 	var summarizerMap map[string]Summarizer
 	if len(factory) > 0 && factory[0] != nil {
 		summarizerMap = factory[0](store)

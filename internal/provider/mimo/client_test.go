@@ -151,13 +151,10 @@ func TestChatStreamParsesToolCallDeltas(t *testing.T) {
 		}
 	}
 
-	if len(calls) != 2 {
-		t.Fatalf("tool calls = %#v, want two accumulated snapshots", calls)
+	if len(calls) != 1 {
+		t.Fatalf("tool calls = %#v, want one completed accumulated call", calls)
 	}
-	if calls[0].ID != "call_1" || calls[0].Name != "read_" || calls[0].Raw != `{"pa` || calls[0].Input != nil {
-		t.Fatalf("first tool call = %#v, want partial accumulated call", calls[0])
-	}
-	last := calls[len(calls)-1]
+	last := calls[0]
 	if last.ID != "call_1" || last.Name != "read_file" || last.Raw != `{"path":"README.md"}` {
 		t.Fatalf("last tool call = %#v, want accumulated name and raw args", last)
 	}

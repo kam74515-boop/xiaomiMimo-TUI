@@ -109,10 +109,10 @@ Date: 2026-05-08
 | Policy.toml not wired into executor | P0 | Added `WithPolicyConfig` to executor, loaded in main.go |
 | MaxSteps=8 too low for real tasks | P0 | Increased to 16, configurable via env var |
 
-## P1 Issues Remaining
+## Follow-Up Issues
 
 | Issue | Severity | Status |
 |-------|----------|--------|
-| Acceptance tests not CLI-accessible | P1 | Needs `-acceptance` flag |
-| Approval timeout mismatch (executor 30s vs TUI 10s) | P1 | TUI controls actual timeout, executor is fallback |
-| Model registry not persisted to models.toml | P1 | DefaultRegistry is in-memory only |
+| Acceptance tests not CLI-accessible | P2 | Optional `-acceptance` flag remains a post-1.0 convenience |
+| Approval timeout mismatch (executor 30s vs TUI 10s) | Fixed | TUI now honors `ApprovalRequest.TimeoutSeconds` from executor/policy |
+| Model registry persistence gap | Fixed | `-model-accept` persists to `.mimo/models.toml`; startup loads global then project overrides |

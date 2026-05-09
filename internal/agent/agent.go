@@ -279,12 +279,20 @@ func Loop(
 				StartedAt: time.Now(),
 			}
 			publishTrace(bus, toolTrace)
+			publishToolActivity(bus, call, core.ActivityRunning, "tool execution started", "")
 
 			result, observation := executor.Execute(totalCtx, call)
 
 			// Publish tool result and observation events.
 			publishToolResult(bus, call, result)
 			publishObservation(bus, call.Name, &observation)
+			activityStatus := core.ActivityDone
+			activitySummary := observation.Summary
+			if result.Error != "" {
+				activityStatus = core.ActivityFailed
+				activitySummary = result.Error
+			}
+			publishToolActivity(bus, call, activityStatus, activitySummary, result.ArtifactID)
 
 			// Append tool result to message history.
 			messages = append(messages, core.Message{
@@ -542,6 +550,67 @@ func publishNote(bus *core.Bus, note string) {
 	event := core.NewEvent(core.EventObservation)
 	event.Observation = &core.Observation{Summary: note}
 	bus.Publish(event)
+}
+
+func publishToolActivity(bus *core.Bus, call core.ToolCall, status core.ActivityStatus, summary, artifactID string) {
+	if bus == nil {
+		return
+	}
+	event := core.NewEvent(core.EventActivityUpdate)
+	activity := core.ActivityEvent{
+		ID:       activityIDForTool(call),
+		Kind:     activityKindForTool(call.Name),
+		Name:     toolCallLabel(call),
+		Title:    toolCallLabel(call),
+		Status:   status,
+		Summary:  truncateActivitySummary(summary, 220),
+		ToolName: call.Name,
+	}
+	if strings.HasPrefix(call.Name, "mcp__") {
+		parts := strings.SplitN(call.Name, "__", 3)
+		if len(parts) == 3 {
+			activity.ServerName = parts[1]
+			activity.Name = parts[2]
+			activity.Title = parts[1] + "/" + parts[2]
+		}
+	}
+	if status == core.ActivityRunning {
+		activity.StartedAt = event.Time
+	} else {
+		activity.EndedAt = event.Time
+	}
+	if artifactID != "" {
+		activity.Artifacts = []string{artifactID}
+	}
+	event.Activity = &activity
+	bus.Publish(event)
+}
+
+func activityIDForTool(call core.ToolCall) string {
+	if strings.TrimSpace(call.ID) != "" {
+		return "tool:" + call.ID
+	}
+	return "tool:" + toolCallLabel(call)
+}
+
+func activityKindForTool(name string) core.ActivityKind {
+	switch {
+	case strings.HasPrefix(name, "mcp__"):
+		return core.ActivityMCP
+	case strings.HasPrefix(name, "skill__"), strings.HasPrefix(name, "skill:"):
+		return core.ActivitySkill
+	default:
+		return core.ActivityTool
+	}
+}
+
+func truncateActivitySummary(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	if limit <= 0 || len([]rune(text)) <= limit {
+		return text
+	}
+	runes := []rune(text)
+	return string(runes[:limit-1]) + "…"
 }
 
 func toolCallLabel(call core.ToolCall) string {

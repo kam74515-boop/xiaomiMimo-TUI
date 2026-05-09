@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,7 +20,7 @@ import (
 )
 
 const (
-	DefaultBaseURL = "https://api.xiaomimimo.com/v1"
+	DefaultBaseURL = model.DefaultMiMoBaseURL
 	DefaultModel   = "mimo-v2.5-pro"
 )
 
@@ -232,12 +233,20 @@ func readEventStream(ctx context.Context, r io.Reader, out chan<- core.ModelEven
 		return
 	}
 	if !done {
+		if calls := toolCalls.complete(); len(calls) > 0 {
+			sendModelEvent(ctx, out, core.ModelEvent{ToolCalls: calls})
+		}
 		sendModelEvent(ctx, out, core.ModelEvent{Done: true})
 	}
 }
 
 func handleSSEData(ctx context.Context, data string, out chan<- core.ModelEvent, toolCalls *toolCallAccumulator) bool {
 	if strings.TrimSpace(data) == "[DONE]" {
+		if toolCalls != nil {
+			if calls := toolCalls.complete(); len(calls) > 0 {
+				sendModelEvent(ctx, out, core.ModelEvent{ToolCalls: calls})
+			}
+		}
 		sendModelEvent(ctx, out, core.ModelEvent{Done: true})
 		return true
 	}
@@ -254,9 +263,9 @@ func handleSSEData(ctx context.Context, data string, out chan<- core.ModelEvent,
 	for _, choice := range chunk.Choices {
 		event := core.ModelEvent{Delta: choice.Delta.Content}
 		if toolCalls != nil {
-			event.ToolCalls = toolCalls.apply(choice.Delta.ToolCalls)
+			toolCalls.apply(choice.Delta.ToolCalls)
 		}
-		if event.Delta != "" || len(event.ToolCalls) > 0 {
+		if event.Delta != "" {
 			sendModelEvent(ctx, out, event)
 		}
 	}
@@ -307,11 +316,10 @@ func newToolCallAccumulator() *toolCallAccumulator {
 	return &toolCallAccumulator{calls: make(map[int]*toolCallState)}
 }
 
-func (a *toolCallAccumulator) apply(deltas []streamToolCallDelta) []core.ToolCall {
+func (a *toolCallAccumulator) apply(deltas []streamToolCallDelta) {
 	if len(deltas) == 0 {
-		return nil
+		return
 	}
-	out := make([]core.ToolCall, 0, len(deltas))
 	for _, delta := range deltas {
 		state := a.calls[delta.Index]
 		if state == nil {
@@ -327,8 +335,28 @@ func (a *toolCallAccumulator) apply(deltas []streamToolCallDelta) []core.ToolCal
 		if delta.Function.Arguments != "" {
 			state.arguments += delta.Function.Arguments
 		}
+	}
+}
+
+func (a *toolCallAccumulator) complete() []core.ToolCall {
+	if a == nil || len(a.calls) == 0 {
+		return nil
+	}
+	indexes := make([]int, 0, len(a.calls))
+	for index := range a.calls {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+
+	out := make([]core.ToolCall, 0, len(indexes))
+	for _, index := range indexes {
+		state := a.calls[index]
+		if state == nil || strings.TrimSpace(state.name) == "" {
+			continue
+		}
 		out = append(out, state.toolCall())
 	}
+	a.calls = make(map[int]*toolCallState)
 	return out
 }
 

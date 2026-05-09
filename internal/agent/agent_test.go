@@ -225,6 +225,18 @@ func hasObservationContaining(events []core.AgentEvent, text string) bool {
 	return false
 }
 
+func hasActivity(events []core.AgentEvent, kind core.ActivityKind, name string, status core.ActivityStatus) bool {
+	for _, event := range events {
+		if event.Type != core.EventActivityUpdate || event.Activity == nil {
+			continue
+		}
+		if event.Activity.Kind == kind && event.Activity.ToolName == name && event.Activity.Status == status {
+			return true
+		}
+	}
+	return false
+}
+
 // ---- Loop tests ----
 
 type fakeExecutor struct {
@@ -427,6 +439,12 @@ func TestLoopMultiStep(t *testing.T) {
 	if !hasEvent(events, core.EventToolResult) {
 		t.Fatal("missing tool result event")
 	}
+	if !hasActivity(events, core.ActivityTool, "read_file", core.ActivityRunning) {
+		t.Fatalf("missing running tool activity: %#v", events)
+	}
+	if !hasActivity(events, core.ActivityTool, "read_file", core.ActivityDone) {
+		t.Fatalf("missing done tool activity: %#v", events)
+	}
 }
 
 func TestLoopMaxSteps(t *testing.T) {
@@ -563,6 +581,9 @@ func TestLoopToolError(t *testing.T) {
 	events := drainBus(sub)
 	if !hasEvent(events, core.EventDone) {
 		t.Fatal("missing done event")
+	}
+	if !hasActivity(events, core.ActivityTool, "shell", core.ActivityFailed) {
+		t.Fatalf("missing failed shell activity: %#v", events)
 	}
 }
 

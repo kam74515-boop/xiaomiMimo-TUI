@@ -24,7 +24,7 @@ MiMo Value Amplifier TUI 是一个 Go 语言实现的终端 AI coding agent。�
 当前主线已经具备：
 
 - Go 单 binary CLI：`cmd/mimo`。
-- Bubble Tea/Lip Gloss TUI：Context Map、Chat Stream、Agent Trace、Tool Cockpit。
+- Bubble Tea/Lip Gloss TUI：transcript-first 主体验，Context Map、Agent Trace、Tool Cockpit 作为可切换仪表盘。
 - OpenAI-compatible MiMo streaming provider。
 - 默认 MiMo model id：`mimo-v2.5-pro`。
 - mock provider：无 key 或 `MIMO_MOCK=1` 时稳定开发。
@@ -105,12 +105,22 @@ flowchart TD
 | SWA/GA hybrid attention | 模型长上下文能力依赖局部窗口与全局层组合；产品侧对应 Near 局部证据 + Anchor 全局锚点。 | 三层 context、anchor/pinned item、evidence placement。 | 把目标、架构决策、当前假设稳定放 Anchor；把当前文件片段、最近 tool observation 放 Near。 |
 | HySparse 思路 | 产品不模拟 attention，而是借鉴“全局选择少量关键 token”的精神：先全局检索/复盘，再选择高价值 evidence 注入。 | `Observation` promotion、AutoBudget。 | `global_review` step：周期性让 agent 从 artifacts/search index 中选择保留证据，并生成选择理由。 |
 | MoE 1.02T/42B active | 强模型适合长轨迹，但每步仍要收敛。产品应把任务拆成可回放 step，而不是追求一次性巨答。 | multi-step agent loop、trace、max steps/timeouts。 | tool result ROI、per-step cost meter、失败路径重试策略、candidate model fallback。 |
-| MTP | 生成速度要被用户感知。TUI 应把流式文本、tool progress、cost、trace 同步推进。 | provider streaming、Chat Stream、Tool Cockpit。 | partial tool-call parser buffering、perceived momentum meter、长任务语音播报。 |
+| MTP | 生成速度要被用户感知。TUI 应把流式文本、tool progress、cost、trace 同步推进。 | provider streaming、Transcript、Tool Cockpit。 | partial tool-call parser buffering、perceived momentum meter、长任务语音播报。 |
 | Agentic RL/MOPD | 模型擅长长任务不等于可以黑箱执行。产品必须展示 goal/plan/action/observation/revision。 | `Agent Trace`、`CriticalThinkingPolicy`、event log。 | risk ledger、assumption ledger、verification gates、trajectory eval。 |
 | ASR/TTS/Audio/Embodied | 语音和多模态是 coding loop 的外设扩展，不是 MVP 阻塞项。 | Labs 预留。 | voice director、screenshot artifact、UI diff preview、device/app state adapters。 |
 | 小米万物互联意图 | 未来不是只接 IDE，而是接设备状态、应用状态、传感器、车家场景。coding 产品应先建立安全的 adapter contract。 | 当前仅保留 Labs 入口。 | read-only device context、explicit consent、state redaction、world-state artifact。 |
 
-### 3.5 Hermes 的批判性结论
+### 3.5 与 Claude Code 的关键差异：delegation 可见化
+
+MiMo-TUI 可以支持后台 delegation，但产品原则不是“让主 agent 静悄悄地把活丢给黑箱”。区别应该体现在 runtime contract 和 UI 上：
+
+- Claude Code 式成熟 coding agent 证明了 task/tool/bridge/transport 的工程价值；MiMo-TUI 借鉴边界，不复刻黑箱体验。
+- MiMo-TUI 的后台活动必须进入 event log：tool、skill、MCP、sub-agent、approval、artifact、context admission 都要可复盘。
+- 主 transcript 保持安静，只显示用户意图、MiMo 关键回复、必要的简短 tool/observation marker、最终合成。
+- 右侧 dashboard 承担可见性：Activity Timeline 展示 tools/skills/MCP/subagents 的生命周期，Sub-agent Observatory 展示 delegated work 的状态、步骤、隔离边界和 merge 决策。
+- sub-agent 的输出默认是 artifact + bounded observation，不直接污染父 agent 的上下文。
+
+### 3.6 Hermes 的批判性结论
 
 Hermes 对本项目有意义，但意义很窄：它适合当作 tool calling grammar、JSON schema adherence、parser recovery 和 structured output eval 的参考。它不应该主导本项目架构。
 
@@ -122,7 +132,7 @@ Hermes 对本项目有意义，但意义很窄：它适合当作 tool calling gr
 - 不把 prompt template 当 runtime。真正的权限、artifact、context、replay 必须由 Go runtime 执行。
 - 对 MiMo 的优化优先级高于对 Hermes 的兼容性。
 
-### 3.6 后续 worktree 方向
+### 3.7 后续 worktree 方向
 
 - `codex/mimo-context-oracle`：实现 global review、context admission score、artifact-backed evidence selector。
 - `codex/rtk-style-summarizers`：为 git/test/rg/shell 建立按工具类型的 filtering/grouping/truncation/dedup summarizer。
@@ -215,6 +225,15 @@ flowchart TD
 - `cost_update`
 - `error`
 - `done`
+
+ActivityEvent 可见性层：
+
+- `ActivityEvent` 是面向 UI/replay 的 activity contract，用来描述后台工作，而不是隐藏思维链。
+- 来源包括 tool、skill、MCP、sub-agent、approval、artifact、context admission。
+- 最小字段应覆盖：`id`、`ts`、`kind`、`actor`、`parent_id`、`status`、`summary`、`artifact_id`、`context_effect`、`privacy`。
+- `kind` 建议值：`tool`、`skill`、`mcp`、`subagent`、`safety`、`context`。
+- `status` 建议值：`queued`、`running`、`waiting`、`done`、`failed`、`redacted`。
+- 所有 worker 和 runtime adapter 只要做了后台动作，就必须产出 activity event，保证 dashboard 和 replay 能复盘。
 
 ### `internal/provider/mimo`
 
@@ -348,17 +367,18 @@ AutoBudget 策略：
 
 职责：
 
-- 渲染四面板：
-  - Context Map
-  - Chat Stream
-  - Agent Trace
-  - Tool Cockpit
+- 默认渲染 transcript-first 主视图：
+  - 连续展示 user / MiMo / tool / approval / observation timeline
+  - 长输出在主 transcript 中完整滚动
+  - Tab / Shift+Tab 切换 Context Map、Agent Trace、Tool Cockpit 仪表盘
 - 接收 `AgentEvent`。
-- 支持 panel scroll。
+- 支持 transcript 和 dashboard scroll。
 - 支持 help overlay。
 - 支持 prompt input。
 - 支持 tool approval input。
 - 支持 context pin/remove 事件。
+- 渲染 Activity Timeline：显示 tools、skills、MCP、subagents 的后台活动。
+- 渲染 Sub-agent Observatory：显示 delegated goal、当前 step、worktree/隔离边界、artifact、merge 状态。
 
 TUI 不应该：
 
@@ -366,6 +386,7 @@ TUI 不应该：
 - 直接调用 provider。
 - 伪造 attention。
 - 把展示逻辑变成 agent 决策逻辑。
+- 把 sub-agent 的详细日志刷进主 transcript。
 
 ### `internal/replay`
 
@@ -382,6 +403,7 @@ Replay 目标：
 - 恢复工作现场。
 - 对模型更新做回归。
 - 对 tool loop 失败路径做复盘。
+- 对 skills/MCP/subagents 的后台 delegation 做 activity-level 复盘。
 
 ### `internal/session`
 
@@ -513,7 +535,7 @@ goal
 
 MiMo 的 MTP 方向能提升生成吞吐。TUI 要把这种速度感转成体验：
 
-- Chat Stream 实时显示 message delta。
+- Transcript 实时显示 message delta，并以内联 block 展示 tool/approval/observation。
 - Agent Trace 同步推进 step 状态。
 - Tool Cockpit 显示 running/done/failed。
 - Cost meter 和 token meter 同步更新。
@@ -731,11 +753,35 @@ worker 规则：
 
 - 每个 worker 有明确 ownership。
 - 不跨目录改公共 contract，除非主线先冻结。
+- Phase 41+ worker 必须说明自己会产出哪些 activity events，至少覆盖 start/progress/result/error。
+- 涉及 tool、skill、MCP、sub-agent 的 worker 必须把后台动作写入 event log/dashboard contract，不能只在主 transcript 留一句话。
 - 必须提交自己的分支。
 - final 输出 changed paths、commit hash、validation、risks。
 - 主线验收后合并并删除 worktree/branch。
 
 ## 11. 后续开发路线
+
+### Phase 41+：ActivityEvent / MCP / Sub-agent 可见性骨架
+
+目标：先把后台 delegation 的可见性 contract 固定下来，再实现真实 transport/runtime。Phase 41+ worker 的核心交付不是“多跑一个黑箱 agent”，而是让每个后台动作都能被 dashboard 看见、被 event log 保存、被 replay 复盘，同时不污染主 transcript。
+
+开发任务：
+
+- 定义 `ActivityEvent` contract：覆盖 tool、skill、MCP、sub-agent、safety、context 六类 activity。
+- 为每个 activity 规定 start/progress/result/error 的状态序列和最小字段。
+- 在 dashboard 设计 Activity Timeline：按时间展示后台 activity，支持按 kind/actor/status 过滤。
+- 在 dashboard 设计 Sub-agent Observatory：按任务树展示 sub-agent goal、step、worktree/隔离边界、tool/MCP 使用、artifact、merge 状态。
+- 建立 transcript 降噪规则：主对话只显示简短 marker 和最终合成；详细过程进入 Activity Timeline 和 artifact。
+- 建立 replay 规则：activity events 必须写入 `.mimo/sessions/*.jsonl`，敏感字段默认 redacted。
+- 建立 worker 验收规则：任何新增 tool/skill/MCP/sub-agent 行为都必须证明自己产生了 activity events。
+- 明确当前边界：真实 MCP stdio JSON-RPC transport、真实 sub-agent scheduler、并行 worktree runtime、跨 agent result merge 仍是后续实现。
+
+验收标准：
+
+- 一个 worker 能列出自己新增或使用的 activity event 类型。
+- dashboard 能根据 activity event 表达 tools/skills/MCP/subagents 的状态，即使底层 runtime 仍是 stub。
+- replay 能保留足够信息复盘“谁在后台做了什么、用了什么工具、产生了什么 artifact、有没有进入上下文”。
+- 主 transcript 不出现长篇工具日志、MCP payload 或 sub-agent step dump。
 
 ### Phase A：工具闭环硬化
 

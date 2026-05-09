@@ -150,6 +150,11 @@ type cliOptions struct {
 	showVersion      bool
 }
 
+type agentRunResult struct {
+	History []core.Message
+	Err     error
+}
+
 func parseFlags() cliOptions {
 	var opts cliOptions
 	flag.BoolVar(&opts.smoke, "smoke", false, "run the event pipeline without starting the full-screen TUI")
@@ -345,18 +350,29 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 			}
 		}()
 
-		toolRegistry := tools.NewDefaultRegistry(cfg.Runtime.Workspace, summarizers.NewRegistry)
+		artifactStore := artifact.NewStore(cfg.Runtime.Workspace)
+		toolRegistry := tools.NewDefaultRegistryWithStore(cfg.Runtime.Workspace, artifactStore, summarizers.NewRegistry)
 		approvalCh := make(chan core.ApprovalRequest, 8)
 		defer close(approvalCh)
 		policyCfg, _ := config.LoadPolicy()
+		budgetProvider := func() tools.BudgetLevel {
+			snapshot := manager.Snapshot()
+			return tools.BudgetFromContext(snapshot.WindowTokens, snapshot.UsedTokens)
+		}
 		executor := tools.NewExecutor(
+			toolRegistry,
+			nil,
+			tools.WithApprovalChannel(approvalCh),
+			tools.WithBudgetProvider(budgetProvider),
+			tools.WithArtifactStore(artifactStore, cfg.Runtime.Workspace),
+			tools.WithPolicyConfig(policyCfg),
+		)
+		bootstrapExecutor := tools.NewExecutor(
 			toolRegistry,
 			bus,
 			tools.WithApprovalChannel(approvalCh),
-			tools.WithBudgetProvider(func() tools.BudgetLevel {
-				snapshot := manager.Snapshot()
-				return tools.BudgetFromContext(snapshot.WindowTokens, snapshot.UsedTokens)
-			}),
+			tools.WithBudgetProvider(budgetProvider),
+			tools.WithArtifactStore(artifactStore, cfg.Runtime.Workspace),
 			tools.WithPolicyConfig(policyCfg),
 		)
 
@@ -369,10 +385,23 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 				event.Approval = &req
 				event.Message = "Approval needed for tool " + req.ToolCall.Name
 				bus.Publish(event)
+
+				activityEvent := core.NewEvent(core.EventActivityUpdate)
+				activityEvent.Activity = &core.ActivityEvent{
+					ID:       "approval:" + fallbackToolCallID(req.ToolCall),
+					Kind:     activityKindForToolName(req.ToolCall.Name),
+					Name:     req.ToolCall.Name,
+					Title:    req.ToolCall.Name,
+					Status:   core.ActivityBlocked,
+					Summary:  "waiting for user approval",
+					Reason:   req.Permission.Reason,
+					ToolName: req.ToolCall.Name,
+				}
+				bus.Publish(activityEvent)
 			}
 		}()
 
-		bootstrapObservations := runBootstrapTools(ctx, executor, manager, bus)
+		bootstrapObservations := runBootstrapTools(ctx, bootstrapExecutor, manager, bus)
 
 		// Run oracle review after bootstrap tools to re-evaluate context placement.
 		contextmap.RunOracleStep(manager, prompt, bootstrapObservations, bus)
@@ -385,6 +414,7 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 		userPrompts := bus.Subscribe(8)
 		oracleEvents := bus.Subscribe(8)
 		interruptEvents := bus.Subscribe(4)
+		runResults := make(chan agentRunResult, 1)
 
 		// Track the most recent prompt and observations for oracle review.
 		lastPrompt := prompt
@@ -392,70 +422,76 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 
 		// Collect observation events for oracle context.
 		obsSub := bus.Subscribe(32)
-		go func() {
-			for event := range obsSub {
-				if event.Type == core.EventObservation && event.Observation != nil {
-					recentObservations = append(recentObservations, *event.Observation)
-					if len(recentObservations) > 5 {
-						recentObservations = recentObservations[len(recentObservations)-5:]
-					}
-				}
-			}
-		}()
 
 		// Shared cancel for in-progress agent runs.
 		var agentCancel context.CancelFunc
+		var runCtx context.Context
+		var running bool
+		var queuedPrompts []string
+		history := resumeHistory
 
-		// Initial agent run with the startup prompt.
-		runCtx, cancel := context.WithCancel(ctx)
-		agentCancel = cancel
-		history, err := agent.Loop(runCtx, prompt, client, executor, manager, toolRegistry.ToolSpecs(), bus, loopConfig, resumeHistory)
-		if err != nil {
-			// Log error but continue to multi-turn listening so the user can retry.
-			bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: "startup agent error: " + err.Error()}})
+		startRun := func(runPrompt string) {
+			if strings.TrimSpace(runPrompt) == "" {
+				return
+			}
+			runCtx, agentCancel = context.WithCancel(ctx)
+			running = true
+			bus.Publish(core.NewEvent(core.EventAgentStarted))
+			historySnapshot := append([]core.Message(nil), history...)
+			currentCtx := runCtx
+			go func(runContext context.Context, p string, h []core.Message) {
+				nextHistory, loopErr := agent.Loop(runContext, p, client, executor, manager, toolRegistry.ToolSpecs(), bus, loopConfig, h)
+				runResults <- agentRunResult{History: nextHistory, Err: loopErr}
+			}(currentCtx, runPrompt, historySnapshot)
 		}
+		startRun(prompt)
 
 		// Multi-turn: listen for user prompts, oracle review, and interrupt.
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case result := <-runResults:
+				running = false
+				agentCancel = nil
+				if len(result.History) > 0 {
+					history = result.History
+				}
+				if result.Err != nil {
+					summary := "agent error: " + result.Err.Error()
+					if errors.Is(result.Err, context.Canceled) {
+						summary = "agent run cancelled"
+					}
+					bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: summary}})
+				}
+				if len(queuedPrompts) > 0 {
+					next := queuedPrompts[0]
+					queuedPrompts = queuedPrompts[1:]
+					lastPrompt = next
+					startRun(next)
+				}
 			case event, ok := <-userPrompts:
 				if !ok {
 					return
 				}
 				if event.Type == core.EventUserPrompt && event.Message != "" {
 					lastPrompt = event.Message
-					// Create a fresh cancel context if previous was used.
-					if agentCancel == nil {
-						runCtx, cancel = context.WithCancel(ctx)
-						agentCancel = cancel
+					if running {
+						queuedPrompts = append(queuedPrompts, event.Message)
+						bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: fmt.Sprintf("prompt queued while agent is running (queue=%d)", len(queuedPrompts))}})
 					} else {
-						select {
-						case <-runCtx.Done():
-							runCtx, cancel = context.WithCancel(ctx)
-							agentCancel = cancel
-						default:
-						}
+						startRun(event.Message)
 					}
-					bus.Publish(core.NewEvent(core.EventAgentStarted))
-					nextHistory, loopErr := agent.Loop(runCtx, event.Message, client, executor, manager, toolRegistry.ToolSpecs(), bus, loopConfig, history)
-					if loopErr != nil {
-						bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: "agent error: " + loopErr.Error()}})
-						if len(nextHistory) > 0 {
-							history = nextHistory
-						}
-						continue
-					}
-					history = nextHistory
 				}
 			case event, ok := <-interruptEvents:
 				if !ok {
 					return
 				}
 				if event.Type == core.EventInterrupt {
-					if agentCancel != nil {
+					if running && agentCancel != nil {
 						agentCancel()
+						queuedPrompts = nil
+						bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: "interrupt requested; current agent run cancelling"}})
 					}
 				}
 			case event, ok := <-oracleEvents:
@@ -474,6 +510,16 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 							Summary: "oracle review triggered manually via ctrl+r — context placement re-evaluated",
 						},
 					})
+				}
+			case event, ok := <-obsSub:
+				if !ok {
+					return
+				}
+				if event.Type == core.EventObservation && event.Observation != nil {
+					recentObservations = append(recentObservations, *event.Observation)
+					if len(recentObservations) > 5 {
+						recentObservations = recentObservations[len(recentObservations)-5:]
+					}
 				}
 			}
 		}
@@ -810,4 +856,25 @@ func runEval(cfg config.Config, opts cliOptions) error {
 	}
 
 	return nil
+}
+
+func fallbackToolCallID(call core.ToolCall) string {
+	if strings.TrimSpace(call.ID) != "" {
+		return call.ID
+	}
+	if strings.TrimSpace(call.Name) != "" {
+		return call.Name
+	}
+	return "tool"
+}
+
+func activityKindForToolName(name string) core.ActivityKind {
+	switch {
+	case strings.HasPrefix(name, "mcp__"):
+		return core.ActivityMCP
+	case strings.HasPrefix(name, "skill__"), strings.HasPrefix(name, "skill:"):
+		return core.ActivitySkill
+	default:
+		return core.ActivityTool
+	}
 }

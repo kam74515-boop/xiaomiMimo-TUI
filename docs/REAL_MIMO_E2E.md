@@ -34,7 +34,7 @@ RunE2E() --> for each E2ETask:
 | `internal/eval/benchmark/e2e_tasks.go` | Defines 5 E2E task scenarios |
 | `internal/eval/benchmark/e2e.go` | E2E runner with failure classification |
 | `internal/eval/benchmark/e2e_test.go` | Unit tests for runner, classification, masking |
-| `internal/eval/benchmark/e2e_real_test.go` | Real E2E tests against live MiMo API (requires MIMO_API_KEY) |
+| `internal/eval/benchmark/e2e_real_test.go` | Real E2E tests against live MiMo API (requires `MIMO_RUN_REAL_E2E=1` and `MIMO_API_KEY`) |
 | `internal/provider/mimo/edge_case_test.go` | Provider edge case tests (empty/malformed/timeout) |
 
 ## E2E Tasks
@@ -44,7 +44,7 @@ RunE2E() --> for each E2ETask:
 | `simple_question` | "What is Go?" | 0 | 4 | 60s |
 | `read_file` | "Read go.mod..." | 1 | 6 | 90s |
 | `search_code` | "Search for 'func New'..." | 1 | 6 | 90s |
-| `generate_patch` | "Create e2e_marker.txt..." | 1 | 6 | 90s |
+| `generate_patch` | "Create e2e_marker.txt..." in a temporary workspace | 1 | 6 | 90s |
 | `run_test` | "Run go test..." | 1 | 8 | 120s |
 
 ## Failure Classification
@@ -72,7 +72,7 @@ e2e: starting 5 tasks (model=mimo-v2.5-pro, base_url=https://a..., key=mimo_abc.
 
 ## Graceful Skip
 
-When `MIMO_API_KEY` is not set (and no API key is passed in `E2EConfig`), `RunE2E` returns `nil, nil` -- no error, no results. This allows CI pipelines to conditionally run E2E tests without failure.
+When `MIMO_API_KEY` is not set (and no API key is passed in `E2EConfig`), `RunE2E` returns `nil, nil` -- no error, no results. The live Go tests also require `MIMO_RUN_REAL_E2E=1`, so normal `go test ./...` runs never call the live API just because a developer has a MiMo key in their shell.
 
 ## Provider Edge Case Tests
 
@@ -97,14 +97,14 @@ The `edge_case_test.go` file covers these scenarios:
 ## Running
 
 ```bash
-# Run E2E tests against the real API (requires MIMO_API_KEY)
-MIMO_API_KEY="your-key" go test ./internal/eval/benchmark/ -run TestRealMiMoE2E -v -timeout 10m
+# Run E2E tests against the real API (explicit opt-in required)
+MIMO_RUN_REAL_E2E=1 MIMO_API_KEY="your-key" go test ./internal/eval/benchmark/ -run TestRealMiMoE2E -v -timeout 10m
 
 # Run streaming-only E2E test (just the simple_question task)
-MIMO_API_KEY="your-key" go test ./internal/eval/benchmark/ -run TestRealMiMoE2E_StreamingOnly -v -timeout 2m
+MIMO_RUN_REAL_E2E=1 MIMO_API_KEY="your-key" go test ./internal/eval/benchmark/ -run TestRealMiMoE2E_StreamingOnly -v -timeout 2m
 
 # Run with custom base URL
-MIMO_API_KEY="your-key" MIMO_BASE_URL="https://custom.api.com/v1" go test ./internal/eval/benchmark/ -run TestRealMiMoE2E -v
+MIMO_RUN_REAL_E2E=1 MIMO_API_KEY="your-key" MIMO_BASE_URL="https://custom.api.com/v1" go test ./internal/eval/benchmark/ -run TestRealMiMoE2E -v
 
 # Run provider edge case tests (no API key needed -- uses httptest)
 go test ./internal/provider/mimo/ -run TestEdgeCase -v
@@ -134,20 +134,20 @@ Tested on 2026-05-08 against the production MiMo API.
 **Configuration:**
 - Base URL: `https://token-plan-cn.xiaomimimo.com/v1`
 - Model: `mimo-v2.5-pro`
-- API Key: 51 characters, prefix `tp-c0n9v...`
+- API Key: provided via `MIMO_API_KEY` (not logged in full)
 - Test file: `internal/eval/benchmark/e2e_real_test.go`
 
 ### Results Summary
 
 | Task | Status | Steps | Tool Calls | Duration | Notes |
 |------|--------|-------|------------|----------|-------|
-| `simple_question` | PASS | 1 | 0 | 2.9s | Direct text answer, no tools needed |
-| `read_file` | PASS | 4 | 2 | 11.3s | Used read_file tool; needed a retry before succeeding |
-| `search_code` | PASS | 9 | 5 | 30.7s | Used rg (grep) tool; model needed multiple iterations to converge |
-| `generate_patch` | PASS | 3 | 1 | 7.0s | Used write_file tool in a single call |
-| `run_test` | PASS | 4 | 2 | 16.2s | Used shell tool to run `go version` |
+| `simple_question` | PASS | 1 | 0 | 4.9s | Direct text answer, no tools needed |
+| `read_file` | PASS | 6 | 3 | 22.7s | Used read_file and converged after retries |
+| `search_code` | PASS | 5 | 2 | 17.8s | Used search tools and returned file paths |
+| `generate_patch` | PASS | 3 | 1 | 7.6s | Used write_file inside a temporary workspace |
+| `run_test` | PASS | 3 | 1 | 10.4s | Used shell tool to run `go version` |
 
-**Overall: 5/5 tasks passed. Total duration: 68 seconds.**
+**Overall: 5/5 tasks passed. Total duration: 63 seconds.**
 
 ### Key Findings
 
@@ -157,11 +157,11 @@ Tested on 2026-05-08 against the production MiMo API.
 
 3. **Tool arguments are valid.** The model produced correct `path` arguments for `read_file`, valid `pattern`/`path` arguments for `rg`, a valid `path`/`content` pair for `write_file`, and a valid `command` argument for `shell`.
 
-4. **The model tends to retry.** For `read_file` and `search_code`, the model took more iterations than minimum (4 steps for read_file, 9 for search_code). This is expected behavior -- the model sometimes explores alternative approaches before settling on the right one. The higher MaxSteps (12) in the real E2E tasks accommodates this.
+4. **The model tends to retry.** For `read_file` and `search_code`, the model took more iterations than minimum. This is expected behavior -- the model sometimes explores alternative approaches before settling on the right one. The higher MaxSteps in the real E2E tasks accommodates this.
 
 5. **No provider fixes needed.** The MiMo provider client (`internal/provider/mimo/client.go`) worked correctly out of the box for all tasks. No edge cases or bugs were encountered during live testing.
 
-6. **Default BaseURL note.** The client's `DefaultBaseURL` is `https://api.xiaomimimo.com/v1` while the real E2E tests use `https://token-plan-cn.xiaomimimo.com/v1`. The correct URL depends on the API key type; the E2E config explicitly sets the URL to avoid ambiguity.
+6. **Default BaseURL note.** Code, docs, and live E2E tests now default to `https://token-plan-cn.xiaomimimo.com/v1`. Override `MIMO_BASE_URL` when using a different MiMo endpoint.
 
 ### Initial Run Issues (Resolved)
 
@@ -169,4 +169,6 @@ The first automated run (via `go test ./...`) exposed two issues that were fixed
 
 1. **Recursive test execution.** The `run_test` E2E task originally used `go test ./...` as its prompt, which triggered the real E2E tests recursively, causing a timeout cascade. Fixed by changing the prompt to `go version`.
 
-2. **MaxSteps too low.** The default tasks had MaxSteps of 6 for `read_file` and `search_code`, but the model needed more iterations. The real E2E tasks use MaxSteps of 12 to accommodate the model's exploration behavior.
+2. **MaxSteps too low.** The default tasks had MaxSteps of 6 for `read_file` and `search_code`, but the model sometimes needs more iterations. The real E2E tasks use larger per-task limits to accommodate the model's exploration behavior.
+
+3. **Repository pollution.** Earlier live runs created `e2e_marker.txt` in the repo root. Live tests now run against a disposable temporary Go workspace, so generated files do not touch the project checkout.

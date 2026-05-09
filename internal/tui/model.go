@@ -1,12 +1,18 @@
 package tui
 
 import (
+	"bytes"
 	"fmt"
+	"io"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/mattn/go-runewidth"
 
 	"mimo-tui/internal/core"
 )
@@ -57,9 +63,12 @@ type Model struct {
 	hasContext          bool
 	selectedContextItem int
 	chat                string
+	assistantStreaming  bool
 	trace               []core.TraceStep
 	traceIndex          map[string]int
 	tools               []toolRun
+	activities          []core.ActivityEvent
+	activityIndex       map[string]int
 	notes               []string
 
 	cost    core.CostUpdate
@@ -79,6 +88,8 @@ type Model struct {
 
 	bus *core.Bus
 
+	cursorState *terminalCursorState
+
 	inputMode       InputMode
 	textInput       string
 	cursorPos       int
@@ -90,15 +101,68 @@ type Model struct {
 	promptQueue []string
 
 	totalSteps int
+
+	loadingFrame int
 }
 
 type agentEventMsg core.AgentEvent
 
 type tickMsg struct{}
 
+type pulseMsg struct{}
+
 type eventSourceClosedMsg struct{}
 
-const approvalCountdownSeconds = 10
+const defaultApprovalCountdownSeconds = 30
+
+type terminalCursorState struct {
+	mu       sync.RWMutex
+	sequence string
+}
+
+func (s *terminalCursorState) Set(sequence string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.sequence = sequence
+	s.mu.Unlock()
+}
+
+func (s *terminalCursorState) Sequence() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sequence
+}
+
+func (s *terminalCursorState) Clear() {
+	s.Set("")
+}
+
+type cursorTrackingWriter struct {
+	io.Writer
+	state *terminalCursorState
+}
+
+func (w cursorTrackingWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	if err != nil || n == 0 || w.state == nil {
+		return n, err
+	}
+	if bytes.Contains(p, []byte(ansi.ResetAltScreenSaveCursorMode)) {
+		w.state.Clear()
+		return n, nil
+	}
+	if sequence := w.state.Sequence(); sequence != "" {
+		if _, writeErr := w.Writer.Write([]byte(sequence)); writeErr != nil {
+			return n, writeErr
+		}
+	}
+	return n, nil
+}
 
 func NewModel(events <-chan core.AgentEvent, bus *core.Bus) Model {
 	if events == nil {
@@ -111,26 +175,33 @@ func NewModel(events <-chan core.AgentEvent, bus *core.Bus) Model {
 		bus:                 bus,
 		width:               100,
 		height:              32,
+		focus:               chatPanel,
 		selectedContextItem: -1,
 		traceIndex:          make(map[string]int),
+		activityIndex:       make(map[string]int),
 		status:              "waiting for agent events",
 		chatAutoScroll:      true,
 	}
 }
 
 func Run(events <-chan core.AgentEvent, bus *core.Bus, modelName string, mockMode bool) error {
+	cursorState := &terminalCursorState{}
 	m := NewModel(events, bus)
+	m.cursorState = cursorState
 	m.modelName = modelName
 	m.mockMode = mockMode
 	if mockMode {
-		m.chat = "MOCK MODE — set MIMO_API_KEY for real MiMo\n"
+		m.appendTranscriptBlock("SYSTEM", "MOCK MODE - set MIMO_API_KEY for real MiMo")
 	}
-	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
+	_, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithOutput(cursorTrackingWriter{
+		Writer: os.Stdout,
+		state:  cursorState,
+	})).Run()
 	return err
 }
 
 func (m Model) Init() tea.Cmd {
-	return waitForEvent(m.events)
+	return tea.Batch(waitForEvent(m.events), pulseTick())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -138,7 +209,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		key := msg.String()
 
-		if key == "q" || key == "ctrl+c" {
+		if key == "ctrl+c" {
 			return m, tea.Quit
 		}
 
@@ -170,10 +241,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case tea.KeyEnter:
 				if strings.TrimSpace(m.textInput) != "" {
 					if m.running {
+						m.appendUserPrompt(m.textInput, true)
 						m.promptQueue = append(m.promptQueue, m.textInput)
 						m.status = fmt.Sprintf("prompt queued (position %d)", len(m.promptQueue))
 					} else {
-						m.chat += "\nuser> " + m.textInput
+						m.appendUserPrompt(m.textInput, false)
 						if m.bus != nil {
 							event := core.NewEvent(core.EventUserPrompt)
 							event.Message = m.textInput
@@ -229,32 +301,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case InputApprove:
-			switch key {
-			case "y", "Y":
-				if m.pendingApproval.Response != nil {
-					m.pendingApproval.Response <- core.ApprovalDecision{Allowed: true, Reason: "user approved"}
+			switch msg.Type {
+			case tea.KeyEnter:
+				return m.submitApprovalInput()
+			case tea.KeyEsc:
+				return m.finishApproval(false, "user cancelled", "approval cancelled"), nil
+			case tea.KeyBackspace, tea.KeyDelete:
+				if m.cursorPos > 0 {
+					runes := []rune(m.textInput)
+					m.textInput = string(runes[:m.cursorPos-1]) + string(runes[m.cursorPos:])
+					m.cursorPos--
 				}
-				m.inputMode = InputNone
-				m.pendingApproval = core.ApprovalRequest{}
-				m.status = "tool approved"
 				return m, nil
-			case "n", "N":
-				if m.pendingApproval.Response != nil {
-					m.pendingApproval.Response <- core.ApprovalDecision{Allowed: false, Reason: "user denied"}
+			case tea.KeyLeft:
+				if m.cursorPos > 0 {
+					m.cursorPos--
 				}
-				m.inputMode = InputNone
-				m.pendingApproval = core.ApprovalRequest{}
-				m.status = "tool denied"
 				return m, nil
-			case "esc":
-				if m.pendingApproval.Response != nil {
-					m.pendingApproval.Response <- core.ApprovalDecision{Allowed: false, Reason: "user cancelled"}
+			case tea.KeyRight:
+				if m.cursorPos < len([]rune(m.textInput)) {
+					m.cursorPos++
 				}
-				m.inputMode = InputNone
-				m.pendingApproval = core.ApprovalRequest{}
-				m.status = "approval cancelled"
+				return m, nil
+			case tea.KeyHome:
+				m.cursorPos = 0
+				return m, nil
+			case tea.KeyEnd:
+				m.cursorPos = len([]rune(m.textInput))
+				return m, nil
+			case tea.KeyRunes:
+				runes := []rune(m.textInput)
+				insert := string(msg.Runes)
+				m.textInput = string(runes[:m.cursorPos]) + insert + string(runes[m.cursorPos:])
+				m.cursorPos += len(msg.Runes)
+				m.status = "approval response typed; press Enter to confirm"
 				return m, nil
 			}
+			m.status = "approval mode: type y/n then Enter, or Esc to deny"
 			return m, nil
 
 		case InputNone:
@@ -263,7 +346,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focus = (m.focus + 1) % panelCount
 				m.status = "focused " + panelNames[m.focus]
 				return m, nil
-			case "i", "/":
+			case "shift+tab":
+				m.focus = (m.focus + panelCount - 1) % panelCount
+				m.status = "focused " + panelNames[m.focus]
+				return m, nil
+			case "/":
 				m.inputMode = InputPrompt
 				m.textInput = ""
 				m.cursorPos = 0
@@ -271,6 +358,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			case "ctrl+l":
 				m.chat = ""
+				m.assistantStreaming = false
 				m.status = "chat cleared"
 				return m, nil
 			case "ctrl+r":
@@ -316,6 +404,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 			}
+
+			if msg.Type == tea.KeyRunes && len(msg.Runes) > 0 {
+				m.inputMode = InputPrompt
+				m.textInput = string(msg.Runes)
+				m.cursorPos = len(msg.Runes)
+				m.status = "PROMPT> type your message, Enter to submit, Esc to cancel"
+				return m, nil
+			}
 		}
 
 	case tea.WindowSizeMsg:
@@ -350,8 +446,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "approval timed out (auto-denied)"
 			return m, nil
 		}
-		m.status = fmt.Sprintf("APPROVE? tool '%s' requires approval [y/n] (%ds)", m.pendingApproval.ToolCall.Name, m.approvalCountdown)
+		m.status = fmt.Sprintf("approval required for %s: type y/n then Enter (%ds)", m.pendingApproval.ToolCall.Name, m.approvalCountdown)
 		return m, approvalTick()
+
+	case pulseMsg:
+		if m.running {
+			m.loadingFrame++
+		}
+		return m, pulseTick()
 
 	case eventSourceClosedMsg:
 		m.sourceClosed = true
@@ -363,6 +465,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m Model) submitApprovalInput() (Model, tea.Cmd) {
+	answer := strings.ToLower(strings.TrimSpace(m.textInput))
+	switch answer {
+	case "", "y", "yes", "approve", "a", "同意", "批准":
+		return m.finishApproval(true, "user approved", "tool approved"), nil
+	case "n", "no", "deny", "d", "拒绝", "取消":
+		return m.finishApproval(false, "user denied", "tool denied"), nil
+	default:
+		m.status = fmt.Sprintf("invalid approval response %q; type y/n then Enter", answer)
+		return m, nil
+	}
+}
+
+func (m Model) finishApproval(allowed bool, reason, status string) Model {
+	if m.pendingApproval.Response != nil {
+		m.pendingApproval.Response <- core.ApprovalDecision{Allowed: allowed, Reason: reason}
+	}
+	m.inputMode = InputNone
+	m.pendingApproval = core.ApprovalRequest{}
+	m.textInput = ""
+	m.cursorPos = 0
+	m.status = status
+	return m
+}
+
 func (m Model) View() string {
 	width := maxInt(m.width, 60)
 	height := maxInt(m.height, 20)
@@ -371,103 +498,117 @@ func (m Model) View() string {
 	statusLine := m.renderStatusLine(width)
 	footer := m.renderFooter(width)
 	inputBar := m.renderInputBar(width)
-	inputBarHeight := 0
-	if m.inputMode != InputNone {
-		inputBarHeight = lipgloss.Height(inputBar)
-	}
+	inputBarHeight := lipgloss.Height(inputBar)
 	statusLineHeight := lipgloss.Height(statusLine)
 	bodyHeight := maxInt(height-lipgloss.Height(header)-statusLineHeight-lipgloss.Height(footer)-inputBarHeight, 12)
 
+	var view string
 	if m.showHelp {
-		return lipgloss.JoinVertical(lipgloss.Left, header, statusLine, renderHelp(width, bodyHeight), footer)
-	}
-
-	if m.inputMode == InputApprove {
+		view = lipgloss.JoinVertical(lipgloss.Left, header, statusLine, renderHelp(width, bodyHeight), footer)
+	} else if m.inputMode == InputApprove {
 		approvalPanel := m.renderApprovalPanel(width, bodyHeight)
 		if m.inputMode != InputNone {
-			return lipgloss.JoinVertical(lipgloss.Left, header, statusLine, approvalPanel, inputBar, footer)
+			view = lipgloss.JoinVertical(lipgloss.Left, header, statusLine, approvalPanel, inputBar, footer)
+		} else {
+			view = lipgloss.JoinVertical(lipgloss.Left, header, statusLine, approvalPanel, footer)
 		}
-		return lipgloss.JoinVertical(lipgloss.Left, header, statusLine, approvalPanel, footer)
+	} else {
+		var body string
+		if mainWidth, sideWidth := dashboardSplit(width); sideWidth > 0 {
+			body = lipgloss.JoinHorizontal(
+				lipgloss.Top,
+				m.renderTranscript(mainWidth, bodyHeight),
+				m.renderDashboardRail(sideWidth, bodyHeight),
+			)
+		} else if m.focus == chatPanel {
+			body = m.renderTranscript(width, bodyHeight)
+		} else {
+			body = m.renderPanel(m.focus, width, bodyHeight)
+		}
+		view = lipgloss.JoinVertical(lipgloss.Left, header, statusLine, body, inputBar, footer)
 	}
 
-	leftWidth := width / 2
-	rightWidth := width - leftWidth
-	topHeight := bodyHeight / 2
-	bottomHeight := bodyHeight - topHeight
-
-	top := lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		m.renderPanel(contextPanel, leftWidth, topHeight),
-		m.renderPanel(chatPanel, rightWidth, topHeight),
-	)
-	bottom := lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		m.renderPanel(tracePanel, leftWidth, bottomHeight),
-		m.renderPanel(toolPanel, rightWidth, bottomHeight),
-	)
-
-	if m.inputMode != InputNone {
-		return lipgloss.JoinVertical(lipgloss.Left, header, statusLine, top, bottom, inputBar, footer)
-	}
-	return lipgloss.JoinVertical(lipgloss.Left, header, statusLine, top, bottom, footer)
+	m.updateTerminalCursor(width, lipgloss.Height(header), statusLineHeight, bodyHeight)
+	return view
 }
 
 func (m Model) renderInputBar(width int) string {
-	if m.inputMode == InputNone {
-		return ""
-	}
-
-	var prefix string
+	prefix := m.inputPrefix()
 	content := m.textInput
 	switch m.inputMode {
-	case InputPrompt:
-		prefix = "PROMPT> "
-	case InputApprove:
-		countdown := m.approvalCountdown
-		if countdown <= 0 {
-			countdown = approvalCountdownSeconds
-		}
-		prefix = fmt.Sprintf("APPROVE? (%ds) ", countdown)
-		if m.pendingApproval.ToolCall.Name != "" {
-			prefix += m.pendingApproval.ToolCall.Name
-			if m.pendingApproval.Permission.Reason != "" {
-				prefix += ": " + m.pendingApproval.Permission.Reason
-			}
-			prefix += " [y/n] "
-		} else {
-			prefix += "Allow? [y/n] "
-		}
+	case InputNone:
 		content = ""
 	}
 
 	runes := []rune(content)
-	cursorPos := clampInt(m.cursorPos, 0, len(runes))
 	var display string
-	if m.inputMode == InputPrompt {
-		before := string(runes[:cursorPos])
-		after := string(runes[cursorPos:])
-		cursorChar := " "
-		if cursorPos < len(runes) {
-			cursorChar = string(runes[cursorPos])
-		}
-		display = prefix + before + lipgloss.NewStyle().
-			Background(lipgloss.Color("15")).
-			Foreground(lipgloss.Color("0")).
-			Render(cursorChar) + after
+	if m.inputMode == InputPrompt || m.inputMode == InputApprove {
+		display = prefix + string(runes)
+	} else if m.inputMode == InputNone {
+		placeholder := "type a message, / command, tab dashboard"
+		display = prefix + lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(placeholder)
 	} else {
 		display = prefix
 	}
 
 	return lipgloss.NewStyle().
-		Width(width).
-		Background(lipgloss.Color("237")).
+		Width(maxInt(width-2, 20)).
+		Height(1).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("39")).
+		Padding(0, 1).
 		Foreground(lipgloss.Color("15")).
-		Render(truncate(display, width))
+		Render(truncate(display, maxInt(width-4, 16)))
+}
+
+func (m Model) inputPrefix() string {
+	switch m.inputMode {
+	case InputApprove:
+		countdown := m.approvalCountdown
+		if countdown <= 0 {
+			countdown = m.approvalCountdownMax
+		}
+		if countdown <= 0 {
+			countdown = defaultApprovalCountdownSeconds
+		}
+		toolName := fallback(m.pendingApproval.ToolCall.Name, "tool")
+		return fmt.Sprintf("approval %s (%ds) y/n› ", toolName, countdown)
+	default:
+		return "› "
+	}
+}
+
+func (m Model) updateTerminalCursor(width, headerHeight, statusLineHeight, bodyHeight int) {
+	if m.cursorState == nil {
+		return
+	}
+	if m.inputMode != InputPrompt && m.inputMode != InputApprove {
+		m.cursorState.Set(ansi.HideCursor)
+		return
+	}
+	inputContentRow := headerHeight + statusLineHeight + bodyHeight + 2
+	inputContentCol := m.inputCursorColumn(width)
+	m.cursorState.Set(ansi.ShowCursor + ansi.CursorPosition(inputContentCol, inputContentRow))
+}
+
+func (m Model) inputCursorColumn(width int) int {
+	prefix := m.inputPrefix()
+	runes := []rune(m.textInput)
+	cursorPos := clampInt(m.cursorPos, 0, len(runes))
+	before := string(runes[:cursorPos])
+	col := 3 + runewidth.StringWidth(prefix+before)
+	return clampInt(col, 3, maxInt(width-2, 3))
 }
 
 func approvalTick() tea.Cmd {
 	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
 		return tickMsg{}
+	})
+}
+
+func pulseTick() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(t time.Time) tea.Msg {
+		return pulseMsg{}
 	})
 }
 
@@ -523,7 +664,10 @@ func (m Model) renderApprovalPanel(width, height int) string {
 
 	countdown := m.approvalCountdown
 	if countdown <= 0 {
-		countdown = approvalCountdownSeconds
+		countdown = m.approvalCountdownMax
+	}
+	if countdown <= 0 {
+		countdown = defaultApprovalCountdownSeconds
 	}
 	countdownStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
 	if countdown <= 3 {
@@ -535,8 +679,8 @@ func (m Model) renderApprovalPanel(width, height int) string {
 	b.WriteString("\n")
 
 	b.WriteString("\n")
-	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true).Render("  [y] Approve    "))
-	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true).Render("[n] Deny    "))
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true).Render("  type y + Enter to approve    "))
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true).Render("type n + Enter to deny    "))
 	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("[esc] Cancel"))
 	b.WriteString("\n")
 
@@ -663,7 +807,7 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 	}
 	switch event.Type {
 	case core.EventMessageDelta:
-		m.chat += event.Message
+		m.appendAssistantDelta(event.Message)
 		m.status = "receiving assistant output"
 		if m.chatAutoScroll {
 			m.scroll[chatPanel] = m.maxPanelScroll(chatPanel)
@@ -680,19 +824,39 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 			m.status = "agent trace updated"
 		}
 	case core.EventToolStart:
+		toolName := fallback(event.ToolName, "tool")
+		if m.hasRunningTool(toolName) {
+			m.status = "tool running: " + toolName
+			return
+		}
 		m.tools = append(m.tools, toolRun{
-			Name:      fallback(event.ToolName, "tool"),
+			Name:      toolName,
 			Status:    "running",
 			Detail:    event.Message,
 			StartedAt: eventTime(event),
 		})
-		m.status = "tool started: " + fallback(event.ToolName, "tool")
+		m.status = "tool started: " + toolName
 	case core.EventToolResult:
 		m.finishTool(event)
+		if event.Err != "" {
+			m.appendToolTranscript("failed", fallback(event.ToolName, "tool"), compactTranscriptDetail(event.Err))
+		}
 		m.status = "tool finished: " + fallback(event.ToolName, "tool")
+	case core.EventActivityUpdate:
+		if event.Activity != nil {
+			previous := m.upsertActivity(*event.Activity, event.Time)
+			activity := m.activities[m.activityIndexFor(*event.Activity)]
+			if activity.Status == core.ActivityFailed && (previous == nil || previous.Status != core.ActivityFailed) {
+				m.appendActivityFailureTranscript(activity)
+			}
+			m.status = fmt.Sprintf("activity %s: %s", activityStatusLabel(activity), activityDisplayName(activity))
+		} else {
+			m.status = fallback(event.Message, "activity updated")
+		}
 	case core.EventObservation:
 		if event.Observation != nil {
 			m.notes = append(m.notes, event.Observation.Summary)
+			m.appendObservationTranscriptIfUseful(event.Observation.Summary)
 			m.status = "observation recorded"
 			if event.Observation.RollbackArtifactID != "" {
 				toolName := fallback(event.ToolName, "tool")
@@ -715,24 +879,27 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 	case core.EventError:
 		msg := fallback(event.Err, event.Message)
 		m.lastError = msg
+		m.assistantStreaming = false
 		recovery := errorRecoveryAction(msg)
 		note := "error: " + msg
 		if recovery != "" {
 			note += " — " + recovery
 		}
 		m.notes = append(m.notes, note)
+		m.appendTranscriptBlock("ERROR", note)
 		m.running = false
 		m.status = "error: " + msg
 	case core.EventAgentStarted:
 		m.running = true
 		m.lastError = ""
+		m.assistantStreaming = false
 	case core.EventDone:
 		m.running = false
+		m.assistantStreaming = false
 		m.status = fallback(event.Message, "agent complete")
 		if len(m.promptQueue) > 0 {
 			next := m.promptQueue[0]
 			m.promptQueue = m.promptQueue[1:]
-			m.chat += "\nuser> " + next
 			if m.bus != nil {
 				ev := core.NewEvent(core.EventUserPrompt)
 				ev.Message = next
@@ -743,13 +910,18 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 		}
 	case core.EventApprovalNeeded:
 		if event.Approval != nil {
+			timeoutSeconds := event.Approval.TimeoutSeconds
+			if timeoutSeconds <= 0 {
+				timeoutSeconds = defaultApprovalCountdownSeconds
+			}
+			m.appendApprovalTranscript(*event.Approval)
 			m.inputMode = InputApprove
 			m.pendingApproval = *event.Approval
 			m.textInput = ""
 			m.cursorPos = 0
-			m.approvalCountdown = approvalCountdownSeconds
-			m.approvalCountdownMax = approvalCountdownSeconds
-			m.status = fmt.Sprintf("APPROVE? tool '%s' requires approval [y/n] (%ds)", event.Approval.ToolCall.Name, approvalCountdownSeconds)
+			m.approvalCountdown = timeoutSeconds
+			m.approvalCountdownMax = timeoutSeconds
+			m.status = fmt.Sprintf("approval required for %s: type y/n then Enter (%ds)", event.Approval.ToolCall.Name, timeoutSeconds)
 		}
 	default:
 		if event.Message != "" {
@@ -838,6 +1010,340 @@ func (m *Model) finishTool(event core.AgentEvent) {
 	})
 }
 
+func (m *Model) upsertActivity(activity core.ActivityEvent, eventTime time.Time) *core.ActivityEvent {
+	if !eventTime.IsZero() {
+		switch activity.Status {
+		case core.ActivityPlanned, core.ActivityRunning, core.ActivityBlocked:
+			if activity.StartedAt.IsZero() {
+				activity.StartedAt = eventTime
+			}
+		case core.ActivityDone, core.ActivityFailed, core.ActivitySkipped:
+			if activity.EndedAt.IsZero() {
+				activity.EndedAt = eventTime
+			}
+		}
+	}
+	if m.activityIndex == nil {
+		m.activityIndex = make(map[string]int)
+		for i, existing := range m.activities {
+			if existing.ID != "" {
+				m.activityIndex[existing.ID] = i
+			}
+		}
+	}
+	if activity.ID != "" {
+		if index, ok := m.activityIndex[activity.ID]; ok && index >= 0 && index < len(m.activities) {
+			previous := m.activities[index]
+			merged := mergeActivityEvent(previous, activity)
+			m.activities[index] = merged
+			return &previous
+		}
+		m.activityIndex[activity.ID] = len(m.activities)
+	}
+	m.activities = append(m.activities, activity)
+	return nil
+}
+
+func mergeActivityEvent(previous, next core.ActivityEvent) core.ActivityEvent {
+	if next.ID == "" {
+		next.ID = previous.ID
+	}
+	if next.ParentID == "" {
+		next.ParentID = previous.ParentID
+	}
+	if next.Kind == "" {
+		next.Kind = previous.Kind
+	}
+	if next.Name == "" {
+		next.Name = previous.Name
+	}
+	if next.Title == "" {
+		next.Title = previous.Title
+	}
+	if next.Status == "" {
+		next.Status = previous.Status
+	}
+	if next.Summary == "" {
+		next.Summary = previous.Summary
+	}
+	if next.Detail == "" {
+		next.Detail = previous.Detail
+	}
+	if next.Reason == "" {
+		next.Reason = previous.Reason
+	}
+	if next.ToolName == "" {
+		next.ToolName = previous.ToolName
+	}
+	if next.ServerName == "" {
+		next.ServerName = previous.ServerName
+	}
+	if next.ModelName == "" {
+		next.ModelName = previous.ModelName
+	}
+	if next.Role == "" {
+		next.Role = previous.Role
+	}
+	if len(next.Files) == 0 {
+		next.Files = previous.Files
+	}
+	if len(next.Artifacts) == 0 {
+		next.Artifacts = previous.Artifacts
+	}
+	if next.StartedAt.IsZero() {
+		next.StartedAt = previous.StartedAt
+	}
+	if next.EndedAt.IsZero() {
+		next.EndedAt = previous.EndedAt
+	}
+	return next
+}
+
+func (m Model) activityIndexFor(activity core.ActivityEvent) int {
+	if activity.ID != "" && m.activityIndex != nil {
+		if index, ok := m.activityIndex[activity.ID]; ok && index >= 0 && index < len(m.activities) {
+			return index
+		}
+	}
+	return maxInt(len(m.activities)-1, 0)
+}
+
+func (m Model) hasRunningTool(name string) bool {
+	if len(m.tools) == 0 {
+		return false
+	}
+	last := m.tools[len(m.tools)-1]
+	return last.Name == name && last.Status == "running"
+}
+
+func (m *Model) appendUserPrompt(prompt string, queued bool) {
+	label := "USER"
+	if queued {
+		label = "USER QUEUED"
+	}
+	m.assistantStreaming = false
+	m.appendTranscriptBlock(label, prompt)
+	m.scrollTranscriptToBottom()
+}
+
+func (m *Model) appendAssistantDelta(delta string) {
+	if delta == "" {
+		return
+	}
+	if !m.assistantStreaming {
+		m.ensureTranscriptGap()
+		m.chat += "MIMO\n  "
+		m.assistantStreaming = true
+	}
+	m.chat += delta
+	m.scrollTranscriptToBottom()
+}
+
+func (m *Model) appendToolTranscript(status, name, detail string) {
+	m.assistantStreaming = false
+	body := compactTranscriptDetail(detail)
+	if body == "" {
+		body = "running"
+	}
+	m.appendTranscriptBlock(fmt.Sprintf("TOOL %s [%s]", name, status), body)
+	m.scrollTranscriptToBottom()
+}
+
+func (m *Model) appendActivityFailureTranscript(activity core.ActivityEvent) {
+	m.assistantStreaming = false
+	label := fmt.Sprintf("ACTIVITY %s %s [failed]", activityKindLabel(activity.Kind), activityDisplayName(activity))
+	m.appendTranscriptBlock(label, activityFailureSummary(activity))
+	m.scrollTranscriptToBottom()
+}
+
+func activityFailureSummary(activity core.ActivityEvent) string {
+	body := compactTranscriptDetail(firstNonEmpty(activity.Summary, activity.Detail, activity.Reason))
+	if body == "" {
+		body = "background activity failed"
+	}
+	if activity.Reason != "" && !strings.Contains(body, activity.Reason) {
+		body += "\nreason: " + compactTranscriptDetail(activity.Reason)
+	}
+	body += "\nnext: " + activityRecoveryAction(activity)
+	return body
+}
+
+func activityRecoveryAction(activity core.ActivityEvent) string {
+	lower := strings.ToLower(strings.Join([]string{activity.Summary, activity.Detail, activity.Reason}, " "))
+	switch {
+	case strings.Contains(lower, "permission") || strings.Contains(lower, "denied") || strings.Contains(lower, "policy") || strings.Contains(lower, "approval"):
+		return "check permissions or approve the required action"
+	case strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out"):
+		return "retry or increase the timeout"
+	case strings.Contains(lower, "not found") || strings.Contains(lower, "missing"):
+		return "check the configured name or path"
+	case strings.Contains(lower, "blocked"):
+		return "resolve the blocker, then retry"
+	default:
+		return "review Activity Timeline details, then retry or skip it"
+	}
+}
+
+func (m *Model) appendObservationTranscript(summary string) {
+	summary = compactTranscriptDetail(summary)
+	if summary == "" {
+		return
+	}
+	m.assistantStreaming = false
+	m.appendTranscriptBlock("OBSERVATION", summary)
+	m.scrollTranscriptToBottom()
+}
+
+func (m *Model) appendObservationTranscriptIfUseful(summary string) {
+	if !shouldShowObservationInTranscript(summary) {
+		return
+	}
+	m.appendObservationTranscript(summary)
+}
+
+func (m *Model) appendApprovalTranscript(req core.ApprovalRequest) {
+	m.assistantStreaming = false
+	reason := req.Permission.Reason
+	if reason == "" {
+		reason = "tool requires explicit permission"
+	}
+	body := reason
+	if inputSummary := approvalInputSummary(req.ToolCall.Input); inputSummary != "" {
+		body += "\n" + inputSummary
+	}
+	m.appendTranscriptBlock("APPROVAL "+fallback(req.ToolCall.Name, "tool"), body)
+	m.scrollTranscriptToBottom()
+}
+
+func compactTranscriptDetail(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	lower := strings.ToLower(text)
+	if strings.HasPrefix(lower, "starting tool ") {
+		return "running"
+	}
+	if strings.Contains(lower, "large payload kept in artifact") || strings.Contains(lower, "remain artifact-backed") {
+		return "large output stored as artifact; raw payload kept out of model context"
+	}
+	if strings.HasPrefix(lower, "artifact ") {
+		if idx := strings.Index(text, ":"); idx > 0 {
+			return text[:idx] + ": artifact stored"
+		}
+	}
+	return truncate(text, 180)
+}
+
+func shouldShowObservationInTranscript(summary string) bool {
+	summary = strings.TrimSpace(summary)
+	if summary == "" {
+		return false
+	}
+	lower := strings.ToLower(summary)
+	noisyMarkers := []string{
+		"artifact ",
+		"large payload kept in artifact",
+		"remain artifact-backed",
+		"tool=",
+		" exit=",
+		"rg exit=",
+		"read_file",
+	}
+	for _, marker := range noisyMarkers {
+		if strings.Contains(lower, marker) {
+			return false
+		}
+	}
+	usefulMarkers := []string{
+		"agent run cancelled",
+		"interrupt requested",
+		"oracle review",
+		"approval timed out",
+		"prompt queued",
+		"rollback",
+	}
+	for _, marker := range usefulMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Model) appendTranscriptBlock(label, body string) {
+	m.ensureTranscriptGap()
+	label = strings.TrimSpace(label)
+	if label == "" {
+		label = "EVENT"
+	}
+	m.chat += label
+	body = strings.TrimRight(body, "\n")
+	if body != "" {
+		m.chat += "\n" + indentTranscriptBody(body)
+	}
+}
+
+func (m *Model) ensureTranscriptGap() {
+	if strings.TrimSpace(m.chat) == "" {
+		m.chat = ""
+		return
+	}
+	if strings.HasSuffix(m.chat, "\n\n") {
+		return
+	}
+	if !strings.HasSuffix(m.chat, "\n") {
+		m.chat += "\n"
+	}
+	m.chat += "\n"
+}
+
+func (m *Model) scrollTranscriptToBottom() {
+	if m.chatAutoScroll {
+		m.scroll[chatPanel] = m.maxPanelScroll(chatPanel)
+	}
+}
+
+func indentTranscriptBody(body string) string {
+	lines := strings.Split(body, "\n")
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			lines[i] = ""
+			continue
+		}
+		lines[i] = "  " + line
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderTranscript(width, height int) string {
+	w := maxInt(width, 30)
+	h := maxInt(height, 6)
+	viewportHeight := maxInt(h-1, 1)
+	lines := m.panelLines(chatPanel, w)
+	offset := clampInt(m.scroll[chatPanel], 0, maxScrollForLines(len(lines), viewportHeight))
+
+	title := m.transcriptTitle(w)
+	body := scrollText(lines, offset, viewportHeight)
+	return lipgloss.NewStyle().
+		Width(w).
+		Height(h).
+		Foreground(lipgloss.Color("252")).
+		Render(title + "\n" + body)
+}
+
+func (m Model) transcriptTitle(width int) string {
+	title := "Transcript"
+	if m.running {
+		title += " " + m.loadingGlyph() + " working"
+	}
+	title += " | " + m.scrollPosition(chatPanel)
+	return lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("15")).
+		Render(truncate(title, width))
+}
+
 func (m Model) renderPanel(panel focusPanel, width, height int) string {
 	title := panelNames[panel]
 	contentWidth := maxInt(width-2, 18)
@@ -910,6 +1416,9 @@ func (m Model) maxPanelScroll(panel focusPanel) int {
 
 func (m Model) panelViewport(panel focusPanel) (int, int) {
 	panelWidth, panelHeight := m.panelSize(panel)
+	if panel == chatPanel {
+		return maxInt(panelWidth, 18), maxInt(panelHeight-1, 1)
+	}
 	contentWidth := maxInt(panelWidth-2, 18)
 	contentHeight := maxInt(panelHeight-2, 4)
 	return contentWidth, maxInt(contentHeight-1, 1)
@@ -922,28 +1431,37 @@ func (m Model) panelSize(panel focusPanel) (int, int) {
 	header := renderHeader(width, m.status, m.sourceClosed, panelNames[m.focus], "")
 	statusLine := m.renderStatusLine(width)
 	footer := m.renderFooter(width)
-	inputBarHeight := 0
-	if m.inputMode != InputNone {
-		inputBarHeight = 1
-	}
+	inputBarHeight := lipgloss.Height(m.renderInputBar(width))
 	bodyHeight := maxInt(height-lipgloss.Height(header)-lipgloss.Height(statusLine)-lipgloss.Height(footer)-inputBarHeight, 12)
 
-	leftWidth := width / 2
-	rightWidth := width - leftWidth
-	topHeight := bodyHeight / 2
-	bottomHeight := bodyHeight - topHeight
+	if m.focus == chatPanel {
+		if panel == chatPanel {
+			return width, bodyHeight
+		}
+		side := width / 2
+		return side, bodyHeight
+	}
+
+	mainWidth, sideWidth := dashboardSplit(width)
+	if sideWidth == 0 {
+		return width, bodyHeight
+	}
+
+	if panel == chatPanel {
+		return mainWidth, bodyHeight
+	}
 
 	switch panel {
 	case contextPanel:
-		return leftWidth, topHeight
+		return sideWidth, bodyHeight
 	case chatPanel:
-		return rightWidth, topHeight
+		return mainWidth, bodyHeight
 	case tracePanel:
-		return leftWidth, bottomHeight
+		return sideWidth, bodyHeight
 	case toolPanel:
-		return rightWidth, bottomHeight
+		return sideWidth, bodyHeight
 	default:
-		return leftWidth, topHeight
+		return sideWidth, bodyHeight
 	}
 }
 
@@ -1132,42 +1650,444 @@ func (m Model) toolContent() string {
 	}
 
 	if len(m.tools) == 0 {
-		b.WriteString("waiting for tool_start events")
-		return b.String()
-	}
+		if len(m.activities) == 0 {
+			b.WriteString("waiting for tool_start events")
+			return b.String()
+		}
+	} else {
+		for i, tool := range m.tools {
+			if i > 0 {
+				b.WriteString("\n")
+			}
+			fmt.Fprintf(&b, "[%s] %s", tool.Status, tool.Name)
+			if !tool.StartedAt.IsZero() {
+				fmt.Fprintf(&b, " %s", tool.StartedAt.Format("15:04:05"))
+			}
+			if !tool.EndedAt.IsZero() {
+				fmt.Fprintf(&b, "-%s", tool.EndedAt.Format("15:04:05"))
+			}
+			b.WriteByte('\n')
+			if tool.Detail != "" {
+				fmt.Fprintf(&b, "%s\n", tool.Detail)
+			}
 
-	for i, tool := range m.tools {
-		if i > 0 {
-			b.WriteString("\n")
-		}
-		fmt.Fprintf(&b, "[%s] %s", tool.Status, tool.Name)
-		if !tool.StartedAt.IsZero() {
-			fmt.Fprintf(&b, " %s", tool.StartedAt.Format("15:04:05"))
-		}
-		if !tool.EndedAt.IsZero() {
-			fmt.Fprintf(&b, "-%s", tool.EndedAt.Format("15:04:05"))
-		}
-		b.WriteByte('\n')
-		if tool.Detail != "" {
-			fmt.Fprintf(&b, "%s\n", tool.Detail)
-		}
+			// Verification status: show pass/fail for run_test, written/applied for mutation tools.
+			if tool.Status == "done" {
+				verificationLine := verificationStatus(tool.Name, tool.Detail)
+				if verificationLine != "" {
+					fmt.Fprintf(&b, "%s\n", verificationLine)
+				}
+			}
 
-		// Verification status: show pass/fail for run_test, written/applied for mutation tools.
-		if tool.Status == "done" {
-			verificationLine := verificationStatus(tool.Name, tool.Detail)
-			if verificationLine != "" {
-				fmt.Fprintf(&b, "%s\n", verificationLine)
+			// Rollback availability: show "[rollback available]" if RollbackArtifactID is set.
+			if tool.RollbackArtifactID != "" {
+				rollbackStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+				fmt.Fprintf(&b, "%s\n", rollbackStyle.Render("[rollback available]"))
+				fmt.Fprintf(&b, "rollback: %s\n", tool.RollbackArtifactID)
 			}
 		}
+	}
 
-		// Rollback availability: show "[rollback available]" if RollbackArtifactID is set.
-		if tool.RollbackArtifactID != "" {
-			rollbackStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-			fmt.Fprintf(&b, "%s\n", rollbackStyle.Render("[rollback available]"))
-			fmt.Fprintf(&b, "rollback: %s\n", tool.RollbackArtifactID)
+	if len(m.activities) > 0 {
+		if strings.TrimSpace(b.String()) != "" {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(m.activityTimelineContent())
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m Model) activityTimelineContent() string {
+	var b strings.Builder
+	b.WriteString("Activity Timeline\n")
+	for i, activity := range m.activities {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		fmt.Fprintf(&b, "[%s] %s %s\n", activityStatusLabel(activity), activityKindLabel(activity.Kind), activityDisplayName(activity))
+		if !activity.StartedAt.IsZero() || !activity.EndedAt.IsZero() {
+			if !activity.StartedAt.IsZero() {
+				fmt.Fprintf(&b, "  start: %s\n", activity.StartedAt.Format("15:04:05"))
+			}
+			if !activity.EndedAt.IsZero() {
+				fmt.Fprintf(&b, "  end: %s\n", activity.EndedAt.Format("15:04:05"))
+			}
+		}
+		switch activity.Kind {
+		case core.ActivitySubAgent:
+			writeDetail(&b, "goal", firstNonEmpty(activity.Title, activity.Name))
+			writeDetail(&b, "step", firstNonEmpty(activity.Summary, activity.Detail))
+			writeDetail(&b, "role", activity.Role)
+			writeDetail(&b, "model", activity.ModelName)
+		case core.ActivityMCP:
+			writeDetail(&b, "mcp", firstNonEmpty(activity.ServerName, activity.Name))
+			writeDetail(&b, "tool", activity.ToolName)
+			writeDetail(&b, "summary", activity.Summary)
+			writeDetail(&b, "detail", activity.Detail)
+		case core.ActivitySkill:
+			writeDetail(&b, "skill", firstNonEmpty(activity.Name, activity.Title))
+			writeDetail(&b, "summary", activity.Summary)
+			writeDetail(&b, "detail", activity.Detail)
+		default:
+			writeDetail(&b, "summary", activity.Summary)
+			writeDetail(&b, "detail", activity.Detail)
+		}
+		writeDetail(&b, "reason", activity.Reason)
+		if len(activity.Files) > 0 {
+			writeDetail(&b, "files", strings.Join(activity.Files, ", "))
+		}
+		if len(activity.Artifacts) > 0 {
+			writeDetail(&b, "artifacts", strings.Join(activity.Artifacts, ", "))
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m Model) renderDashboardRail(width, height int) string {
+	if width <= 0 || height <= 0 {
+		return ""
+	}
+	gap := 1
+	topHeight := maxInt(height/2, 8)
+	bottomHeight := maxInt(height-topHeight-gap, 8)
+	if topHeight+bottomHeight+gap > height {
+		topHeight = height / 2
+		bottomHeight = maxInt(height-topHeight-gap, 1)
+	}
+	return lipgloss.JoinVertical(
+		lipgloss.Left,
+		m.renderContextViz(width, topHeight),
+		strings.Repeat(" ", maxInt(width, 1)),
+		m.renderActivityViz(width, bottomHeight),
+	)
+}
+
+func (m Model) renderContextViz(width, height int) string {
+	innerWidth := maxInt(width-4, 24)
+	used := m.context.UsedTokens
+	window := maxInt(m.context.WindowTokens, 1)
+	pct := clampInt(used*100/window, 0, 100)
+
+	nearCount, anchorCount, artifactCount := m.contextTierCounts()
+	lines := []string{
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Render("Context Map"),
+		progressBar(pct, innerWidth),
+		fmt.Sprintf("%s / %s tokens  %d%%", formatNumber(used), formatNumber(window), pct),
+		fmt.Sprintf("Near     %s %2d", smallBar(nearCount, len(m.context.Items), 10), nearCount),
+		fmt.Sprintf("Anchor   %s %2d", smallBar(anchorCount, len(m.context.Items), 10), anchorCount),
+		fmt.Sprintf("Artifact %s %2d", smallBar(artifactCount, len(m.context.Items), 10), artifactCount),
+		"Risk     " + m.visualRiskLabel(),
+	}
+
+	for _, item := range m.topContextItems(2) {
+		lines = append(lines, truncate("• "+fallback(item.Title, item.ID), innerWidth))
+	}
+
+	return dashboardBox("MiMo / 1M", lines, width, height, m.focus == contextPanel)
+}
+
+func (m Model) renderActivityViz(width, height int) string {
+	innerWidth := maxInt(width-4, 24)
+	state := "idle"
+	if m.running {
+		state = m.loadingGlyph() + " working"
+	}
+	activityTotal, activityRunning, activityFailed, toolCount, skillCount, mcpCount, subagentCount := m.activityCounts()
+
+	lines := []string{
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Render("Agent Cockpit"),
+		"State  " + state,
+		fmt.Sprintf("Activity %d total / %d running / %d failed", activityTotal, activityRunning, activityFailed),
+		fmt.Sprintf("Counts tool %d skill %d mcp %d sub %d", toolCount, skillCount, mcpCount, subagentCount),
+		fmt.Sprintf("Trace  %s", smallBar(len(m.trace), maxInt(len(m.trace)+len(m.promptQueue), 1), 14)),
+		fmt.Sprintf("Tools  %d total", len(m.tools)),
+		"Last   " + truncate(m.lastToolSummary(), maxInt(innerWidth-7, 10)),
+	}
+	for _, activity := range m.runningSubagents(2) {
+		lines = append(lines, truncate("Subagent "+activityDisplayName(activity)+" running", innerWidth))
+		if activity.Summary != "" {
+			lines = append(lines, truncate("Step: "+activity.Summary, innerWidth))
+		}
+	}
+	if names := m.activityShortNamesForKinds([]core.ActivityKind{core.ActivityMCP, core.ActivitySkill}, 3); len(names) > 0 {
+		lines = append(lines, truncate("MCP/Skill "+strings.Join(names, ", "), innerWidth))
+	}
+	if recent := m.recentActivities(3); len(recent) > 0 {
+		lines = append(lines, "Recent activity")
+		for _, activity := range recent {
+			lines = append(lines, truncate(fmt.Sprintf("- %s %s %s", activityKindTitle(activity.Kind), activityDisplayName(activity), activityStatusLabel(activity)), innerWidth))
+		}
+	}
+	if len(m.trace) > 0 {
+		latest := m.trace[len(m.trace)-1]
+		lines = append(lines, "Stage  "+fallback(string(latest.Stage), string(latest.Status)))
+		if latest.Goal != "" {
+			lines = append(lines, truncate("Goal   "+latest.Goal, innerWidth))
+		}
+	}
+	if m.hasCost {
+		lines = append(lines, fmt.Sprintf("Tokens %s", formatNumber(m.cost.TotalTokens)))
+	}
+	if len(m.promptQueue) > 0 {
+		lines = append(lines, fmt.Sprintf("Queue  %d", len(m.promptQueue)))
+	}
+
+	return dashboardBox("Trace / Tools", lines, width, height, m.focus == tracePanel || m.focus == toolPanel)
+}
+
+func dashboardBox(title string, lines []string, width, height int, focused bool) string {
+	border := lipgloss.Color("238")
+	titleColor := lipgloss.Color("75")
+	if focused {
+		border = lipgloss.Color("39")
+		titleColor = lipgloss.Color("15")
+	}
+	innerWidth := maxInt(width-4, 20)
+	innerHeight := maxInt(height-2, 4)
+	content := append([]string{
+		lipgloss.NewStyle().Bold(true).Foreground(titleColor).Render(title),
+	}, lines...)
+	body := fitText(strings.Join(content, "\n"), innerWidth, innerHeight)
+	return lipgloss.NewStyle().
+		Width(maxInt(width-2, 24)).
+		Height(maxInt(height-2, 4)).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(border).
+		Padding(0, 1).
+		Render(body)
+}
+
+func (m Model) contextTierCounts() (near, anchor, artifact int) {
+	for _, item := range m.context.Items {
+		switch item.Tier {
+		case core.TierNear:
+			near++
+		case core.TierAnchor:
+			anchor++
+		case core.TierArtifact:
+			artifact++
+		}
+	}
+	return near, anchor, artifact
+}
+
+func (m Model) topContextItems(limit int) []core.ContextItem {
+	if limit <= 0 || len(m.context.Items) == 0 {
+		return nil
+	}
+	items := make([]core.ContextItem, 0, limit)
+	for _, item := range m.context.Items {
+		if item.Pinned || item.Tier == core.TierNear {
+			items = append(items, item)
+			if len(items) >= limit {
+				return items
+			}
+		}
+	}
+	for _, item := range m.context.Items {
+		items = append(items, item)
+		if len(items) >= limit {
+			return items
+		}
+	}
+	return items
+}
+
+func (m Model) visualRiskLabel() string {
+	label, color := m.riskLevel()
+	return lipgloss.NewStyle().Foreground(color).Bold(true).Render(label)
+}
+
+func (m Model) lastToolSummary() string {
+	if len(m.tools) == 0 {
+		return "none"
+	}
+	last := m.tools[len(m.tools)-1]
+	if last.Detail != "" {
+		return fmt.Sprintf("%s %s", last.Name, last.Status)
+	}
+	return last.Name + " " + last.Status
+}
+
+func activityKindLabel(kind core.ActivityKind) string {
+	if kind == "" {
+		return "activity"
+	}
+	return string(kind)
+}
+
+func activityKindTitle(kind core.ActivityKind) string {
+	switch kind {
+	case core.ActivityMCP:
+		return "MCP"
+	case core.ActivitySkill:
+		return "Skill"
+	case core.ActivitySubAgent:
+		return "Subagent"
+	case core.ActivityTool:
+		return "Tool"
+	default:
+		return "Activity"
+	}
+}
+
+func activityStatusLabel(activity core.ActivityEvent) string {
+	if activity.Status == "" {
+		return "unknown"
+	}
+	return string(activity.Status)
+}
+
+func activityDisplayName(activity core.ActivityEvent) string {
+	switch activity.Kind {
+	case core.ActivityMCP:
+		if activity.ServerName != "" && activity.ToolName != "" {
+			return simplifyActivityName(activity.ServerName) + "/" + simplifyActivityName(activity.ToolName)
+		}
+		return simplifyActivityName(firstNonEmpty(activity.ServerName, activity.ToolName, activity.Name, activity.Title, activity.ID))
+	case core.ActivitySkill:
+		return simplifyActivityName(firstNonEmpty(activity.Name, activity.Title, activity.ID))
+	case core.ActivitySubAgent:
+		return simplifyActivityName(firstNonEmpty(activity.Role, activity.Name, activity.Title, activity.ID))
+	case core.ActivityTool:
+		return simplifyActivityName(firstNonEmpty(activity.ToolName, activity.Name, activity.Title, activity.ID))
+	default:
+		return simplifyActivityName(firstNonEmpty(activity.Name, activity.Title, activity.ToolName, activity.ServerName, activity.ID, "activity"))
+	}
+}
+
+func simplifyActivityName(name string) string {
+	name = strings.TrimSpace(name)
+	name = strings.TrimPrefix(name, "@")
+	if name == "" {
+		return ""
+	}
+	if idx := strings.LastIndex(name, "/"); idx >= 0 && idx < len(name)-1 {
+		name = name[idx+1:]
+	}
+	if idx := strings.LastIndex(name, ":"); idx >= 0 && idx < len(name)-1 {
+		name = name[idx+1:]
+	}
+	if idx := strings.Index(name, "@"); idx > 0 {
+		name = name[:idx]
+	}
+	return name
+}
+
+func (m Model) activityCounts() (total, running, failed, tools, skills, mcps, subagents int) {
+	total = len(m.activities)
+	for _, activity := range m.activities {
+		switch activity.Status {
+		case core.ActivityRunning:
+			running++
+		case core.ActivityFailed:
+			failed++
+		}
+		switch activity.Kind {
+		case core.ActivityTool:
+			tools++
+		case core.ActivitySkill:
+			skills++
+		case core.ActivityMCP:
+			mcps++
+		case core.ActivitySubAgent:
+			subagents++
+		}
+	}
+	return total, running, failed, tools, skills, mcps, subagents
+}
+
+func (m Model) runningSubagents(limit int) []core.ActivityEvent {
+	if limit <= 0 {
+		return nil
+	}
+	var out []core.ActivityEvent
+	for i := len(m.activities) - 1; i >= 0; i-- {
+		activity := m.activities[i]
+		if activity.Kind != core.ActivitySubAgent || activity.Status != core.ActivityRunning {
+			continue
+		}
+		out = append(out, activity)
+		if len(out) >= limit {
+			return out
+		}
+	}
+	return out
+}
+
+func (m Model) recentActivities(limit int) []core.ActivityEvent {
+	if limit <= 0 {
+		return nil
+	}
+	var out []core.ActivityEvent
+	for i := len(m.activities) - 1; i >= 0; i-- {
+		out = append(out, m.activities[i])
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func (m Model) activityShortNamesForKinds(kinds []core.ActivityKind, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+	allowed := make(map[core.ActivityKind]bool, len(kinds))
+	for _, kind := range kinds {
+		allowed[kind] = true
+	}
+	var names []string
+	seen := make(map[string]bool)
+	for i := len(m.activities) - 1; i >= 0; i-- {
+		activity := m.activities[i]
+		if !allowed[activity.Kind] {
+			continue
+		}
+		name := activityDisplayName(activity)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+		if len(names) >= limit {
+			break
+		}
+	}
+	return names
+}
+
+func progressBar(pct, width int) string {
+	barWidth := clampInt(width-8, 8, 32)
+	filled := clampInt(pct*barWidth/100, 0, barWidth)
+	color := lipgloss.Color("42")
+	if pct >= 90 {
+		color = lipgloss.Color("196")
+	} else if pct >= 70 {
+		color = lipgloss.Color("220")
+	}
+	return lipgloss.NewStyle().Foreground(color).Render(strings.Repeat("█", filled)) +
+		lipgloss.NewStyle().Foreground(lipgloss.Color("238")).Render(strings.Repeat("░", barWidth-filled))
+}
+
+func smallBar(value, total, width int) string {
+	total = maxInt(total, 1)
+	width = maxInt(width, 1)
+	filled := clampInt(value*width/total, 0, width)
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Render(strings.Repeat("▰", filled)) +
+		lipgloss.NewStyle().Foreground(lipgloss.Color("238")).Render(strings.Repeat("▱", width-filled))
+}
+
+func dashboardSplit(width int) (int, int) {
+	if width < 96 {
+		return width, 0
+	}
+	sideWidth := clampInt(width/4, 34, 48)
+	mainWidth := width - sideWidth
+	if mainWidth < 48 {
+		return width, 0
+	}
+	return mainWidth, sideWidth
 }
 
 // verificationStatus returns a colored verification line for a completed tool run.
@@ -1281,9 +2201,9 @@ func (m Model) renderFooter(width int) string {
 
 	var controls string
 	if m.showHelp {
-		controls = "? close help | esc close | q quit"
+		controls = "? close help | esc close | ctrl+c quit"
 	} else {
-		controls = "tab focus | i/ prompt | ctrl+l clear | ctrl+r oracle | ? help | up/down scroll | pgup/pgdn | home/end | q quit"
+		controls = "type to prompt | / command | tab dashboard | ctrl+g stop | ctrl+r oracle | up/down scroll | ctrl+c quit"
 	}
 
 	left := modelInfo + " | " + tokenInfo + " | "
@@ -1358,7 +2278,7 @@ func (m Model) renderStatusLine(width int) string {
 	var state string
 	switch {
 	case m.running:
-		state = "running"
+		state = m.loadingGlyph() + " working"
 	case m.sourceClosed:
 		state = "closed"
 	default:
@@ -1377,6 +2297,11 @@ func (m Model) renderStatusLine(width int) string {
 		Foreground(lipgloss.Color("15")).
 		Background(lipgloss.Color("238")).
 		Render(truncate(line, width))
+}
+
+func (m Model) loadingGlyph() string {
+	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	return frames[m.loadingFrame%len(frames)]
 }
 
 func formatNumber(n int) string {
@@ -1409,14 +2334,15 @@ func renderHelp(width, height int) string {
 func helpContent() string {
 	return strings.TrimSpace(`
 Navigation
-  tab: focus next panel
+  tab / shift+tab: switch transcript and dashboard views
   j/k: move context selection (context panel)
-  up/down: scroll focused panel
-  pgup/pgdn: scroll focused panel by page
-  home/end: jump focused panel
+  up/down: scroll current view
+  pgup/pgdn: scroll current view by page
+  home/end: jump current view
 
 Input
-  i or /: enter prompt input mode
+  type normally: start prompt input
+  /: enter prompt input mode
   Enter: submit prompt
   Esc: cancel input / close help
 
@@ -1426,21 +2352,22 @@ Context
   ctrl+r: request context oracle review
 
 Approval
-  y: approve tool execution
-  n: deny tool execution
+  type y then Enter: approve tool execution
+  type n then Enter: deny tool execution
+  empty Enter: approve tool execution
   esc: cancel approval
 
 Control
-  ctrl+c or q: quit
+  ctrl+c: quit
   ctrl+g: interrupt running agent
   ctrl+l: clear chat display
   ?: toggle help
 
 Panels
+  Transcript: continuous user, assistant, tool, approval, and observation timeline
   Context Map: evidence and context budget by tier
-  Chat Stream: assistant output deltas
   Agent Trace: plan, action, risk, revision, and evidence notes
-  Tool Cockpit: tool runs, timing, and cost
+  Tool Cockpit: tool runs, activity timeline, timing, and cost
 `)
 }
 
@@ -1589,6 +2516,15 @@ func fallback(value, fallbackValue string) string {
 		return value
 	}
 	return fallbackValue
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func maxInt(a, b int) int {

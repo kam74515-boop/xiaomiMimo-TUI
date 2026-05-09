@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"strings"
 	"time"
 
 	"mimo-tui/internal/artifact"
@@ -92,6 +93,7 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 		result := core.ToolResult{ExitCode: 127, Error: "tool registry is nil"}
 		observation := executorObservation(call.Name, result)
 		e.publishResult(call, result)
+		e.publishActivityResult(call, nil, result, "")
 		e.publishObservation(call, observation)
 		return result, observation
 	}
@@ -101,9 +103,12 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 		result := core.ToolResult{ExitCode: 127, Error: fmt.Sprintf("unknown tool %q", call.Name)}
 		observation := executorObservation(call.Name, result)
 		e.publishResult(call, result)
+		e.publishActivityResult(call, nil, result, "")
 		e.publishObservation(call, observation)
 		return result, observation
 	}
+
+	e.publishActivity(call, tool, core.ActivityRunning, "Tool started", "", "", nil)
 
 	// Evaluate permission: policy.toml overrides tool's default if configured.
 	permission := tool.Permission(call.Input)
@@ -116,12 +121,15 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 	// is not already whitelisted, request user approval via the channel.
 	if permission.Behavior == core.PermissionAsk && e.ApprovalCh != nil && !e.policy.isAllowedAsk(tool.Name()) {
 		req := core.ApprovalRequest{
-			ToolCall:   call,
-			Permission: permission,
-			Response:   make(chan core.ApprovalDecision, 1),
+			ToolCall:       call,
+			Permission:     permission,
+			TimeoutSeconds: int(e.approvalTimeout() / time.Second),
+			Response:       make(chan core.ApprovalDecision, 1),
 		}
 		select {
 		case e.ApprovalCh <- req:
+			e.publishApprovalNeeded(call, req)
+			e.publishActivity(call, tool, core.ActivityBlocked, "Waiting for approval", permission.Reason, permission.Reason, nil)
 		default:
 			result := core.ToolResult{
 				Content:  fmt.Sprintf("tool %s approval channel full", tool.Name()),
@@ -130,6 +138,7 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 			}
 			observation := executorObservation(tool.Name(), result)
 			e.publishResult(call, result)
+			e.publishActivity(call, tool, core.ActivityFailed, "Approval request failed", result.Error, result.Error, nil)
 			e.publishObservation(call, observation)
 			return result, observation
 		}
@@ -148,18 +157,21 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 				}
 				observation := executorObservation(tool.Name(), result)
 				e.publishResult(call, result)
+				e.publishActivity(call, tool, core.ActivitySkipped, "Approval denied", reason, reason, nil)
 				e.publishObservation(call, observation)
 				return result, observation
 			}
-			// Approved: fall through to normal execution.
+		// Approved: fall through to normal execution.
 		case <-time.After(e.approvalTimeout()):
+			timeout := e.approvalTimeout()
 			result := core.ToolResult{
 				Content:  fmt.Sprintf("tool %s approval timed out", tool.Name()),
 				ExitCode: permissionDeniedExitCode,
-				Error:    "approval timed out after 30s",
+				Error:    fmt.Sprintf("approval timed out after %s", timeout),
 			}
 			observation := executorObservation(tool.Name(), result)
 			e.publishResult(call, result)
+			e.publishActivity(call, tool, core.ActivityFailed, "Approval timed out", result.Error, result.Error, nil)
 			e.publishObservation(call, observation)
 			return result, observation
 		}
@@ -172,6 +184,7 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 			}
 			observation := executorObservation(tool.Name(), result)
 			e.publishResult(call, result)
+			e.publishActivity(call, tool, core.ActivitySkipped, "Tool skipped", reason, reason, nil)
 			e.publishObservation(call, observation)
 			return result, observation
 		}
@@ -187,6 +200,7 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 
 	result := tool.Run(ctx, call.Input)
 	e.publishResult(call, result)
+	e.publishActivityResult(call, tool, result, rollbackArtifactID)
 
 	observation := SummarizeTool(tool, result, e.currentBudget())
 	normalizeObservation(&observation, result)
@@ -281,6 +295,46 @@ func (e *Executor) publishObservation(call core.ToolCall, observation core.Obser
 	e.bus.Publish(event)
 }
 
+func (e *Executor) publishActivityResult(call core.ToolCall, tool core.Tool, result core.ToolResult, rollbackArtifactID string) {
+	status, summary, detail := activityResult(tool, result)
+	e.publishActivity(call, tool, status, summary, detail, result.Error, activityArtifacts(result.ArtifactID, rollbackArtifactID))
+}
+
+func (e *Executor) publishActivity(call core.ToolCall, tool core.Tool, status core.ActivityStatus, summary, detail, reason string, artifacts []string) {
+	if e == nil || e.bus == nil {
+		return
+	}
+	now := time.Now()
+	activity := core.ActivityEvent{
+		ID:        activityID(call),
+		Kind:      activityKind(tool),
+		Name:      call.Name,
+		Title:     activityTitle(call, tool),
+		Status:    status,
+		Summary:   shortActivityText(summary),
+		Detail:    shortActivityText(detail),
+		Reason:    shortActivityText(reason),
+		ToolName:  activityToolName(call, tool),
+		Artifacts: artifacts,
+	}
+	if mcp, ok := tool.(mcpMetadata); ok {
+		activity.Kind = core.ActivityMCP
+		activity.ToolName = mcp.ToolName()
+		activity.ServerName = mcp.ServerName()
+	}
+	if status == core.ActivityRunning {
+		activity.StartedAt = now
+	} else if status == core.ActivityDone || status == core.ActivityFailed || status == core.ActivitySkipped {
+		activity.EndedAt = now
+	}
+
+	event := core.NewEvent(core.EventActivityUpdate)
+	event.ToolName = call.Name
+	event.ToolCall = &call
+	event.Activity = &activity
+	e.bus.Publish(event)
+}
+
 func executorObservation(name string, result core.ToolResult) core.Observation {
 	observation := summarizeResult(name, result, core.TierNear)
 	if result.ArtifactID == "" {
@@ -300,6 +354,114 @@ func normalizeObservation(observation *core.Observation, result core.ToolResult)
 			observation.ContextPlacement = core.TierNear
 		}
 	}
+}
+
+type mcpMetadata interface {
+	ServerName() string
+	ToolName() string
+}
+
+type stubbedTool interface {
+	Stubbed() bool
+}
+
+func activityResult(tool core.Tool, result core.ToolResult) (core.ActivityStatus, string, string) {
+	if isStubbedMCPTool(tool) && result.ExitCode == 0 && result.Error == "" {
+		return core.ActivityBlocked, "MCP stub not connected", mcpStubDetail(tool)
+	}
+	if result.ExitCode != 0 || result.Error != "" {
+		detail := result.Error
+		if detail == "" {
+			detail = fmt.Sprintf("exit code %d", result.ExitCode)
+		}
+		return core.ActivityFailed, "Tool failed", detail
+	}
+	if _, ok := tool.(mcpMetadata); ok {
+		return core.ActivityDone, "MCP tool completed", mcpToolDetail(tool)
+	}
+	return core.ActivityDone, "Tool completed", ""
+}
+
+func activityID(call core.ToolCall) string {
+	if call.ID != "" {
+		return call.ID
+	}
+	if call.Name != "" {
+		return "tool:" + call.Name
+	}
+	return "tool:unknown"
+}
+
+func activityKind(tool core.Tool) core.ActivityKind {
+	if _, ok := tool.(mcpMetadata); ok {
+		return core.ActivityMCP
+	}
+	return core.ActivityTool
+}
+
+func activityTitle(call core.ToolCall, tool core.Tool) string {
+	if mcp, ok := tool.(mcpMetadata); ok {
+		return fmt.Sprintf("MCP %s/%s", mcp.ServerName(), mcp.ToolName())
+	}
+	if call.Name != "" {
+		return call.Name
+	}
+	return "tool"
+}
+
+func activityToolName(call core.ToolCall, tool core.Tool) string {
+	if mcp, ok := tool.(mcpMetadata); ok {
+		return mcp.ToolName()
+	}
+	if tool != nil {
+		return tool.Name()
+	}
+	return call.Name
+}
+
+func activityArtifacts(ids ...string) []string {
+	seen := map[string]bool{}
+	var artifacts []string
+	for _, id := range ids {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		artifacts = append(artifacts, id)
+	}
+	return artifacts
+}
+
+func isStubbedMCPTool(tool core.Tool) bool {
+	if _, ok := tool.(mcpMetadata); !ok {
+		return false
+	}
+	stub, ok := tool.(stubbedTool)
+	return ok && stub.Stubbed()
+}
+
+func mcpStubDetail(tool core.Tool) string {
+	if mcp, ok := tool.(mcpMetadata); ok {
+		return fmt.Sprintf("server %q tool %q is configured but no MCP connection is active", mcp.ServerName(), mcp.ToolName())
+	}
+	return "MCP tool is configured but no MCP connection is active"
+}
+
+func mcpToolDetail(tool core.Tool) string {
+	if mcp, ok := tool.(mcpMetadata); ok {
+		return fmt.Sprintf("server %q tool %q", mcp.ServerName(), mcp.ToolName())
+	}
+	return ""
+}
+
+func shortActivityText(text string) string {
+	const limit = 240
+	text = strings.Join(strings.Fields(text), " ")
+	if len([]rune(text)) <= limit {
+		return text
+	}
+	runes := []rune(text)
+	return string(runes[:limit-3]) + "..."
 }
 
 func (e *Executor) captureRollbackSnapshot(toolName string) (string, error) {

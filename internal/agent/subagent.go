@@ -2,7 +2,15 @@ package agent
 
 import (
 	"fmt"
+	"strings"
 	"time"
+
+	"mimo-tui/internal/core"
+)
+
+const (
+	subAgentActivitySummaryLimit = 220
+	subAgentStepSummaryLimit     = 160
 )
 
 // SubAgentStatus represents the lifecycle state of a sub-agent task.
@@ -36,8 +44,20 @@ type SubAgentTask struct {
 	// ID uniquely identifies this task within a session.
 	ID string `json:"id"`
 
+	// Name is a short display label for the sub-agent task.
+	Name string `json:"name,omitempty"`
+
+	// Title is a human-readable heading for dashboards and activity streams.
+	Title string `json:"title,omitempty"`
+
 	// Goal is a natural-language description of what the task should achieve.
 	Goal string `json:"goal"`
+
+	// Role describes the delegated responsibility of this sub-agent.
+	Role string `json:"role,omitempty"`
+
+	// ModelName records the model used by the sub-agent, when known.
+	ModelName string `json:"model_name,omitempty"`
 
 	// Status tracks the task lifecycle.
 	Status SubAgentStatus `json:"status"`
@@ -111,6 +131,152 @@ func (t *SubAgentTask) AddStep(action string) int {
 	}
 	t.Steps = append(t.Steps, step)
 	return len(t.Steps) - 1
+}
+
+// Activity converts the task into a visible high-level activity event.
+func (t SubAgentTask) Activity() core.ActivityEvent {
+	return t.ActivityEvent()
+}
+
+// ActivityEvent converts the task into a visible high-level activity event.
+// Pass an override status when the runtime needs to surface states such as
+// blocked or skipped that are not part of SubAgentStatus.
+func (t SubAgentTask) ActivityEvent(statusOverride ...core.ActivityStatus) core.ActivityEvent {
+	status := subAgentActivityStatus(t.Status)
+	if len(statusOverride) > 0 && statusOverride[0] != "" {
+		status = statusOverride[0]
+	}
+
+	return core.ActivityEvent{
+		ID:        t.ID,
+		ParentID:  t.ParentID,
+		Kind:      core.ActivitySubAgent,
+		Name:      t.activityName(),
+		Title:     t.activityTitle(),
+		Status:    status,
+		Summary:   t.activitySummary(),
+		Detail:    compactSubAgentText(t.Goal, subAgentActivitySummaryLimit),
+		Role:      strings.TrimSpace(t.Role),
+		ModelName: strings.TrimSpace(t.ModelName),
+		StartedAt: t.activityStartedAt(),
+		EndedAt:   t.CompletedAt,
+	}
+}
+
+func (t SubAgentTask) activityName() string {
+	switch {
+	case strings.TrimSpace(t.Name) != "":
+		return strings.TrimSpace(t.Name)
+	case strings.TrimSpace(t.Title) != "":
+		return strings.TrimSpace(t.Title)
+	case strings.TrimSpace(t.Goal) != "":
+		return compactSubAgentText(t.Goal, 80)
+	case strings.TrimSpace(t.ID) != "":
+		return strings.TrimSpace(t.ID)
+	default:
+		return "subagent"
+	}
+}
+
+func (t SubAgentTask) activityTitle() string {
+	switch {
+	case strings.TrimSpace(t.Title) != "":
+		return strings.TrimSpace(t.Title)
+	case strings.TrimSpace(t.Goal) != "":
+		return compactSubAgentText(t.Goal, 120)
+	default:
+		return t.activityName()
+	}
+}
+
+func (t SubAgentTask) activitySummary() string {
+	switch {
+	case strings.TrimSpace(t.Error) != "":
+		return compactSubAgentText("failed: "+t.Error, subAgentActivitySummaryLimit)
+	case strings.TrimSpace(t.Result) != "":
+		return compactSubAgentText(t.Result, subAgentActivitySummaryLimit)
+	case len(t.Steps) > 0:
+		latest := t.Steps[len(t.Steps)-1].CompactSummary()
+		return compactSubAgentText(fmt.Sprintf("%d step(s); latest %s", len(t.Steps), latest), subAgentActivitySummaryLimit)
+	case strings.TrimSpace(t.Goal) != "":
+		return compactSubAgentText(t.Goal, subAgentActivitySummaryLimit)
+	default:
+		return ""
+	}
+}
+
+func (t SubAgentTask) activityStartedAt() time.Time {
+	if !t.StartedAt.IsZero() {
+		return t.StartedAt
+	}
+	if t.Status == SubAgentPending {
+		return t.CreatedAt
+	}
+	return time.Time{}
+}
+
+// CompactSummary returns a short, UI-safe summary of a step without embedding
+// raw tool output or long observations.
+func (s SubAgentStep) CompactSummary() string {
+	parts := []string{}
+	if s.Number > 0 {
+		parts = append(parts, fmt.Sprintf("#%d", s.Number))
+	}
+	if s.Status != "" {
+		parts = append(parts, string(s.Status))
+	}
+
+	summary := strings.Join(parts, " ")
+	action := strings.TrimSpace(s.Action)
+	switch {
+	case strings.TrimSpace(s.Error) != "":
+		summary = joinSubAgentSummary(summary, action, "error: "+s.Error)
+	case strings.TrimSpace(s.Observation) != "":
+		summary = joinSubAgentSummary(summary, action, "observed: "+s.Observation)
+	default:
+		summary = joinSubAgentSummary(summary, action)
+	}
+	return compactSubAgentText(summary, subAgentStepSummaryLimit)
+}
+
+func joinSubAgentSummary(parts ...string) string {
+	trimmed := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			trimmed = append(trimmed, part)
+		}
+	}
+	return strings.Join(trimmed, " - ")
+}
+
+func subAgentActivityStatus(status SubAgentStatus) core.ActivityStatus {
+	switch status {
+	case SubAgentPending:
+		return core.ActivityPlanned
+	case SubAgentRunning:
+		return core.ActivityRunning
+	case SubAgentDone:
+		return core.ActivityDone
+	case SubAgentFailed:
+		return core.ActivityFailed
+	default:
+		return core.ActivityBlocked
+	}
+}
+
+func compactSubAgentText(text string, limit int) string {
+	text = strings.Join(strings.Fields(text), " ")
+	if limit <= 0 {
+		return text
+	}
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	if limit <= 3 {
+		return string(runes[:limit])
+	}
+	return string(runes[:limit-3]) + "..."
 }
 
 // CompleteStep marks a step as done with an observation.

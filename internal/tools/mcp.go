@@ -48,6 +48,12 @@ func (t *ExternalTool) ToolName() string {
 	return t.toolName
 }
 
+// Stubbed reports whether this ExternalTool is still using the local MVP stub
+// instead of a live MCP connection.
+func (t *ExternalTool) Stubbed() bool {
+	return true
+}
+
 // Schema returns the JSON schema for this tool. If the MCP server provided a
 // schema it is used; otherwise a minimal object schema is returned.
 func (t *ExternalTool) Schema() core.JSONSchema {

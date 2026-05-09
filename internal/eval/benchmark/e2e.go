@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"mimo-tui/internal/agent"
+	"mimo-tui/internal/artifact"
 	"mimo-tui/internal/config"
 	contextmap "mimo-tui/internal/context"
 	"mimo-tui/internal/core"
@@ -204,7 +205,8 @@ func runE2ETask(apiKey, baseURL, model, workspace string, task E2ETask) E2EResul
 
 	// Set up context manager and tool executor.
 	ctxMgr := contextmap.New(contextmap.DefaultWindowTokens)
-	registry := tools.NewDefaultRegistry(workspace)
+	store := artifact.NewStore(workspace)
+	registry := tools.NewDefaultRegistryWithStore(workspace, store)
 
 	approvalCh := make(chan core.ApprovalRequest, 16)
 	executor := tools.NewExecutor(
@@ -212,12 +214,18 @@ func runE2ETask(apiKey, baseURL, model, workspace string, task E2ETask) E2EResul
 		nil,
 		tools.WithApprovalChannel(approvalCh),
 		tools.WithAllowedAskTools(),
+		tools.WithArtifactStore(store, workspace),
 	)
 
-	// Auto-approve all tool calls.
+	// Auto-approve non-destructive requests only. E2E should validate the loop,
+	// not normalize unsafe commands into passing tests.
 	go func() {
 		for req := range approvalCh {
-			req.Response <- core.ApprovalDecision{Allowed: true, Reason: "e2e auto-approve"}
+			if req.Permission.Behavior == core.PermissionDeny || strings.Contains(strings.ToLower(req.Permission.Reason), "destructive") {
+				req.Response <- core.ApprovalDecision{Allowed: false, Reason: "e2e denied unsafe tool call"}
+				continue
+			}
+			req.Response <- core.ApprovalDecision{Allowed: true, Reason: "e2e auto-approve non-destructive tool call"}
 		}
 	}()
 

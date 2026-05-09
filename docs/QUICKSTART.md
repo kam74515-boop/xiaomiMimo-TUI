@@ -36,11 +36,11 @@ Mock mode runs the full agent loop with simulated MiMo responses. No API key req
 MIMO_MOCK=1 go run ./cmd/mimo
 ```
 
-This launches the 4-panel TUI:
-- **Context Map** (top-left): shows Near/Anchor/Artifact tiers
-- **Chat Stream** (top-right): conversation with MiMo
-- **Agent Trace** (bottom-left): goal/plan/action/observation steps
-- **Tool Cockpit** (bottom-right): tool results and artifacts
+This launches a transcript-first TUI:
+- **Transcript** (default): continuous user, MiMo, tool, approval, and observation timeline
+- **Context Map** (`Tab`): Near/Anchor/Artifact tiers and 1M context budget
+- **Agent Trace** (`Tab`): goal/plan/action/observation steps
+- **Tool Cockpit** (`Tab`): tool results, artifacts, timing, and rollback hints
 
 Headless smoke test (no TUI):
 
@@ -80,17 +80,18 @@ go run ./cmd/mimo "Explain the context oracle architecture"
 
 | Key | Action |
 |-----|--------|
-| `i` or `/` | Enter prompt input mode |
+| Type normally | Start prompt input in the persistent bottom bar |
+| `/` | Enter prompt input mode explicitly |
 | `Enter` | Submit prompt |
 | `Esc` | Cancel input, close help, dismiss approval |
-| `Tab` | Switch panel focus |
+| `Tab` / `Shift+Tab` | Switch transcript and dashboard views |
 | `Ctrl+L` | Clear chat display |
 | `Ctrl+R` | Request context oracle review |
 | `?` | Toggle help overlay |
 | `Up/Down` | Scroll within focused panel |
 | `PgUp/PgDn` | Page scroll |
 | `Home/End` | Jump to top/bottom |
-| `q` or `Ctrl+C` | Quit |
+| `Ctrl+C` | Quit |
 | `Ctrl+G` | Interrupt running agent |
 
 When a tool requests approval:
@@ -103,10 +104,10 @@ When a tool requests approval:
 
 ### Config File
 
-MiMo-TUI loads configuration from (in order, first found wins):
+MiMo-TUI layers configuration from:
 
 1. `~/.mimo-tui/config.toml` (user-global)
-2. `.mimo/config.toml` (project-local)
+2. `.mimo/config.toml` (project-local, overrides global values)
 
 Example `config.toml`:
 
@@ -137,10 +138,10 @@ All environment variables override config file values:
 
 ### Policy File
 
-Policy files are loaded in order (first found wins):
+Policy files use first-found precedence:
 
 1. `.mimo/policy.toml` (project-local)
-2. `~/.mimo-tui/policy.toml` (user-global)
+2. `~/.mimo-tui/policy.toml` (user-global fallback)
 
 Note: policy.toml loading order is the reverse of config.toml -- project-local
 policy takes precedence over user-global policy. This lets projects define their

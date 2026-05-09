@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"mimo-tui/internal/artifact"
 	"mimo-tui/internal/config"
@@ -80,14 +81,121 @@ func TestExecutorPublishesEventsAndPlacesArtifacts(t *testing.T) {
 	}
 
 	got := drainEvents(events)
-	if len(got) != 3 {
-		t.Fatalf("expected 3 events, got %d: %+v", len(got), got)
+	if len(got) != 5 {
+		t.Fatalf("expected 5 events, got %d: %+v", len(got), got)
 	}
-	if got[0].Type != core.EventToolStart || got[1].Type != core.EventToolResult || got[2].Type != core.EventObservation {
+	if got[0].Type != core.EventToolStart ||
+		got[1].Type != core.EventActivityUpdate ||
+		got[2].Type != core.EventToolResult ||
+		got[3].Type != core.EventActivityUpdate ||
+		got[4].Type != core.EventObservation {
 		t.Fatalf("unexpected event sequence: %+v", got)
 	}
-	if got[2].Observation == nil || got[2].Observation.ArtifactID != result.ArtifactID {
-		t.Fatalf("observation event missing artifact id: %+v", got[2])
+	running := got[1].Activity
+	if running == nil || running.Kind != core.ActivityTool || running.Status != core.ActivityRunning || running.ToolName != "list_dir" {
+		t.Fatalf("running activity missing tool metadata: %+v", running)
+	}
+	done := got[3].Activity
+	if done == nil || done.ID != "call-list" || done.Kind != core.ActivityTool || done.Status != core.ActivityDone {
+		t.Fatalf("done activity missing tool metadata: %+v", done)
+	}
+	if done.Summary != "Tool completed" || strings.Contains(done.Summary, "alpha.txt") || strings.Contains(done.Summary, result.ArtifactID) {
+		t.Fatalf("done activity summary should stay compact and artifact-free: %+v", done)
+	}
+	if !containsArtifact(done.Artifacts, result.ArtifactID) {
+		t.Fatalf("done activity missing artifact id: %+v", done)
+	}
+	if got[4].Observation == nil || got[4].Observation.ArtifactID != result.ArtifactID {
+		t.Fatalf("observation event missing artifact id: %+v", got[4])
+	}
+}
+
+func TestExecutorPublishesFailedActivity(t *testing.T) {
+	workspace := t.TempDir()
+	registry := NewDefaultRegistry(workspace)
+	bus := core.NewBus()
+	events := bus.Subscribe(10)
+	executor := NewExecutor(registry, bus)
+
+	result, _ := executor.Execute(context.Background(), core.ToolCall{
+		ID:    "call-missing",
+		Name:  "read_file",
+		Input: core.ToolInput{"path": "missing.txt"},
+	})
+	if result.ExitCode == 0 {
+		t.Fatalf("read_file unexpectedly succeeded: %+v", result)
+	}
+
+	activities := activityEvents(drainEvents(events))
+	if len(activities) != 2 {
+		t.Fatalf("expected running and failed activities, got %+v", activities)
+	}
+	failed := activities[1]
+	if failed.Status != core.ActivityFailed || failed.Summary != "Tool failed" {
+		t.Fatalf("missing failed activity: %+v", failed)
+	}
+	if !strings.Contains(failed.Detail, "missing.txt") {
+		t.Fatalf("failed activity detail should include short error context: %+v", failed)
+	}
+}
+
+func TestExecutorPublishesApprovalBlockedAndDeniedActivity(t *testing.T) {
+	workspace := t.TempDir()
+	registry := NewDefaultRegistry(workspace)
+	bus := core.NewBus()
+	events := bus.Subscribe(20)
+	approvalCh := make(chan core.ApprovalRequest, 1)
+	executor := NewExecutor(registry, bus, WithApprovalChannel(approvalCh))
+
+	call := core.ToolCall{
+		ID:    "call-write",
+		Name:  "write_file",
+		Input: core.ToolInput{"path": "denied.txt", "content": "nope"},
+	}
+	done := make(chan core.ToolResult, 1)
+	go func() {
+		result, _ := executor.Execute(context.Background(), call)
+		done <- result
+	}()
+
+	var req core.ApprovalRequest
+	select {
+	case req = <-approvalCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for approval request")
+	}
+
+	var got []core.AgentEvent
+	if !waitForActivity(events, &got, core.ActivityBlocked, time.Second) {
+		t.Fatalf("did not see blocked approval activity: %+v", got)
+	}
+
+	req.Response <- core.ApprovalDecision{Allowed: false, Reason: "not now"}
+	var result core.ToolResult
+	select {
+	case result = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for denied tool result")
+	}
+	if result.ExitCode != permissionDeniedExitCode {
+		t.Fatalf("denied tool exit = %d, want %d", result.ExitCode, permissionDeniedExitCode)
+	}
+
+	got = append(got, drainEvents(events)...)
+	activities := activityEvents(got)
+	if len(activities) < 3 {
+		t.Fatalf("expected running, blocked, and skipped activities, got %+v", activities)
+	}
+	blocked := findActivity(activities, core.ActivityBlocked)
+	if blocked == nil || blocked.Summary != "Waiting for approval" {
+		t.Fatalf("blocked approval activity missing: %+v", activities)
+	}
+	skipped := findActivity(activities, core.ActivitySkipped)
+	if skipped == nil || skipped.Summary != "Approval denied" || !strings.Contains(skipped.Reason, "not now") {
+		t.Fatalf("approval denial activity missing: %+v", activities)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "denied.txt")); !os.IsNotExist(err) {
+		t.Fatalf("write_file ran despite denied approval")
 	}
 }
 
@@ -234,6 +342,49 @@ func drainEvents(events <-chan core.AgentEvent) []core.AgentEvent {
 			return got
 		}
 	}
+}
+
+func activityEvents(events []core.AgentEvent) []core.ActivityEvent {
+	var activities []core.ActivityEvent
+	for _, event := range events {
+		if event.Type == core.EventActivityUpdate && event.Activity != nil {
+			activities = append(activities, *event.Activity)
+		}
+	}
+	return activities
+}
+
+func waitForActivity(events <-chan core.AgentEvent, got *[]core.AgentEvent, status core.ActivityStatus, timeout time.Duration) bool {
+	deadline := time.After(timeout)
+	for {
+		select {
+		case event := <-events:
+			*got = append(*got, event)
+			if event.Type == core.EventActivityUpdate && event.Activity != nil && event.Activity.Status == status {
+				return true
+			}
+		case <-deadline:
+			return false
+		}
+	}
+}
+
+func findActivity(activities []core.ActivityEvent, status core.ActivityStatus) *core.ActivityEvent {
+	for i := range activities {
+		if activities[i].Status == status {
+			return &activities[i]
+		}
+	}
+	return nil
+}
+
+func containsArtifact(artifacts []string, id string) bool {
+	for _, artifact := range artifacts {
+		if artifact == id {
+			return true
+		}
+	}
+	return false
 }
 
 func mustReadFile(t *testing.T, path string) string {

@@ -60,8 +60,9 @@ Policy is configured via `.mimo/policy.toml` with allowlist, denylist, and
 
 ### Secret Redaction and Input Sanitization
 
-- `redactSecrets()` scrubs API keys, tokens, and bearer tokens from shell and
-  test tool output before artifact storage.
+- `redactSecrets()` scrubs API keys, tokens, and bearer tokens from `shell`,
+  `run_test`, `rg`, `read_file`, `git_status`, `git_diff`, and `git_log`
+  output before artifact storage.
 - `redactInput()` replaces large `content` and `patch` fields with byte counts
   in artifact storage.
 - No hardcoded API keys in source; all credentials come from environment
@@ -129,8 +130,9 @@ MIMO_MOCK=1 go run ./cmd/mimo
 architected but not wired into the runtime. Cannot connect to external tool
 servers or spawn sub-agents.
 
-**LSP Diagnostics** -- Not implemented. The agent cannot detect compilation or
-type errors after writing files unless it runs the full test or build command.
+**LSP Diagnostics** -- Go diagnostics are available through the `diagnostics`
+tool, but there is no persistent LSP client yet. Node.js, Python, and Rust
+diagnostics remain placeholder follow-ups.
 
 **Language-Specific Diagnostics** -- No inline diagnostics for Node.js
 (TypeScript, ESLint), Python (mypy, pylint), or Rust (cargo check). Agent
@@ -155,11 +157,6 @@ all tool approvals. No per-tool or per-safety-grade timeout configuration.
 
 **Benchmark Tasks are Go-Focused** -- The 5 benchmark coding tasks are defined
 for Go projects only.
-
-**Secret Redaction is Partial** -- `shell` and `run_test` redact secrets from
-output. `rg`, `git_diff`, `git_log`, `read_file`, and `list_dir` store raw
-bytes without redaction. See [RELEASE_BLOCKER_REPORT.md](RELEASE_BLOCKER_REPORT.md)
-P1-1.
 
 ---
 
@@ -194,9 +191,9 @@ markers (`rm`, `sudo`, `git reset --hard`, `curl | sh`) and mutation markers
 
 ### Secret Redaction
 
-`redactSecrets()` pattern-matches API keys, tokens, and bearer tokens in shell
-and test tool output. `redactInput()` strips large content fields from artifact
-storage.
+`redactSecrets()` pattern-matches API keys, tokens, and bearer tokens across
+command output, search results, file reads, and git output before artifact
+storage. `redactInput()` strips large content fields from artifact storage.
 
 ---
 

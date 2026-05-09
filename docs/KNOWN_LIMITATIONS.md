@@ -22,16 +22,18 @@ parallel task execution.
 
 ## LSP Diagnostics
 
-**Status:** Not implemented.
+**Status:** Go diagnostic tool implemented; no full LSP client.
 
-LSP (Language Server Protocol) diagnostics are not available. The tool registry
-does not include an LSP client. After-edit diagnostics (type errors, lint
-warnings) are not surfaced automatically.
+MiMo-TUI includes a `diagnostics` tool that runs Go checks (`go vet` and
+`go build`) and turns compiler output into structured diagnostics. It does not
+yet run a persistent LSP server, so editor-grade incremental diagnostics,
+cross-language symbol intelligence, and code action support are not available.
 
-**Impact:** The agent cannot detect compilation or type errors after writing
-files unless it runs the full test/build command.
+**Impact:** Go projects get basic after-edit validation, but diagnostics are
+coarser than a real language server and still depend on explicit tool use.
 
-**Planned:** Go LSP diagnostics as an MVP, then expand to other languages.
+**Planned:** Add a real LSP client after the Go diagnostic tool has proven
+stable, then expand to other languages.
 
 ---
 

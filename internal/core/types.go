@@ -27,7 +27,51 @@ const (
 	EventOracleReview   EventType = "oracle_review"
 	EventInterrupt      EventType = "interrupt"
 	EventAgentStarted   EventType = "agent_started"
+	EventActivityUpdate EventType = "activity_update"
 )
+
+type ActivityKind string
+
+const (
+	ActivityTool     ActivityKind = "tool"
+	ActivitySkill    ActivityKind = "skill"
+	ActivityMCP      ActivityKind = "mcp"
+	ActivitySubAgent ActivityKind = "subagent"
+)
+
+type ActivityStatus string
+
+const (
+	ActivityPlanned ActivityStatus = "planned"
+	ActivityRunning ActivityStatus = "running"
+	ActivityBlocked ActivityStatus = "blocked"
+	ActivityDone    ActivityStatus = "done"
+	ActivityFailed  ActivityStatus = "failed"
+	ActivitySkipped ActivityStatus = "skipped"
+)
+
+// ActivityEvent makes background work visible without polluting the chat
+// transcript. It is intentionally higher-level than raw tool output: stdout,
+// stderr, full diffs, and large payloads should stay artifact-backed.
+type ActivityEvent struct {
+	ID         string         `json:"id"`
+	ParentID   string         `json:"parent_id,omitempty"`
+	Kind       ActivityKind   `json:"kind"`
+	Name       string         `json:"name"`
+	Title      string         `json:"title,omitempty"`
+	Status     ActivityStatus `json:"status"`
+	Summary    string         `json:"summary,omitempty"`
+	Detail     string         `json:"detail,omitempty"`
+	Reason     string         `json:"reason,omitempty"`
+	ToolName   string         `json:"tool_name,omitempty"`
+	ServerName string         `json:"server_name,omitempty"`
+	ModelName  string         `json:"model_name,omitempty"`
+	Role       string         `json:"role,omitempty"`
+	Files      []string       `json:"files,omitempty"`
+	Artifacts  []string       `json:"artifacts,omitempty"`
+	StartedAt  time.Time      `json:"started_at,omitempty"`
+	EndedAt    time.Time      `json:"ended_at,omitempty"`
+}
 
 type ContextTier string
 
@@ -125,6 +169,7 @@ type AgentEvent struct {
 	Context     *ContextSnapshot `json:"context,omitempty"`
 	Observation *Observation     `json:"observation,omitempty"`
 	Cost        *CostUpdate      `json:"cost,omitempty"`
+	Activity    *ActivityEvent   `json:"activity,omitempty"`
 	Err         string           `json:"error,omitempty"`
 	Approval    *ApprovalRequest `json:"-"`
 }
@@ -248,9 +293,10 @@ type PermissionRequest struct {
 }
 
 type ApprovalRequest struct {
-	ToolCall   ToolCall              `json:"tool_call"`
-	Permission PermissionRequest     `json:"permission"`
-	Response   chan ApprovalDecision `json:"-"`
+	ToolCall       ToolCall              `json:"tool_call"`
+	Permission     PermissionRequest     `json:"permission"`
+	TimeoutSeconds int                   `json:"timeout_seconds,omitempty"`
+	Response       chan ApprovalDecision `json:"-"`
 }
 
 type ApprovalDecision struct {
