@@ -609,7 +609,7 @@ func (m Model) updateTerminalCursor(width, headerHeight, statusLineHeight, bodyH
 	if m.cursorState == nil {
 		return
 	}
-	if m.inputMode != InputPrompt && m.inputMode != InputApprove {
+	if m.showHelp {
 		m.cursorState.Set(ansi.HideCursor)
 		return
 	}
@@ -1144,13 +1144,33 @@ func (m Model) hasRunningTool(name string) bool {
 }
 
 func (m *Model) appendUserPrompt(prompt string, queued bool) {
-	label := "USER"
-	if queued {
-		label = "USER QUEUED"
-	}
 	m.assistantStreaming = false
-	m.appendTranscriptBlock(label, prompt)
+	m.ensureTranscriptGap()
+	m.chat += userPromptBlock(prompt, queued)
 	m.scrollTranscriptToBottom()
+}
+
+func userPromptBlock(prompt string, queued bool) string {
+	prompt = strings.TrimRight(prompt, "\n")
+	if prompt == "" {
+		prompt = "(empty)"
+	}
+	prefix := "■ "
+	if queued {
+		prefix = "■ queued "
+	}
+	lines := strings.Split(prompt, "\n")
+	for i, line := range lines {
+		if i == 0 {
+			lines[i] = prefix + line
+			continue
+		}
+		lines[i] = "  " + line
+	}
+	return lipgloss.NewStyle().
+		Foreground(lipgloss.Color("39")).
+		Bold(true).
+		Render(strings.Join(lines, "\n"))
 }
 
 func (m *Model) appendAssistantDelta(delta string) {

@@ -36,7 +36,7 @@ func TestTerminalCursorTracksPromptInputPosition(t *testing.T) {
 	}
 }
 
-func TestTerminalCursorHiddenWhenInputInactive(t *testing.T) {
+func TestTerminalCursorParksInPromptWhenInputInactive(t *testing.T) {
 	state := &terminalCursorState{}
 	m := NewModel(nil, nil)
 	m.cursorState = state
@@ -46,8 +46,30 @@ func TestTerminalCursorHiddenWhenInputInactive(t *testing.T) {
 
 	_ = m.View()
 
+	sequence := state.Sequence()
+	if !strings.Contains(sequence, "\x1b[?25h") {
+		t.Fatalf("cursor sequence = %q, want visible cursor for IME preedit", sequence)
+	}
+	if !strings.Contains(sequence, "\x1b[") || !strings.HasSuffix(sequence, "H") {
+		t.Fatalf("cursor sequence = %q, want cursor parked in input bar", sequence)
+	}
+	if got, want := m.inputCursorColumn(120), 3+runewidth.StringWidth("› "); got != want {
+		t.Fatalf("input cursor column = %d, want %d", got, want)
+	}
+}
+
+func TestTerminalCursorHiddenWhenHelpOpen(t *testing.T) {
+	state := &terminalCursorState{}
+	m := NewModel(nil, nil)
+	m.cursorState = state
+	m.width = 120
+	m.height = 32
+	m.showHelp = true
+
+	_ = m.View()
+
 	if got := state.Sequence(); got != "\x1b[?25l" {
-		t.Fatalf("cursor sequence = %q, want hidden cursor", got)
+		t.Fatalf("cursor sequence = %q, want hidden cursor while help covers input", got)
 	}
 }
 
@@ -674,8 +696,11 @@ func TestInputPromptEnterAndCancel(t *testing.T) {
 	if m.inputMode != InputNone {
 		t.Fatalf("inputMode after Enter = %d, want InputNone", m.inputMode)
 	}
-	if !strings.Contains(m.chat, "USER") || !strings.Contains(m.chat, "hello") {
-		t.Fatalf("chat = %q, want to contain USER hello block", m.chat)
+	if !strings.Contains(m.chat, "■ hello") {
+		t.Fatalf("chat = %q, want user prompt prefixed with blue marker", m.chat)
+	}
+	if strings.Contains(m.chat, "USER\n") {
+		t.Fatalf("chat = %q, user prompt should not render as a status block", m.chat)
 	}
 
 	// Test cancel: enter prompt mode again, type, Esc.
@@ -691,6 +716,15 @@ func TestInputPromptEnterAndCancel(t *testing.T) {
 	}
 	if m.textInput != "" {
 		t.Fatalf("textInput after cancel = %q, want empty", m.textInput)
+	}
+}
+
+func TestQueuedUserPromptUsesBlueMarker(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.appendUserPrompt("next task", true)
+
+	if !strings.Contains(m.chat, "■ queued next task") {
+		t.Fatalf("chat = %q, want queued user prompt marker", m.chat)
 	}
 }
 
