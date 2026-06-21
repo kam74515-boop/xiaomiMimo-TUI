@@ -66,6 +66,9 @@ func Builtins(workspace string, store *artifact.Store, summarizers map[string]Su
 		NewGitStatusTool(workspace, store, s("git_status")),
 		NewRunTestTool(workspace, store, s("run_test")),
 		NewDiagTool(workspace, store, s("diagnostics")),
+		NewMemoryTool(workspace, store, s("memory")),
+		NewSkillTool(workspace, store, s("skill")),
+		NewSubAgentTool(workspace, store, s("subagent")),
 	}
 }
 
@@ -82,6 +85,12 @@ func (r *Registry) Register(tool core.Tool) error {
 	}
 	r.tools[name] = tool
 	return nil
+}
+
+// Unregister removes a tool by name (no-op if absent). Used to build a
+// sub-agent registry that excludes delegation tools to prevent recursion.
+func (r *Registry) Unregister(name string) {
+	delete(r.tools, name)
 }
 
 func (r *Registry) Get(name string) (core.Tool, bool) {

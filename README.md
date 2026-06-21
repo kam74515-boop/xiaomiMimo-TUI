@@ -101,6 +101,48 @@ Already implemented:
 - Model registry with channel gating and labs unlock via `MIMO_LABS`.
 - Golden session marking and replay gate evaluation with `-golden-session` and `-candidate-session`.
 - Rollback CLI commands: `-rollback-list`, `-rollback-show`, `-rollback-apply`, `-rollback-confirm`.
+- Persistent cross-session memory: project `.mimo/MEMORY.md` (and optional
+  global `~/.mimo-tui/MEMORY.md`), a built-in `memory` tool the agent can use to
+  record durable facts, startup injection into the system prompt every turn, and
+  a pinned `Persistent memory` anchor in the Context Map for visibility.
+- Goal gate with an independent judge: `/goal <condition>` installs a stopping
+  condition; at the point the model would stop, a separate temperature-0 judge
+  call verifies the condition against the transcript. If unmet, the agent
+  re-enters with the judge's diagnosis (bounded by a re-entry cap, fail-open if
+  the judge is unavailable). Verdicts surface in the Agent Trace.
+- Skill playbooks (clean-room take on Compose/skills): governed Markdown
+  playbooks (built-in `plan`, `tdd`, `review`, `debug`, `verify`, plus
+  `.mimo/skills/*.md` project skills) discovered into the activity dashboard, a
+  `skill` tool for the agent to read them, and `/skill use <name>` to inject a
+  playbook into the session system prompt.
+- Evidence provenance and time travel: every run is a replayable event log, so
+  `mimo -provenance` reconstructs an evidence-linked timeline (per-step context,
+  artifact-backed tool evidence, the answer) and shows how the Context Map
+  evolved between snapshots; in the TUI, `/why` shows the evidence behind the
+  latest answer plus the last context delta, and `/timeline` opens an
+  interactive scrubber (j/k) to walk Context Map snapshots and the diff at each.
+- Verification ledger (trust): cross-checks success claims in the answer ("tests
+  pass", "compiles", "fixed") against the tools that actually ran successfully,
+  flagging unverified claims. `mimo -trust` analyzes a saved session; the TUI
+  warns on completion and `/trust` shows the full ledger.
+- Counterfactual comparison: `mimo -counterfactual` compares a baseline session
+  against a variant (e.g. a different model channel or context decision) and
+  localizes the first step where their tool trajectories diverge, with the
+  context diff at that point.
+- MCP over stdio: real newline-delimited JSON-RPC client (initialize, tools/list,
+  tools/call) that connects to servers configured in `.mimo/mcp.toml`, registers
+  their tools as `mcp__<server>__<tool>` (approval-gated), and surfaces them in
+  the activity dashboard. Connection failures are reported and skipped, never
+  blocking startup.
+- Sub-agent delegation (visible, sandboxed): the `subagent` tool spawns a
+  sub-agent in an isolated git worktree, streams its progress to the activity
+  dashboard as sub-agent steps, and returns its changes as a reviewable diff
+  (artifact-backed). The sub-agent reads/writes only within its worktree (shell
+  and destructive tools denied, no nested delegation) and nothing is merged
+  automatically — the parent reviews the diff and merges deliberately.
+- Slash-command bar: `/help`, `/clear`, `/goal`, `/memory`, `/skill`, `/why`,
+  `/timeline`, `/trust`, `/model`, `/sessions`, and `/export` dispatched from the
+  prompt input.
 
 ## Architecture
 
@@ -242,6 +284,9 @@ ignored config files.
 - `-smoke-timeout <duration>`: override headless validation timeout.
 - `-eval`: extract and print trajectory info for a session.
 - `-eval-session <id>`: evaluate a specific session.
+- `-provenance`: print the evidence-linked provenance timeline + context evolution for a session (with `-eval-session`).
+- `-trust`: print the verification ledger for a session (with `-eval-session`).
+- `-counterfactual`: compare two sessions (`-golden-session` baseline vs `-candidate-session` variant) and localize where they diverge.
 - `-list-models`: print registered models.
 - `-golden-session <id>`: mark a session as golden.
 - `-candidate-session <id>`: candidate session used for replay gate comparison.
@@ -256,7 +301,9 @@ export MIMO_LABS=1
 ## TUI Controls
 
 - Type normally: start prompt input in the persistent bottom bar.
-- `/`: enter prompt input mode explicitly.
+- `/`: start a slash command (seeds `/`; type a command like `/help`, or keep
+  typing a normal message). A line whose first word is not a known command is
+  sent to the agent as a normal prompt.
 - `Enter`: submit prompt.
 - `Esc`: cancel prompt/help/approval.
 - `Tab` / `Shift+Tab`: switch transcript and dashboard views.
@@ -266,6 +313,25 @@ export MIMO_LABS=1
 - `Ctrl+R`: request context oracle review.
 - `?`: toggle help.
 - `Ctrl+C`: quit.
+
+### Slash commands
+
+Type these in the prompt bar (a line starting with `/` is treated as a command,
+not a model prompt):
+
+- `/help`: open the help overlay.
+- `/clear`: clear the chat transcript.
+- `/goal <condition>`: set a goal; an independent judge gates stopping until the
+  condition is genuinely met. `/goal clear` removes it; `/goal` shows status.
+- `/memory`: show persistent cross-session memory. `/memory add <note>` records a
+  durable fact into `.mimo/MEMORY.md`.
+- `/skill`: list skill playbooks. `/skill use <name>` activates one for the
+  session (its playbook is injected into the system prompt and shown in the
+  activity dashboard); `/skill show <name>` prints it; `/skill clear` deactivates.
+- `/model`: show the current model and how to switch it.
+- `/sessions`: list recent recorded sessions.
+- `/export [path]`: write the current transcript to a Markdown file
+  (defaults to `.mimo/exports/`).
 
 ## Validation
 

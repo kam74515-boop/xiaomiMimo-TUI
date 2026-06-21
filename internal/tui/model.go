@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,11 @@ import (
 	"github.com/mattn/go-runewidth"
 
 	"mimo-tui/internal/core"
+	"mimo-tui/internal/memory"
+	"mimo-tui/internal/provenance"
+	"mimo-tui/internal/replay"
+	"mimo-tui/internal/skill"
+	"mimo-tui/internal/trust"
 )
 
 type focusPanel int
@@ -61,8 +67,11 @@ type Model struct {
 
 	context             core.ContextSnapshot
 	hasContext          bool
+	contextHistory      []core.ContextSnapshot
 	selectedContextItem int
 	chat                string
+	lastAssistant       string
+	turnToolStart       int
 	assistantStreaming  bool
 	trace               []core.TraceStep
 	traceIndex          map[string]int
@@ -78,6 +87,9 @@ type Model struct {
 	sourceClosed bool
 	showHelp     bool
 
+	showTimeline  bool
+	timelineIndex int
+
 	running   bool
 	lastError string
 
@@ -85,6 +97,12 @@ type Model struct {
 
 	modelName string
 	mockMode  bool
+	workspace string
+
+	goalCondition string
+	goalStatus    string
+	goalCleared   bool
+	activeSkills  []string
 
 	bus *core.Bus
 
@@ -209,12 +227,13 @@ func NewModel(events <-chan core.AgentEvent, bus *core.Bus) Model {
 	}
 }
 
-func Run(events <-chan core.AgentEvent, bus *core.Bus, modelName string, mockMode bool) error {
+func Run(events <-chan core.AgentEvent, bus *core.Bus, modelName string, mockMode bool, workspace string) error {
 	cursorState := &terminalCursorState{}
 	m := NewModel(events, bus)
 	m.cursorState = cursorState
 	m.modelName = modelName
 	m.mockMode = mockMode
+	m.workspace = workspace
 	if mockMode {
 		m.appendTranscriptBlock("SYSTEM", "MOCK MODE - set MIMO_API_KEY for real MiMo")
 	}
@@ -256,9 +275,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = "help closed"
 				return m, nil
 			}
+			if m.showTimeline {
+				m.showTimeline = false
+				m.status = "time travel closed"
+				return m, nil
+			}
 		}
 
 		if m.showHelp {
+			return m, nil
+		}
+
+		// Time-travel overlay captures navigation keys while open.
+		if m.showTimeline {
+			switch key {
+			case "j", "down":
+				if m.timelineIndex < len(m.contextHistory)-1 {
+					m.timelineIndex++
+				}
+			case "k", "up":
+				if m.timelineIndex > 0 {
+					m.timelineIndex--
+				}
+			case "home":
+				m.timelineIndex = 0
+			case "end":
+				m.timelineIndex = len(m.contextHistory) - 1
+			}
 			return m, nil
 		}
 
@@ -266,24 +309,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case InputPrompt:
 			switch msg.Type {
 			case tea.KeyEnter:
-				if strings.TrimSpace(m.textInput) != "" {
-					if m.running {
-						m.appendUserPrompt(m.textInput, true)
-						m.promptQueue = append(m.promptQueue, m.textInput)
-						m.status = fmt.Sprintf("prompt queued (position %d)", len(m.promptQueue))
-					} else {
-						m.appendUserPrompt(m.textInput, false)
-						if m.bus != nil {
-							event := core.NewEvent(core.EventUserPrompt)
-							event.Message = m.textInput
-							m.bus.Publish(event)
-						}
-						m.running = true
-						m.lastError = ""
-						m.status = "agent processing..."
-					}
-				} else {
+				trimmed := strings.TrimSpace(m.textInput)
+				switch {
+				case trimmed == "":
 					m.status = "prompt submitted (empty)"
+				case strings.HasPrefix(trimmed, "/") && isKnownSlashCommand(trimmed):
+					m = m.handleSlashCommand(trimmed)
+				case m.running:
+					m.appendUserPrompt(m.textInput, true)
+					m.promptQueue = append(m.promptQueue, m.textInput)
+					m.status = fmt.Sprintf("prompt queued (position %d)", len(m.promptQueue))
+				default:
+					m.appendUserPrompt(m.textInput, false)
+					if m.bus != nil {
+						event := core.NewEvent(core.EventUserPrompt)
+						event.Message = m.textInput
+						m.bus.Publish(event)
+					}
+					m.running = true
+					m.lastError = ""
+					m.status = "agent processing..."
 				}
 				m.textInput = ""
 				m.cursorPos = 0
@@ -378,10 +423,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = "focused " + panelNames[m.focus]
 				return m, nil
 			case "/":
+				// Seed the slash so slash commands are typeable (e.g. /help).
 				m.inputMode = InputPrompt
-				m.textInput = ""
-				m.cursorPos = 0
-				m.status = "PROMPT> type your message, Enter to submit, Esc to cancel"
+				m.textInput = "/"
+				m.cursorPos = 1
+				m.status = "COMMAND> type a command (e.g. /help) or a message, Enter to submit"
 				return m, nil
 			case "ctrl+l":
 				m.chat = ""
@@ -505,6 +551,458 @@ func (m Model) submitApprovalInput() (Model, tea.Cmd) {
 	}
 }
 
+// knownSlashCommands is the set of recognized command names (without the
+// leading slash). Input that starts with "/" but whose first token is not in
+// this set is treated as a normal prompt, so messages like "/etc/hosts is
+// broken" still reach the agent.
+var knownSlashCommands = map[string]bool{
+	"help": true, "?": true, "clear": true, "goal": true,
+	"memory": true, "mem": true, "model": true, "sessions": true, "export": true,
+	"skill": true, "skills": true, "why": true, "timeline": true, "trust": true,
+}
+
+// isKnownSlashCommand reports whether a "/..." line should be handled as a
+// command rather than forwarded to the agent as a prompt.
+func isKnownSlashCommand(raw string) bool {
+	fields := strings.Fields(strings.TrimSpace(raw))
+	if len(fields) == 0 {
+		return false
+	}
+	return knownSlashCommands[strings.ToLower(strings.TrimPrefix(fields[0], "/"))]
+}
+
+// handleSlashCommand parses and dispatches a "/command args" line entered in
+// the prompt bar. Local commands (help/clear/model/sessions/export) act on the
+// TUI directly; goal/memory are routed to the runtime over the event bus.
+func (m Model) handleSlashCommand(raw string) Model {
+	raw = strings.TrimSpace(raw)
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return m
+	}
+	cmd := strings.ToLower(strings.TrimPrefix(fields[0], "/"))
+	arg := strings.TrimSpace(strings.TrimPrefix(raw, fields[0]))
+
+	switch cmd {
+	case "help", "?":
+		m.showHelp = true
+		m.status = "help opened"
+	case "clear":
+		m.chat = ""
+		m.assistantStreaming = false
+		m.status = "chat cleared"
+	case "goal":
+		m = m.handleGoalCommand(arg)
+	case "memory", "mem":
+		m = m.handleMemoryCommand(arg)
+	case "skill", "skills":
+		m = m.handleSkillCommand(arg)
+	case "why":
+		m = m.handleWhyCommand()
+	case "timeline":
+		m = m.handleTimelineCommand()
+	case "trust":
+		m = m.handleTrustCommand()
+	case "model":
+		mode := "real"
+		if m.mockMode {
+			mode = "mock"
+		}
+		m.appendTranscriptBlock("MODEL", fmt.Sprintf("current: %s (%s)\nswitch via CLI flags, .mimo/models.toml, or -list-models", fallback(m.modelName, "mimo-v2.5-pro"), mode))
+		m.status = "model info"
+	case "sessions":
+		m.appendTranscriptBlock("SESSIONS", m.listSessions())
+		m.status = "sessions listed"
+	case "export":
+		if out, err := m.exportTranscript(arg); err != nil {
+			m.appendTranscriptBlock("EXPORT", "error: "+err.Error())
+			m.status = "export failed"
+		} else {
+			m.appendTranscriptBlock("EXPORT", "wrote transcript to "+out)
+			m.status = "transcript exported"
+		}
+	default:
+		m.appendTranscriptBlock("SYSTEM", "unknown command: /"+cmd+" — try /help for the command list")
+		m.status = "unknown command"
+	}
+	return m
+}
+
+func (m Model) handleGoalCommand(arg string) Model {
+	switch {
+	case arg == "":
+		if m.goalCondition == "" {
+			m.appendTranscriptBlock("GOAL", "no active goal.\nusage: /goal <condition>  |  /goal clear")
+		} else {
+			m.appendTranscriptBlock("GOAL", fmt.Sprintf("active: %s [%s]", m.goalCondition, fallback(m.goalStatus, "active")))
+		}
+		m.status = "goal status"
+	case strings.EqualFold(arg, "clear"), strings.EqualFold(arg, "off"), strings.EqualFold(arg, "none"):
+		if m.bus != nil {
+			ev := core.NewEvent(core.EventGoalSet)
+			ev.Message = ""
+			m.bus.Publish(ev)
+		}
+		m.goalCondition = ""
+		m.goalStatus = ""
+		m.goalCleared = true
+		m.appendTranscriptBlock("GOAL", "goal cleared")
+		m.status = "goal cleared"
+	default:
+		if m.bus != nil {
+			ev := core.NewEvent(core.EventGoalSet)
+			ev.Message = arg
+			m.bus.Publish(ev)
+		}
+		m.goalCondition = arg
+		m.goalStatus = "active"
+		m.goalCleared = false
+		m.appendTranscriptBlock("GOAL", "set: "+arg+"\nThe agent will not stop until an independent judge confirms this is met (re-entries are bounded).")
+		m.status = "goal set"
+	}
+	return m
+}
+
+func (m Model) handleMemoryCommand(arg string) Model {
+	sub := strings.Fields(arg)
+	if len(sub) == 0 || strings.EqualFold(sub[0], "show") || strings.EqualFold(sub[0], "list") {
+		content := memory.NewStore(m.workspace).Load()
+		if strings.TrimSpace(content) == "" {
+			m.appendTranscriptBlock("MEMORY", "(empty) — record a fact with /memory add <note>")
+		} else {
+			m.appendTranscriptBlock("MEMORY", content)
+		}
+		m.status = "memory shown"
+		return m
+	}
+	if strings.EqualFold(sub[0], "add") {
+		note := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(arg), sub[0]))
+		if note == "" {
+			m.status = "usage: /memory add <note>"
+			return m
+		}
+		if m.bus != nil {
+			ev := core.NewEvent(core.EventMemoryWrite)
+			ev.Message = note
+			m.bus.Publish(ev)
+		}
+		m.appendTranscriptBlock("MEMORY", "recorded: "+note)
+		m.status = "memory updated"
+		return m
+	}
+	m.status = "usage: /memory [show|add <note>]"
+	return m
+}
+
+func (m Model) handleSkillCommand(arg string) Model {
+	sub := strings.Fields(arg)
+	store := skill.NewStore(m.workspace)
+
+	if len(sub) == 0 || strings.EqualFold(sub[0], "list") {
+		skills := store.List()
+		if len(skills) == 0 {
+			m.appendTranscriptBlock("SKILLS", "no skills available")
+			m.status = "no skills"
+			return m
+		}
+		var b strings.Builder
+		for _, sk := range skills {
+			active := ""
+			if containsString(m.activeSkills, sk.Name) {
+				active = " [active]"
+			}
+			b.WriteString(fmt.Sprintf("- %s%s (%s): %s\n", sk.Name, active, sk.Source, sk.Description))
+		}
+		b.WriteString("\nuse: /skill use <name> | /skill show <name> | /skill clear")
+		m.appendTranscriptBlock("SKILLS", strings.TrimRight(b.String(), "\n"))
+		m.status = "skills listed"
+		return m
+	}
+
+	action := strings.ToLower(sub[0])
+	rest := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(arg), sub[0]))
+
+	switch action {
+	case "clear", "off", "none":
+		if m.bus != nil {
+			ev := core.NewEvent(core.EventSkillSet)
+			ev.Message = ""
+			m.bus.Publish(ev)
+		}
+		m.activeSkills = nil
+		m.appendTranscriptBlock("SKILLS", "skills cleared")
+		m.status = "skills cleared"
+	case "show", "read":
+		if rest == "" {
+			m.status = "usage: /skill show <name>"
+			return m
+		}
+		sk, ok := store.Get(rest)
+		if !ok {
+			m.appendTranscriptBlock("SKILLS", "unknown skill: "+rest)
+			m.status = "unknown skill"
+			return m
+		}
+		m.appendTranscriptBlock("SKILL "+sk.Name, sk.Body)
+		m.status = "skill shown"
+	case "use", "add", "load":
+		if rest == "" {
+			m.status = "usage: /skill use <name>"
+			return m
+		}
+		sk, ok := store.Get(rest)
+		if !ok {
+			m.appendTranscriptBlock("SKILLS", "unknown skill: "+rest)
+			m.status = "unknown skill"
+			return m
+		}
+		if m.bus != nil {
+			ev := core.NewEvent(core.EventSkillSet)
+			ev.Message = sk.Name
+			m.bus.Publish(ev)
+		}
+		if !containsString(m.activeSkills, sk.Name) {
+			m.activeSkills = append(m.activeSkills, sk.Name)
+		}
+		m.appendTranscriptBlock("SKILLS", "activated: "+sk.Name+" — its playbook will guide the agent this session")
+		m.status = "skill activated"
+	default:
+		m.status = "usage: /skill [list|use <name>|show <name>|clear]"
+	}
+	return m
+}
+
+// handleWhyCommand shows the evidence behind the most recent answer: the context
+// currently in scope, the latest artifact-backed observations, and how the
+// Context Map changed in the last step.
+func (m Model) handleWhyCommand() Model {
+	var b strings.Builder
+	if m.hasContext && len(m.context.Items) > 0 {
+		var anchors, near, artifacts []string
+		for _, it := range m.context.Items {
+			label := fallback(it.Title, it.ID)
+			switch it.Tier {
+			case core.TierAnchor:
+				if it.Pinned {
+					label += " (pinned)"
+				}
+				anchors = append(anchors, label)
+			case core.TierArtifact:
+				artifacts = append(artifacts, label)
+			default:
+				near = append(near, label)
+			}
+		}
+		b.WriteString(fmt.Sprintf("context: %d/%d tokens (%s risk)\n", m.context.UsedTokens, m.context.WindowTokens, fallback(m.context.PollutionRisk, "low")))
+		if len(anchors) > 0 {
+			b.WriteString("  anchor: " + strings.Join(anchors, ", ") + "\n")
+		}
+		if len(near) > 0 {
+			b.WriteString("  near: " + strings.Join(near, ", ") + "\n")
+		}
+		if len(artifacts) > 0 {
+			b.WriteString("  artifacts: " + strings.Join(artifacts, ", ") + "\n")
+		}
+	} else {
+		b.WriteString("no context loaded yet\n")
+	}
+
+	if len(m.notes) > 0 {
+		b.WriteString("\nrecent evidence (observations):\n")
+		start := len(m.notes) - 5
+		if start < 0 {
+			start = 0
+		}
+		for _, note := range m.notes[start:] {
+			b.WriteString("  - " + truncate(note, 160) + "\n")
+		}
+	}
+
+	if len(m.contextHistory) >= 2 {
+		d := provenance.ContextDiff(m.contextHistory[len(m.contextHistory)-2], m.contextHistory[len(m.contextHistory)-1])
+		b.WriteString("\ncontext delta (last step):\n" + provenance.FormatDiff(d))
+	}
+
+	m.appendTranscriptBlock("WHY", strings.TrimRight(b.String(), "\n"))
+	m.status = "evidence shown"
+	return m
+}
+
+// handleTimelineCommand opens the interactive time-travel overlay where the user
+// can scrub Context Map snapshots and see the diff at each step.
+func (m Model) handleTimelineCommand() Model {
+	if len(m.contextHistory) == 0 {
+		m.appendTranscriptBlock("TIMELINE", "no context snapshots yet")
+		m.status = "timeline empty"
+		return m
+	}
+	m.showTimeline = true
+	m.timelineIndex = len(m.contextHistory) - 1
+	m.status = "time travel: j/k to scrub snapshots, esc to close"
+	return m
+}
+
+// renderTimelineOverlay draws the scrubber: a snapshot list with the selected
+// one highlighted, and the Context Map diff from the previous snapshot to it.
+func (m Model) renderTimelineOverlay(width, height int) string {
+	idx := clampInt(m.timelineIndex, 0, maxInt(len(m.contextHistory)-1, 0))
+	var b strings.Builder
+	b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")).
+		Render(fmt.Sprintf("TIME TRAVEL — snapshot %d / %d", idx, len(m.contextHistory)-1)))
+	b.WriteString("\n\n")
+
+	// Window of snapshots around the selection.
+	const window = 12
+	start := idx - window/2
+	if start < 0 {
+		start = 0
+	}
+	end := start + window
+	if end > len(m.contextHistory) {
+		end = len(m.contextHistory)
+		start = maxInt(end-window, 0)
+	}
+	for i := start; i < end; i++ {
+		s := m.contextHistory[i]
+		line := fmt.Sprintf("%3d  %d/%d tok (%s)  %d items", i, s.UsedTokens, s.WindowTokens, fallback(s.PollutionRisk, "low"), len(s.Items))
+		if i == idx {
+			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("236")).Background(lipgloss.Color("39")).Render("▶ " + line))
+		} else {
+			b.WriteString("  " + lipgloss.NewStyle().Foreground(lipgloss.Color("248")).Render(line))
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n")
+	b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252")).Render("Change into this snapshot:"))
+	b.WriteString("\n")
+	if idx > 0 {
+		d := provenance.ContextDiff(m.contextHistory[idx-1], m.contextHistory[idx])
+		b.WriteString(provenance.FormatDiff(d))
+	} else {
+		b.WriteString("(initial snapshot)\n")
+	}
+	b.WriteString("\n")
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("j/k scrub · home/end jump · esc close"))
+
+	content := lipgloss.NewStyle().
+		Width(maxInt(width-4, 20)).
+		Height(maxInt(height-2, 8)).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("39")).
+		Foreground(lipgloss.Color("252")).
+		Render(fitText(b.String(), maxInt(width-6, 18), maxInt(height-4, 6)))
+	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, content)
+}
+
+// trustActions maps the current turn's tool runs into verification evidence, so
+// a claim is only "verified" by a tool that ran in the same turn.
+func (m Model) trustActions() []trust.Action {
+	start := m.turnToolStart
+	if start < 0 || start > len(m.tools) {
+		start = 0
+	}
+	turn := m.tools[start:]
+	actions := make([]trust.Action, 0, len(turn))
+	for _, t := range turn {
+		actions = append(actions, trust.Action{Tool: t.Name, OK: t.Status == "done", ArtifactID: t.RollbackArtifactID})
+	}
+	return actions
+}
+
+// handleTrustCommand shows the verification ledger for the latest answer: which
+// success claims are backed by a tool run and which are merely asserted.
+func (m Model) handleTrustCommand() Model {
+	ledger := trust.Analyze(m.lastAssistant, m.trustActions())
+	m.appendTranscriptBlock("TRUST", trust.Format(ledger))
+	if len(ledger.UnverifiedClaims()) > 0 {
+		m.status = "trust: unverified claims present"
+	} else {
+		m.status = "trust ledger shown"
+	}
+	return m
+}
+
+func containsString(items []string, target string) bool {
+	for _, it := range items {
+		if it == target {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Model) applyGoalUpdate(g core.GoalUpdate) {
+	// Ignore late updates from a run whose goal the user has already cleared, so
+	// a stale verdict cannot resurrect the badge.
+	if m.goalCleared {
+		return
+	}
+	switch {
+	case g.Satisfied:
+		m.goalStatus = "satisfied"
+		m.goalCondition = g.Condition
+		m.appendTranscriptBlock("GOAL [satisfied]", fallback(g.Reason, "the independent judge confirmed the goal is met"))
+		m.status = "goal satisfied"
+	case g.Impossible:
+		m.goalStatus = "impossible"
+		m.goalCondition = g.Condition
+		m.appendTranscriptBlock("GOAL [impossible]", fallback(g.Reason, "the judge ruled the goal cannot be achieved"))
+		m.status = "goal impossible"
+	case g.Active:
+		m.goalStatus = fmt.Sprintf("retry %d", g.ReactCount)
+		m.goalCondition = g.Condition
+		m.appendTranscriptBlock(fmt.Sprintf("GOAL [retry %d]", g.ReactCount), fallback(g.Reason, "not yet satisfied; the agent will keep working"))
+		m.status = "goal not yet satisfied — re-entering"
+	default:
+		m.goalStatus = "closed"
+		m.appendTranscriptBlock("GOAL [closed]", fallback(g.Reason, "goal closed"))
+		m.status = "goal closed"
+		m.goalCondition = ""
+	}
+}
+
+func (m Model) listSessions() string {
+	sessions, err := replay.ListSessions(fallback(m.workspace, "."))
+	if err != nil {
+		return "error listing sessions: " + err.Error()
+	}
+	if len(sessions) == 0 {
+		return "no sessions recorded yet"
+	}
+	limit := len(sessions)
+	if limit > 10 {
+		limit = 10
+	}
+	var b strings.Builder
+	for _, s := range sessions[:limit] {
+		b.WriteString(fmt.Sprintf("%s  events=%d  last=%s  %s\n", s.ID, s.EventCount, fallback(string(s.LastEventType), "?"), s.LastEventAt.Format("2006-01-02 15:04")))
+	}
+	if len(sessions) > limit {
+		b.WriteString(fmt.Sprintf("...and %d more", len(sessions)-limit))
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m Model) exportTranscript(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		dir := filepath.Join(fallback(m.workspace, "."), ".mimo", "exports")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", err
+		}
+		path = filepath.Join(dir, fmt.Sprintf("transcript-%s.md", time.Now().Format("20060102T150405")))
+	}
+	body := m.chat
+	if strings.TrimSpace(body) == "" {
+		body = "(empty transcript)"
+	}
+	if err := os.WriteFile(path, []byte(body+"\n"), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
 func (m Model) finishApproval(allowed bool, reason, status string) Model {
 	if m.pendingApproval.Response != nil {
 		m.pendingApproval.Response <- core.ApprovalDecision{Allowed: allowed, Reason: reason}
@@ -532,6 +1030,8 @@ func (m Model) View() string {
 	var view string
 	if m.showHelp {
 		view = lipgloss.JoinVertical(lipgloss.Left, header, statusLine, renderHelp(width, bodyHeight), footer)
+	} else if m.showTimeline {
+		view = lipgloss.JoinVertical(lipgloss.Left, header, statusLine, m.renderTimelineOverlay(width, bodyHeight), footer)
 	} else if m.inputMode == InputApprove {
 		approvalPanel := m.renderApprovalPanel(width, bodyHeight)
 		if m.inputMode != InputNone {
@@ -609,7 +1109,7 @@ func (m Model) updateTerminalCursor(width, headerHeight, statusLineHeight, bodyH
 	if m.cursorState == nil {
 		return
 	}
-	if m.showHelp {
+	if m.showHelp || m.showTimeline {
 		m.cursorState.Set(ansi.HideCursor)
 		return
 	}
@@ -843,6 +1343,11 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 		if event.Context != nil {
 			m.context = *event.Context
 			m.hasContext = true
+			// Keep a bounded history for in-TUI time travel (/timeline, /why).
+			m.contextHistory = append(m.contextHistory, *event.Context)
+			if len(m.contextHistory) > 64 {
+				m.contextHistory = m.contextHistory[len(m.contextHistory)-64:]
+			}
 		}
 		m.status = "context map updated"
 	case core.EventTraceUpdate:
@@ -917,10 +1422,25 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 		m.running = true
 		m.lastError = ""
 		m.assistantStreaming = false
+		// Reset per-turn state so the trust ledger scopes to THIS run's answer and
+		// tools (not a stale prior answer or an earlier turn's test run).
+		m.lastAssistant = ""
+		m.turnToolStart = len(m.tools)
 	case core.EventDone:
 		m.running = false
 		m.assistantStreaming = false
 		m.status = fallback(event.Message, "agent complete")
+		// Verification ledger: warn if the answer claims success no tool backs.
+		if unv := trust.Analyze(m.lastAssistant, m.trustActions()).UnverifiedClaims(); len(unv) > 0 {
+			labels := make([]string, 0, len(unv))
+			for _, c := range unv {
+				labels = append(labels, c.Label)
+			}
+			warn := "unverified claim(s): " + strings.Join(labels, "; ") + " — run /trust for detail"
+			// Keep this out of m.notes (which feeds /why "evidence"); it has its
+			// own transcript block.
+			m.appendTranscriptBlock("TRUST", "⚠ "+warn)
+		}
 		if len(m.promptQueue) > 0 {
 			next := m.promptQueue[0]
 			m.promptQueue = m.promptQueue[1:]
@@ -932,6 +1452,14 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 			m.running = true
 			m.status = fmt.Sprintf("dequeued prompt (%d remaining)", len(m.promptQueue))
 		}
+	case core.EventGoalUpdate:
+		if event.Goal != nil {
+			m.applyGoalUpdate(*event.Goal)
+		}
+	case core.EventGoalSet, core.EventMemoryWrite, core.EventSkillSet, core.EventUserPrompt:
+		// UI-originated control events echoed back by the bus. The slash/prompt
+		// handlers already updated the transcript and status synchronously, so
+		// ignore the echo to avoid duplicate notes and status clobber.
 	case core.EventApprovalNeeded:
 		if event.Approval != nil {
 			timeoutSeconds := event.Approval.TimeoutSeconds
@@ -1178,8 +1706,10 @@ func (m *Model) appendAssistantDelta(delta string) {
 		m.ensureTranscriptGap()
 		m.chat += "MIMO\n  "
 		m.assistantStreaming = true
+		m.lastAssistant = "" // start a fresh answer for the trust ledger
 	}
 	m.chat += delta
+	m.lastAssistant += delta
 	m.scrollTranscriptToBottom()
 }
 
@@ -2430,6 +2960,12 @@ func (m Model) renderStatusLine(width int) string {
 	}
 
 	line := fmt.Sprintf("%s | %s | %s | Tokens: ~%s", modelName, stepInfo, state, formatNumber(totalTokens))
+	if m.goalCondition != "" {
+		line += fmt.Sprintf(" | ⊙ goal[%s]: %s", fallback(m.goalStatus, "active"), truncate(m.goalCondition, 40))
+	}
+	if len(m.activeSkills) > 0 {
+		line += " | ★ skills: " + truncate(strings.Join(m.activeSkills, ","), 32)
+	}
 
 	return lipgloss.NewStyle().
 		Width(width).
@@ -2484,6 +3020,23 @@ Input
   /: enter prompt input mode
   Enter: submit prompt
   Esc: cancel input / close help
+
+Slash commands
+  /help            show this help
+  /clear           clear the chat transcript
+  /goal <cond>     set a goal; an independent judge gates stopping until met
+  /goal clear      clear the active goal
+  /memory          show persistent cross-session memory
+  /memory add <x>  record a durable fact into memory
+  /skill           list skill playbooks (plan/tdd/review/debug/verify)
+  /skill use <n>   activate a skill playbook for this session
+  /skill clear     deactivate all skills
+  /why             show the evidence behind the latest answer + context delta
+  /timeline        open the interactive time-travel scrubber (j/k, esc)
+  /trust           verification ledger: which success claims a tool actually backs
+  /model           show the current model
+  /sessions        list recent recorded sessions
+  /export [path]   write the transcript to a markdown file
 
 Context
   p: toggle pin on selected context item

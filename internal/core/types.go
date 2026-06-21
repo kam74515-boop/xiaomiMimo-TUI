@@ -29,7 +29,32 @@ const (
 	EventInterrupt      EventType = "interrupt"
 	EventAgentStarted   EventType = "agent_started"
 	EventActivityUpdate EventType = "activity_update"
+	// EventGoalSet is published by the UI to install or clear the active goal
+	// condition. An empty Message clears the goal.
+	EventGoalSet EventType = "goal_set"
+	// EventGoalUpdate is published by the agent loop (and runtime) to report a
+	// judge verdict on the active goal so the UI can render goal progress.
+	EventGoalUpdate EventType = "goal_update"
+	// EventMemoryWrite is published by the UI to append a note to persistent
+	// cross-session memory.
+	EventMemoryWrite EventType = "memory_write"
+	// EventSkillSet is published by the UI to activate (Message=name) or clear
+	// (empty Message) skill playbooks for subsequent runs.
+	EventSkillSet EventType = "skill_set"
 )
+
+// GoalUpdate reports the state of a goal-gate evaluation. It is carried on
+// EventGoalUpdate so the UI can show whether the active goal is still being
+// pursued, was satisfied by an independent judge, judged impossible, or
+// abandoned after the re-entry cap.
+type GoalUpdate struct {
+	Condition  string `json:"condition"`
+	Active     bool   `json:"active"`
+	Satisfied  bool   `json:"satisfied"`
+	Impossible bool   `json:"impossible"`
+	Reason     string `json:"reason,omitempty"`
+	ReactCount int    `json:"react_count"`
+}
 
 type ActivityKind string
 
@@ -171,6 +196,7 @@ type AgentEvent struct {
 	Observation *Observation     `json:"observation,omitempty"`
 	Cost        *CostUpdate      `json:"cost,omitempty"`
 	Activity    *ActivityEvent   `json:"activity,omitempty"`
+	Goal        *GoalUpdate      `json:"goal,omitempty"`
 	Err         string           `json:"error,omitempty"`
 	Approval    *ApprovalRequest `json:"-"`
 }

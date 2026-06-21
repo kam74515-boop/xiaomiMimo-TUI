@@ -42,6 +42,35 @@ func (t baseTool) path(input core.ToolInput) (string, error) {
 	return filepath.Join(t.workspace, path), nil
 }
 
+// confinedPath resolves the input path and rejects anything that escapes the
+// workspace (absolute paths or ".." traversal). Workspace-mutating tools use
+// this so a sub-agent's worktree provides real filesystem isolation, not just
+// git-level isolation.
+func (t baseTool) confinedPath(input core.ToolInput) (string, error) {
+	raw := strings.TrimSpace(stringInput(input, "path"))
+	if raw == "" {
+		return "", fmt.Errorf("path is required")
+	}
+	ws := t.workspace
+	if ws == "" {
+		ws = "."
+	}
+	absWS, err := filepath.Abs(ws)
+	if err != nil {
+		return "", err
+	}
+	target := raw
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(absWS, target)
+	}
+	target = filepath.Clean(target)
+	rel, err := filepath.Rel(absWS, target)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q escapes the workspace", raw)
+	}
+	return target, nil
+}
+
 func (t baseTool) writeArtifact(req artifact.WriteRequest) (string, error) {
 	if t.store == nil {
 		return "", fmt.Errorf("artifact store is nil")
@@ -303,7 +332,7 @@ func (t writeFileTool) Permission(input core.ToolInput) core.PermissionRequest {
 }
 
 func (t writeFileTool) Run(ctx context.Context, input core.ToolInput) core.ToolResult {
-	path, err := t.path(input)
+	path, err := t.confinedPath(input)
 	if err != nil {
 		return core.ToolResult{ExitCode: 2, Error: err.Error()}
 	}

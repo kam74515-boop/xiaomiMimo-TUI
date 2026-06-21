@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -15,14 +16,22 @@ import (
 	"mimo-tui/internal/config"
 	contextmap "mimo-tui/internal/context"
 	"mimo-tui/internal/core"
+	"mimo-tui/internal/counterfactual"
 	"mimo-tui/internal/eval"
+	"mimo-tui/internal/mcp"
+	"mimo-tui/internal/memory"
 	"mimo-tui/internal/model"
+	"mimo-tui/internal/provenance"
 	"mimo-tui/internal/provider/mimo"
 	"mimo-tui/internal/replay"
 	sessionlog "mimo-tui/internal/session"
+	"mimo-tui/internal/skill"
+	"mimo-tui/internal/subagent"
 	"mimo-tui/internal/tools"
 	"mimo-tui/internal/tools/summarizers"
+	"mimo-tui/internal/trust"
 	"mimo-tui/internal/tui"
+	"mimo-tui/internal/worktree"
 )
 
 func main() {
@@ -31,6 +40,13 @@ func main() {
 	if opts.showVersion {
 		fmt.Printf("MiMo-TUI %s\n", version)
 		return
+	}
+
+	// Reject ambiguous command combinations up front rather than letting branch
+	// order silently pick a winner (e.g. -provenance -golden-session).
+	if cmds := commandsSet(opts); len(cmds) > 1 {
+		fmt.Fprintf(os.Stderr, "mimo: only one command may be specified at a time; got: %s\n", strings.Join(cmds, ", "))
+		os.Exit(2)
 	}
 
 	// ----- model registry (persisted) -----
@@ -82,7 +98,8 @@ func main() {
 	}
 
 	// ----- golden session marking -----
-	if opts.goldenSession != "" && opts.modelAccept == "" {
+	// (skip when -golden-session is reused as the counterfactual baseline)
+	if opts.goldenSession != "" && opts.modelAccept == "" && !opts.counterfactual {
 		if err := runGoldenMark(cfg, opts); err != nil {
 			fmt.Fprintf(os.Stderr, "golden: %v\n", err)
 			os.Exit(1)
@@ -100,6 +117,33 @@ func main() {
 		return
 	}
 
+	// ----- provenance timeline (offline, no agent run) -----
+	if opts.provenance {
+		if err := runProvenance(cfg, opts); err != nil {
+			fmt.Fprintf(os.Stderr, "provenance: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// ----- verification ledger (offline, no agent run) -----
+	if opts.trust {
+		if err := runTrust(cfg, opts); err != nil {
+			fmt.Fprintf(os.Stderr, "trust: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// ----- counterfactual comparison (offline, no agent run) -----
+	if opts.counterfactual {
+		if err := runCounterfactual(cfg, opts); err != nil {
+			fmt.Fprintf(os.Stderr, "counterfactual: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if opts.sessionID == "" {
 		opts.sessionID = newSessionID()
 	}
@@ -108,7 +152,11 @@ func main() {
 	if opts.smoke && strings.TrimSpace(prompt) == "" {
 		prompt = defaultSmokePrompt()
 	}
-	events, ctxBus := liveEvents(context.Background(), cfg, prompt, opts, registry)
+	// Tie the runtime (agent loop, MCP child processes) to the app lifetime so
+	// they are torn down on exit rather than orphaned.
+	appCtx, cancelApp := context.WithCancel(context.Background())
+	defer cancelApp()
+	events, ctxBus := liveEvents(appCtx, cfg, prompt, opts, registry)
 	if opts.smoke {
 		if err := runSmoke(os.Stdout, events, opts.smokeTimeout); err != nil {
 			fmt.Fprintf(os.Stderr, "smoke: %v\n", err)
@@ -125,7 +173,7 @@ func main() {
 		return
 	}
 
-	if err := tui.Run(events, ctxBus, cfg.Provider.Model, cfg.Provider.Mock); err != nil {
+	if err := tui.Run(events, ctxBus, cfg.Provider.Model, cfg.Provider.Mock, cfg.Runtime.Workspace); err != nil {
 		fmt.Fprintf(os.Stderr, "run tui: %v\n", err)
 		os.Exit(1)
 	}
@@ -143,6 +191,9 @@ type cliOptions struct {
 	resumeLatest     bool
 	eval             bool
 	evalSession      string
+	provenance       bool
+	trust            bool
+	counterfactual   bool
 	listModels       bool
 	goldenSession    string
 	modelAccept      string
@@ -168,6 +219,9 @@ func parseFlags() cliOptions {
 	flag.BoolVar(&opts.resumeLatest, "resume-latest", false, "load a compact summary of the latest usable session into the startup Context Map")
 	flag.BoolVar(&opts.eval, "eval", false, "extract and compare trajectories from session logs")
 	flag.StringVar(&opts.evalSession, "eval-session", "", "session ID to evaluate (default: latest)")
+	flag.BoolVar(&opts.provenance, "provenance", false, "print the evidence-linked provenance timeline for a session (use -eval-session to choose)")
+	flag.BoolVar(&opts.trust, "trust", false, "print the verification ledger for a session: which success claims a tool actually backs")
+	flag.BoolVar(&opts.counterfactual, "counterfactual", false, "compare two sessions (-golden-session baseline vs -candidate-session variant) and localize divergence")
 	flag.BoolVar(&opts.listModels, "list-models", false, "print all registered models and exit")
 	flag.StringVar(&opts.goldenSession, "golden-session", "", "mark a session as golden")
 	flag.StringVar(&opts.modelAccept, "model-accept", "", "accept a candidate model if the replay gate passes")
@@ -179,6 +233,38 @@ func parseFlags() cliOptions {
 	flag.BoolVar(&opts.showVersion, "version", false, "print version and exit")
 	flag.Parse()
 	return opts
+}
+
+// commandsSet returns the distinct top-level commands requested. -golden-session
+// counts as the "golden-mark" command only when it is not being used as a shared
+// input for model-accept (gate) or counterfactual.
+func commandsSet(o cliOptions) []string {
+	var cmds []string
+	if o.rollbackList || o.rollbackShow != "" || o.rollbackApply != "" {
+		cmds = append(cmds, "rollback")
+	}
+	if o.modelAccept != "" {
+		cmds = append(cmds, "model-accept")
+	}
+	if o.goldenSession != "" && o.modelAccept == "" && !o.counterfactual {
+		cmds = append(cmds, "golden-mark")
+	}
+	if o.provenance {
+		cmds = append(cmds, "provenance")
+	}
+	if o.trust {
+		cmds = append(cmds, "trust")
+	}
+	if o.counterfactual {
+		cmds = append(cmds, "counterfactual")
+	}
+	if o.eval {
+		cmds = append(cmds, "eval")
+	}
+	if o.listModels {
+		cmds = append(cmds, "list-models")
+	}
+	return cmds
 }
 
 func newSessionID() string {
@@ -325,6 +411,23 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 	go func() {
 		manager := newContextManager(cfg)
 		publishContextSnapshot(manager.Snapshot(), bus)
+
+		// Persistent memory: load and make it visible in the Context Map. The
+		// content is also injected into the system prompt on every run (below).
+		memStore := memory.NewStore(cfg.Runtime.Workspace)
+		if item, ok := memStore.AnchorItem(); ok {
+			snapshot, _ := manager.Upsert(item)
+			publishContextSnapshot(snapshot, bus)
+		}
+
+		// Skills: discover governed playbooks and surface them in the activity
+		// dashboard. Activation is explicit (via /skill) and injected per run.
+		skillStore := skill.NewStore(cfg.Runtime.Workspace)
+		activeSkills := map[string]skill.Skill{}
+		for _, sk := range skillStore.List() {
+			publishSkillActivity(bus, sk, core.ActivityPlanned, "discovered")
+		}
+
 		var resumeHistory []core.Message
 		if opts.resumeLatest {
 			_, _, resumeHistory = publishResumeSummary(cfg, manager, bus)
@@ -356,6 +459,16 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 
 		artifactStore := artifact.NewStore(cfg.Runtime.Workspace)
 		toolRegistry := tools.NewDefaultRegistryWithStore(cfg.Runtime.Workspace, artifactStore, summarizers.NewRegistry)
+		// Connect configured MCP servers and register their tools (best-effort).
+		mcpClients := connectMCP(ctx, cfg, toolRegistry, bus)
+		if len(mcpClients) > 0 {
+			go func() {
+				<-ctx.Done()
+				for _, c := range mcpClients {
+					_ = c.Close()
+				}
+			}()
+		}
 		approvalCh := make(chan core.ApprovalRequest, 8)
 		defer close(approvalCh)
 		policyCfg, _ := config.LoadPolicy()
@@ -415,9 +528,33 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 			client.SetModelInfo(info)
 		}
 		loopConfig := agent.DefaultLoopConfig()
+		// Wire sub-agent delegation: the `subagent` tool spawns an isolated
+		// worktree run via this spawner. Worktrees need a git repo; if the
+		// workspace is not one, the tool stays a no-op placeholder.
+		if t, ok := toolRegistry.Get("subagent"); ok && worktree.IsGitRepo(cfg.Runtime.Workspace) {
+			if c, ok := t.(interface {
+				SetSpawner(tools.SubAgentSpawner)
+			}); ok {
+				c.SetSpawner(subagent.NewSpawner(subagent.Deps{
+					RepoRoot:      cfg.Runtime.Workspace,
+					Client:        client,
+					ParentBus:     bus,
+					LoopConfig:    loopConfig,
+					ContextWindow: cfg.Runtime.ContextWindow,
+				}))
+			}
+		}
+		// Independent goal judge reuses the provider but is called separately
+		// (cold context) so the working agent's optimism cannot end a goal early.
+		judge := agent.NewModelJudge(client, cfg.Provider.Model)
+		var currentGoal string
 		userPrompts := bus.Subscribe(8)
 		oracleEvents := bus.Subscribe(8)
 		interruptEvents := bus.Subscribe(4)
+		// Subscribe only to low-frequency control events so the bounded buffer is
+		// never flooded by the message-delta stream (which would drop goal/memory
+		// events on a full buffer).
+		controlEvents := bus.SubscribeFiltered(64, core.EventGoalSet, core.EventGoalUpdate, core.EventMemoryWrite, core.EventSkillSet)
 		runResults := make(chan agentRunResult, 1)
 
 		// Track the most recent prompt and observations for oracle review.
@@ -434,19 +571,96 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 		var queuedPrompts []string
 		history := resumeHistory
 
+		// applyControl handles goal/memory control events. It is invoked both
+		// from the select loop and drained at run completion so that a goal the
+		// just-finished run resolved is cleared before any queued prompt starts.
+		applyControl := func(event core.AgentEvent) {
+			switch event.Type {
+			case core.EventGoalSet:
+				currentGoal = strings.TrimSpace(event.Message)
+				summary := "goal cleared"
+				if currentGoal != "" {
+					summary = "goal set: " + currentGoal + " — agent will not stop until an independent judge confirms it"
+				}
+				bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: summary}})
+			case core.EventGoalUpdate:
+				// Clear the active goal once it is resolved (satisfied /
+				// impossible / gave up) so the next prompt does not re-gate.
+				if event.Goal != nil && !event.Goal.Active {
+					currentGoal = ""
+				}
+			case core.EventMemoryWrite:
+				note := strings.TrimSpace(event.Message)
+				if note == "" {
+					return
+				}
+				if err := memStore.Append(memory.ScopeProject, note); err != nil {
+					bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: "memory write failed: " + err.Error()}})
+					return
+				}
+				if item, ok := memStore.AnchorItem(); ok {
+					snapshot, _ := manager.Upsert(item)
+					publishContextSnapshot(snapshot, bus)
+				}
+				bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: "memory recorded: " + note}})
+			case core.EventSkillSet:
+				name := strings.TrimSpace(event.Message)
+				if name == "" {
+					for n, sk := range activeSkills {
+						publishSkillActivity(bus, sk, core.ActivitySkipped, "deactivated")
+						delete(activeSkills, n)
+					}
+					bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: "skills cleared"}})
+					return
+				}
+				sk, ok := skillStore.Get(name)
+				if !ok {
+					bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: "unknown skill: " + name}})
+					return
+				}
+				activeSkills[sk.Name] = sk
+				publishSkillActivity(bus, sk, core.ActivityDone, "activated")
+				bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: "skill activated: " + sk.Name}})
+			}
+		}
+
+		// drainControl applies any buffered control events without blocking.
+		drainControl := func() {
+			for {
+				select {
+				case event := <-controlEvents:
+					applyControl(event)
+				default:
+					return
+				}
+			}
+		}
+
 		startRun := func(runPrompt string) {
 			if strings.TrimSpace(runPrompt) == "" {
 				return
 			}
+			// Apply any buffered control events (e.g. a goal just set or resolved)
+			// before snapshotting currentGoal for this run.
+			drainControl()
 			runCtx, agentCancel = context.WithCancel(ctx)
 			running = true
 			bus.Publish(core.NewEvent(core.EventAgentStarted))
 			historySnapshot := append([]core.Message(nil), history...)
 			currentCtx := runCtx
-			go func(runContext context.Context, p string, h []core.Message) {
-				nextHistory, loopErr := agent.Loop(runContext, p, client, executor, manager, toolRegistry.ToolSpecs(), bus, loopConfig, h)
+			// Build a per-run config: refresh memory from disk (so newly recorded
+			// facts apply) and attach the active goal + judge if one is set.
+			runCfg := loopConfig
+			runCfg.Memory = memStore.LoadBounded(memory.MaxModelMemoryBytes)
+			runCfg.Skills = combineActiveSkills(activeSkills)
+			runCfg.GoalCondition = currentGoal
+			if currentGoal != "" {
+				runCfg.Judge = judge
+			}
+			go func(runContext context.Context, p string, h []core.Message, cfgCopy agent.LoopConfig) {
+				nextHistory, loopErr := agent.Loop(runContext, p, client, executor, manager, toolRegistry.ToolSpecs(), bus, cfgCopy, h)
 				runResults <- agentRunResult{History: nextHistory, Err: loopErr}
-			}(currentCtx, runPrompt, historySnapshot)
+			}(currentCtx, runPrompt, historySnapshot, runCfg)
 		}
 		startRun(prompt)
 
@@ -458,6 +672,9 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 			case result := <-runResults:
 				running = false
 				agentCancel = nil
+				// Apply any control events the finished run emitted (e.g. a goal
+				// the judge just resolved) before deciding on queued prompts.
+				drainControl()
 				if len(result.History) > 0 {
 					history = result.History
 				}
@@ -525,6 +742,11 @@ func liveEvents(ctx context.Context, cfg config.Config, prompt string, opts cliO
 						recentObservations = recentObservations[len(recentObservations)-5:]
 					}
 				}
+			case event, ok := <-controlEvents:
+				if !ok {
+					return
+				}
+				applyControl(event)
 			}
 		}
 	}()
@@ -563,6 +785,105 @@ func newContextManager(cfg config.Config) *contextmap.Manager {
 		Reason:        fmt.Sprintf("model=%s base_url=%s mock=%t", cfg.Provider.Model, cfg.Provider.BaseURL, cfg.Provider.Mock),
 	})
 	return manager
+}
+
+// connectMCP dials each enabled MCP server, registers its tools into the
+// registry, and surfaces them in the activity dashboard. Failures are reported
+// as activity events and skipped — a bad server never blocks startup.
+func connectMCP(ctx context.Context, cfg config.Config, registry *tools.Registry, bus *core.Bus) []*mcp.Client {
+	mcpCfg, err := config.LoadMCPConfig()
+	if err != nil {
+		bus.Publish(core.AgentEvent{Type: core.EventObservation, Observation: &core.Observation{Summary: "mcp config error: " + err.Error()}})
+		return nil
+	}
+	var clients []*mcp.Client
+	for _, server := range mcpCfg.EnabledServers() {
+		publishMCPActivity(bus, server.Name, "", core.ActivityRunning, "connecting")
+		client, _, derr := mcp.Dial(ctx, server.Command, server.Args, server.Env)
+		if derr != nil {
+			publishMCPActivity(bus, server.Name, "", core.ActivityFailed, derr.Error())
+			continue
+		}
+		handshakeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		if _, ierr := client.Initialize(handshakeCtx); ierr != nil {
+			cancel()
+			publishMCPActivity(bus, server.Name, "", core.ActivityFailed, "initialize: "+ierr.Error())
+			_ = client.Close()
+			continue
+		}
+		defs, lerr := client.ListTools(handshakeCtx)
+		cancel()
+		if lerr != nil {
+			publishMCPActivity(bus, server.Name, "", core.ActivityFailed, "tools/list: "+lerr.Error())
+			_ = client.Close()
+			continue
+		}
+		registered := 0
+		for _, def := range defs {
+			ext := tools.NewExternalTool(server.Name, def.Name, def.Description, core.JSONSchema(def.InputSchema), cfg.Runtime.Workspace)
+			ext.SetCaller(client)
+			if rerr := registry.Register(ext); rerr != nil {
+				continue
+			}
+			registered++
+			publishMCPActivity(bus, server.Name, def.Name, core.ActivityPlanned, "discovered")
+		}
+		publishMCPActivity(bus, server.Name, "", core.ActivityDone, fmt.Sprintf("connected: %d tool(s)", registered))
+		clients = append(clients, client)
+	}
+	return clients
+}
+
+func publishMCPActivity(bus *core.Bus, server, tool string, status core.ActivityStatus, summary string) {
+	event := core.NewEvent(core.EventActivityUpdate)
+	id := "mcp:" + server
+	name := server
+	if tool != "" {
+		id += ":" + tool
+		name = tool
+	}
+	event.Activity = &core.ActivityEvent{
+		ID:         id,
+		Kind:       core.ActivityMCP,
+		Name:       name,
+		Title:      name,
+		Status:     status,
+		Summary:    summary,
+		ServerName: server,
+		ToolName:   tool,
+	}
+	bus.Publish(event)
+}
+
+func publishSkillActivity(bus *core.Bus, sk skill.Skill, status core.ActivityStatus, summary string) {
+	event := core.NewEvent(core.EventActivityUpdate)
+	event.Activity = &core.ActivityEvent{
+		ID:      "skill:" + sk.Name,
+		Kind:    core.ActivitySkill,
+		Name:    sk.Name,
+		Title:   sk.Name,
+		Status:  status,
+		Summary: firstNonEmpty(summary, sk.Description),
+	}
+	bus.Publish(event)
+}
+
+// combineActiveSkills renders the active skill set (sorted by name) into the
+// system-prompt block injected for a run.
+func combineActiveSkills(active map[string]skill.Skill) string {
+	if len(active) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(active))
+	for name := range active {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	skills := make([]skill.Skill, 0, len(names))
+	for _, name := range names {
+		skills = append(skills, active[name])
+	}
+	return skill.Combine(skills)
 }
 
 func publishContextSnapshot(snapshot core.ContextSnapshot, bus *core.Bus) {
@@ -859,6 +1180,104 @@ func runEval(cfg config.Config, opts cliOptions) error {
 		}
 	}
 
+	return nil
+}
+
+// resolveSession finds the requested session (by id, or the latest).
+func resolveSession(cfg config.Config, sessionID string) (replay.SessionInfo, error) {
+	if sessionID != "" {
+		sessions, err := replay.ListSessions(cfg.Runtime.Workspace)
+		if err != nil {
+			return replay.SessionInfo{}, fmt.Errorf("list sessions: %w", err)
+		}
+		for _, s := range sessions {
+			if s.ID == sessionID {
+				return s, nil
+			}
+		}
+		return replay.SessionInfo{}, fmt.Errorf("session %q not found", sessionID)
+	}
+	target, err := replay.LatestSession(cfg.Runtime.Workspace)
+	if err != nil {
+		return replay.SessionInfo{}, fmt.Errorf("find latest session: %w", err)
+	}
+	return target, nil
+}
+
+// runProvenance prints the evidence-linked provenance timeline for a session,
+// followed by how the Context Map evolved between snapshots (time travel).
+func runProvenance(cfg config.Config, opts cliOptions) error {
+	target, err := resolveSession(cfg, opts.evalSession)
+	if err != nil {
+		return err
+	}
+
+	events, err := replay.ReadFile(target.Path)
+	if err != nil {
+		return fmt.Errorf("read session %s: %w", target.ID, err)
+	}
+
+	timeline := provenance.Build(events)
+	timeline.SessionID = target.ID
+	fmt.Print(provenance.Format(timeline))
+
+	if len(timeline.Snapshots) >= 2 {
+		fmt.Println("\n--- Context evolution (time travel) ---")
+		for i := 1; i < len(timeline.Snapshots); i++ {
+			d := provenance.ContextDiff(timeline.Snapshots[i-1], timeline.Snapshots[i])
+			if len(d.Added) == 0 && len(d.Removed) == 0 && len(d.Changed) == 0 {
+				continue
+			}
+			fmt.Printf("snapshot %d → %d:\n%s", i-1, i, provenance.FormatDiff(d))
+		}
+	}
+	return nil
+}
+
+// runTrust prints the verification ledger for a session: which success claims in
+// the final answer are backed by a successful tool run.
+func runTrust(cfg config.Config, opts cliOptions) error {
+	target, err := resolveSession(cfg, opts.evalSession)
+	if err != nil {
+		return err
+	}
+	events, err := replay.ReadFile(target.Path)
+	if err != nil {
+		return fmt.Errorf("read session %s: %w", target.ID, err)
+	}
+	timeline := provenance.Build(events)
+	answer := ""
+	var actions []trust.Action
+	for _, s := range timeline.Steps {
+		if strings.TrimSpace(s.Assistant) != "" {
+			answer = s.Assistant
+		}
+		for _, run := range s.Tools {
+			actions = append(actions, trust.Action{Tool: run.Name, OK: run.Error == "", ArtifactID: run.ArtifactID})
+		}
+	}
+	fmt.Printf("Trust ledger for session %s:\n%s\n", target.ID, trust.Format(trust.Analyze(answer, actions)))
+	return nil
+}
+
+// runCounterfactual compares a baseline session (-golden-session) against a
+// variant (-candidate-session) and localizes where they diverge.
+func runCounterfactual(cfg config.Config, opts cliOptions) error {
+	baselineID := strings.TrimSpace(opts.goldenSession)
+	variantID := strings.TrimSpace(opts.candidateSession)
+	if baselineID == "" || variantID == "" {
+		return fmt.Errorf("-counterfactual requires -golden-session (baseline) and -candidate-session (variant)")
+	}
+	baseline, err := replay.Read(cfg.Runtime.Workspace, baselineID)
+	if err != nil {
+		return fmt.Errorf("read baseline %q: %w", baselineID, err)
+	}
+	variant, err := replay.Read(cfg.Runtime.Workspace, variantID)
+	if err != nil {
+		return fmt.Errorf("read variant %q: %w", variantID, err)
+	}
+	fmt.Printf("Baseline: %s | Variant: %s\n", baselineID, variantID)
+	fmt.Print(counterfactual.Format(counterfactual.Compare(baseline, variant)))
 	return nil
 }
 

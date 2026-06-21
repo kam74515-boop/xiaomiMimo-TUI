@@ -721,17 +721,11 @@ func TestInputPromptEnterAndCancel(t *testing.T) {
 	m.width = 80
 	m.height = 24
 
-	// Press '/' to enter prompt mode.
-	m = updateModel(t, m, runeKey('/'))
+	// Type a message (any non-slash rune enters prompt mode).
+	m = updateModel(t, m, runeKey('h'))
 	if m.inputMode != InputPrompt {
 		t.Fatalf("inputMode = %d, want InputPrompt", m.inputMode)
 	}
-	if m.textInput != "" {
-		t.Fatalf("textInput = %q, want empty", m.textInput)
-	}
-
-	// Type some text.
-	m = updateModel(t, m, runeKey('h'))
 	m = updateModel(t, m, runeKey('e'))
 	m = updateModel(t, m, runeKey('l'))
 	m = updateModel(t, m, runeKey('l'))
@@ -753,7 +747,6 @@ func TestInputPromptEnterAndCancel(t *testing.T) {
 	}
 
 	// Test cancel: enter prompt mode again, type, Esc.
-	m = updateModel(t, m, runeKey('/'))
 	m = updateModel(t, m, runeKey('w'))
 	m = updateModel(t, m, runeKey('o'))
 	m = updateModel(t, m, runeKey('r'))
@@ -810,7 +803,7 @@ func TestInputPromptEmptySubmit(t *testing.T) {
 	m.width = 80
 	m.height = 24
 
-	m = updateModel(t, m, runeKey('/'))
+	m.inputMode = InputPrompt
 	chatBefore := m.chat
 	// Press Enter with empty text.
 	m = updateModel(t, m, keyMsg(tea.KeyEnter))
@@ -830,8 +823,7 @@ func TestInputPromptPublishesUserPromptEvent(t *testing.T) {
 	m.width = 80
 	m.height = 24
 
-	// Enter prompt mode, type, and submit.
-	m = updateModel(t, m, runeKey('/'))
+	// Type and submit (first rune enters prompt mode).
 	m = updateModel(t, m, runeKey('h'))
 	m = updateModel(t, m, runeKey('i'))
 	m = updateModel(t, m, keyMsg(tea.KeyEnter))
@@ -857,7 +849,6 @@ func TestInputPromptBackspace(t *testing.T) {
 	m.width = 80
 	m.height = 24
 
-	m = updateModel(t, m, runeKey('/'))
 	m = updateModel(t, m, runeKey('a'))
 	m = updateModel(t, m, runeKey('b'))
 	m = updateModel(t, m, runeKey('c'))
@@ -888,7 +879,6 @@ func TestInputPromptCursorMovement(t *testing.T) {
 	m.width = 80
 	m.height = 24
 
-	m = updateModel(t, m, runeKey('/'))
 	m = updateModel(t, m, runeKey('a'))
 	m = updateModel(t, m, runeKey('b'))
 	m = updateModel(t, m, runeKey('c'))
@@ -924,7 +914,6 @@ func TestInputPromptInsertAtCursor(t *testing.T) {
 	m.width = 80
 	m.height = 24
 
-	m = updateModel(t, m, runeKey('/'))
 	m = updateModel(t, m, runeKey('a'))
 	m = updateModel(t, m, runeKey('c'))
 
@@ -947,8 +936,8 @@ func TestNavigationDisabledInInputModes(t *testing.T) {
 	initialFocus := m.focus
 	initialScroll := m.scroll[chatPanel]
 
-	// Enter prompt mode.
-	m = updateModel(t, m, runeKey('/'))
+	// Enter prompt mode (first rune enters input).
+	m = updateModel(t, m, runeKey('a'))
 	if m.inputMode != InputPrompt {
 		t.Fatalf("inputMode = %d, want InputPrompt", m.inputMode)
 	}
@@ -1176,7 +1165,6 @@ func TestRunningStateTransitions(t *testing.T) {
 	}
 
 	// Enter prompt mode, type, and submit: running should become true.
-	m = updateModel(t, m, runeKey('/'))
 	m = updateModel(t, m, runeKey('t'))
 	m = updateModel(t, m, runeKey('e'))
 	m = updateModel(t, m, runeKey('s'))
@@ -1722,7 +1710,7 @@ func TestMockModeShowsWarning(t *testing.T) {
 	// Verify mock mode sets the initial chat warning.
 	events := make(chan core.AgentEvent)
 	close(events)
-	err := Run(events, nil, "test-model", true)
+	err := Run(events, nil, "test-model", true, ".")
 	// Run blocks until program exits, but since the event channel is closed
 	// it should exit quickly. We just verify it doesn't panic.
 	if err != nil {
@@ -1743,16 +1731,13 @@ func TestSlashKeyEntersPromptMode(t *testing.T) {
 	m.width = 80
 	m.height = 24
 
-	// Press '/' to enter prompt mode.
+	// Press '/' to start a slash command; the slash is seeded into the buffer.
 	m = updateModel(t, m, runeKey('/'))
 	if m.inputMode != InputPrompt {
 		t.Fatalf("inputMode = %d, want InputPrompt after /", m.inputMode)
 	}
-	if m.textInput != "" {
-		t.Fatalf("textInput = %q, want empty", m.textInput)
-	}
-	if m.status != "PROMPT> type your message, Enter to submit, Esc to cancel" {
-		t.Fatalf("status = %q, want prompt status", m.status)
+	if m.textInput != "/" {
+		t.Fatalf("textInput = %q, want \"/\"", m.textInput)
 	}
 }
 
@@ -1830,7 +1815,6 @@ func TestPromptQueuedWhileRunning(t *testing.T) {
 	m.running = true
 
 	// Submit prompt while running — should queue, not publish.
-	m = updateModel(t, m, runeKey('/'))
 	m = updateModel(t, m, runeKey('h'))
 	m = updateModel(t, m, runeKey('i'))
 	m = updateModel(t, m, keyMsg(tea.KeyEnter))

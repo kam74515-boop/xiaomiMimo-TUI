@@ -7,16 +7,40 @@ These are documented so users know what to expect and what is planned for future
 
 ## MCP / Sub-Agent Support
 
-**Status:** Design only, not functional.
+**Status:** MCP stdio transport functional; sub-agent execution functional
+(worktree-isolated, no auto-merge).
 
-MCP (Model Context Protocol) and sub-agent orchestration are architected but not
-yet wired into the runtime. The agent loop currently runs tools locally via the
-built-in registry. Remote MCP servers and delegated sub-agents are not available.
+MCP servers configured in `.mimo/mcp.toml` are connected over a newline-delimited
+JSON-RPC stdio transport (initialize / tools/list / tools/call); their tools are
+registered as `mcp__<server>__<tool>`, approval-gated, and shown in the activity
+dashboard. Only local stdio servers are supported — remote HTTP/SSE transports
+are not yet implemented.
 
-**Impact:** Cannot connect to external tool servers or spawn sub-agents for
-parallel task execution.
+Sub-agent delegation is wired: the `subagent` tool spawns a sub-agent that runs
+in an isolated git worktree, with progress published to the activity dashboard
+and its changes returned as a reviewable diff (artifact-backed). The sub-agent is
+sandboxed — it may read and write files in its worktree but shell and destructive
+tools are denied, it cannot delegate further (no nested sub-agents), and nothing
+is merged into the parent tree automatically. Requires the workspace to be a git
+repository; otherwise the tool stays an inert placeholder.
 
-**Planned:** After the local tool loop is stable and proven in real coding sessions.
+**Impact:** Can use local stdio MCP servers and delegate worktree-isolated
+sub-tasks. Cannot use remote (HTTP/SSE) MCP servers; sub-agents cannot run shell
+tools and their changes are not auto-merged (by design — the parent reviews the
+diff and merges deliberately).
+
+**Planned:** Remote MCP transports; optional shell access and merge assistance
+for sub-agents once the isolated path is proven in real sessions.
+
+**Configure** (`.mimo/mcp.toml`):
+
+```toml
+[[servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+enabled = true
+```
 
 ---
 
