@@ -11,13 +11,23 @@ import (
 // between the MCP protocol and MiMo-TUI's tool system. In the MVP, the tool
 // is a stub that returns a placeholder result. The real implementation will
 // connect to the MCP server process via stdio JSON-RPC.
+// MCPCaller invokes a tool on a connected MCP server. *mcp.Client satisfies it.
+type MCPCaller interface {
+	CallTool(ctx context.Context, name string, args map[string]any) (string, error)
+}
+
 type ExternalTool struct {
 	baseTool
 	serverName  string
 	toolName    string
 	toolSchema  core.JSONSchema
 	description string
+	caller      MCPCaller
 }
+
+// SetCaller connects this tool to a live MCP server. Once set, Run dispatches
+// real tools/call requests instead of returning the placeholder.
+func (t *ExternalTool) SetCaller(c MCPCaller) { t.caller = c }
 
 // NewExternalTool creates an ExternalTool for a tool exposed by an MCP server.
 // The tool is registered under the name "mcp__<serverName>__<toolName>" to
@@ -48,10 +58,10 @@ func (t *ExternalTool) ToolName() string {
 	return t.toolName
 }
 
-// Stubbed reports whether this ExternalTool is still using the local MVP stub
+// Stubbed reports whether this ExternalTool is still using the local placeholder
 // instead of a live MCP connection.
 func (t *ExternalTool) Stubbed() bool {
-	return true
+	return t.caller == nil
 }
 
 // Schema returns the JSON schema for this tool. If the MCP server provided a
@@ -85,10 +95,17 @@ func (t *ExternalTool) Permission(input core.ToolInput) core.PermissionRequest {
 //  2. Send a tools/call request via JSON-RPC over stdio
 //  3. Parse the response and convert it to a ToolResult
 func (t *ExternalTool) Run(ctx context.Context, input core.ToolInput) core.ToolResult {
-	return core.ToolResult{
-		Content:  fmt.Sprintf("MCP tool %q from server %q is configured but not yet connected", t.toolName, t.serverName),
-		ExitCode: 0,
+	if t.caller == nil {
+		return core.ToolResult{
+			Content:  fmt.Sprintf("MCP tool %q from server %q is configured but not yet connected", t.toolName, t.serverName),
+			ExitCode: 0,
+		}
 	}
+	out, err := t.caller.CallTool(ctx, t.toolName, map[string]any(input))
+	if err != nil {
+		return core.ToolResult{Content: out, ExitCode: 1, Error: err.Error()}
+	}
+	return core.ToolResult{Content: out}
 }
 
 // Summarize converts the tool result into an observation for the context window.

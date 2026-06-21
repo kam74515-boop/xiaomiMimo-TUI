@@ -75,6 +75,27 @@ type LoopConfig struct {
 	MaxSteps     int
 	StepTimeout  time.Duration
 	TotalTimeout time.Duration
+
+	// Memory, when non-empty, is injected into the system prompt every turn so
+	// persistent cross-session facts influence the model. It is supplied by the
+	// runtime, which owns the memory store.
+	Memory string
+
+	// Skills, when non-empty, is the combined body of active skill playbooks,
+	// injected into the system prompt so the model follows them. Supplied by the
+	// runtime, which owns the active-skill set.
+	Skills string
+
+	// GoalCondition, when non-empty together with Judge, enables the goal gate:
+	// at the point the model would produce a final answer, the judge verifies
+	// the condition is met before the loop is allowed to stop.
+	GoalCondition string
+	// Judge independently evaluates GoalCondition. Optional; the gate is a no-op
+	// when nil.
+	Judge Judge
+	// MaxGoalReact bounds goal-gate re-entries per prompt. Zero means
+	// DefaultMaxGoalReact.
+	MaxGoalReact int
 }
 
 func DefaultLoopConfig() LoopConfig {
@@ -88,6 +109,7 @@ func DefaultLoopConfig() LoopConfig {
 		MaxSteps:     maxSteps,
 		StepTimeout:  120 * time.Second,
 		TotalTimeout: 600 * time.Second,
+		MaxGoalReact: DefaultMaxGoalReact,
 	}
 }
 
@@ -158,6 +180,13 @@ func Loop(
 	}
 	messages = append(messages, BuildUserMessage(prompt))
 
+	maxGoalReact := config.MaxGoalReact
+	if maxGoalReact <= 0 {
+		maxGoalReact = DefaultMaxGoalReact
+	}
+	goalActive := strings.TrimSpace(config.GoalCondition) != "" && config.Judge != nil
+	reactCount := 0
+
 	for step := 0; step < config.MaxSteps; step++ {
 		select {
 		case <-totalCtx.Done():
@@ -177,8 +206,10 @@ func Loop(
 		}
 		publishTrace(bus, stepTrace)
 
-		// Inject context-map summary so the model knows what evidence is loaded.
-		messages[0].Content = BuildSystemPrompt() + "\n\n" + buildContextSummary(ctxMgr.Snapshot())
+		// Inject memory, active skills, and the context-map summary so the model
+		// knows the persistent facts, the playbooks to follow, and what evidence
+		// is loaded.
+		messages[0].Content = buildSystemContext(config.Memory, config.Skills) + "\n\n" + buildContextSummary(ctxMgr.Snapshot())
 
 		stepCtx, stepCancel := context.WithTimeout(totalCtx, config.StepTimeout)
 
@@ -255,6 +286,70 @@ func Loop(
 				Role:    "assistant",
 				Content: assistantContent,
 			})
+
+			// Goal gate: before allowing the loop to stop, let an independent
+			// judge verify the active goal is genuinely satisfied. If not, inject
+			// a synthetic user turn with the judge's diagnosis and re-enter.
+			if goalActive {
+				verdict, jerr := config.Judge.Evaluate(totalCtx, config.GoalCondition, messages)
+				// If the run was cancelled or timed out during the judge call,
+				// report it as such rather than masking it as a fail-open stop.
+				if cerr := totalCtx.Err(); cerr != nil {
+					stepTrace.Status = core.TraceFailed
+					stepTrace.EndedAt = time.Now()
+					stepTrace.Observation = "Run ended during goal evaluation."
+					publishTrace(bus, stepTrace)
+					publishError(bus, cerr)
+					publishDone(bus)
+					return messages, cerr
+				}
+				if jerr == nil && !verdict.OK && !verdict.Impossible {
+					if reactCount < maxGoalReact {
+						reactCount++
+						publishGoalUpdate(bus, core.GoalUpdate{
+							Condition:  config.GoalCondition,
+							Active:     true,
+							Reason:     verdict.Reason,
+							ReactCount: reactCount,
+						})
+						publishNote(bus, fmt.Sprintf("goal not yet satisfied (re-entry %d/%d): %s", reactCount, maxGoalReact, verdict.Reason))
+						messages = append(messages, core.Message{
+							Role:    "user",
+							Content: goalReminderMessage(config.GoalCondition, verdict.Reason),
+						})
+						stepTrace.Status = core.TraceDone
+						stepTrace.EndedAt = time.Now()
+						stepTrace.Observation = "Goal not yet satisfied; judge requested another attempt."
+						stepTrace.Revision = verdict.Reason
+						publishTrace(bus, stepTrace)
+						continue
+					}
+					// Re-entry cap reached: stop and report that we gave up.
+					publishGoalUpdate(bus, core.GoalUpdate{
+						Condition:  config.GoalCondition,
+						Active:     false,
+						Reason:     fmt.Sprintf("stopped after %d re-entries without meeting the goal", reactCount),
+						ReactCount: reactCount,
+					})
+					publishNote(bus, fmt.Sprintf("goal gate gave up after %d re-entries", reactCount))
+				} else {
+					// Satisfied, impossible, or a judge error (fail-open): clear
+					// the goal so it does not re-gate the next prompt.
+					update := core.GoalUpdate{
+						Condition:  config.GoalCondition,
+						Active:     false,
+						Satisfied:  jerr == nil && verdict.OK,
+						Impossible: jerr == nil && verdict.Impossible,
+						Reason:     verdict.Reason,
+						ReactCount: reactCount,
+					}
+					if jerr != nil {
+						update.Reason = "judge unavailable; allowing stop (fail-open): " + jerr.Error()
+					}
+					publishGoalUpdate(bus, update)
+				}
+			}
+
 			stepTrace.Status = core.TraceDone
 			stepTrace.EndedAt = time.Now()
 			stepTrace.Observation = "Model produced final answer without tool calls."
@@ -343,8 +438,17 @@ func Loop(
 		publishTrace(bus, stepTrace)
 	}
 
-	// Max steps reached.
+	// Max steps reached. If a goal was active, close it out so it does not
+	// silently re-gate the next prompt and so the truncation is visible.
 	err := fmt.Errorf("agent loop reached max steps limit (%d)", config.MaxSteps)
+	if goalActive {
+		publishGoalUpdate(bus, core.GoalUpdate{
+			Condition:  config.GoalCondition,
+			Active:     false,
+			Reason:     fmt.Sprintf("stopped: reached max steps (%d) before the goal was satisfied", config.MaxSteps),
+			ReactCount: reactCount,
+		})
+	}
 	publishError(bus, err)
 	publishDone(bus)
 	return messages, err
@@ -451,6 +555,23 @@ func RunOnce(ctx context.Context, prompt string, client core.ModelClient, bus *c
 	}
 }
 
+// buildSystemContext appends persistent memory and active skill playbooks to
+// the base system prompt so the model reads recorded cross-session facts and
+// follows activated procedures every turn.
+func buildSystemContext(memory, skills string) string {
+	b := strings.Builder{}
+	b.WriteString(BuildSystemPrompt())
+	if memory = strings.TrimSpace(memory); memory != "" {
+		b.WriteString("\n\n[Persistent Memory — durable facts recorded across sessions; trust and apply these]\n")
+		b.WriteString(memory)
+	}
+	if skills = strings.TrimSpace(skills); skills != "" {
+		b.WriteString("\n\n[Active Skills — follow these playbooks for this session]\n")
+		b.WriteString(skills)
+	}
+	return b.String()
+}
+
 func buildContextSummary(snapshot core.ContextSnapshot) string {
 	var b strings.Builder
 	b.WriteString("[Context Map Summary]\n")
@@ -543,6 +664,26 @@ func publishError(bus *core.Bus, err error) {
 
 func publishDone(bus *core.Bus) {
 	bus.Publish(core.NewEvent(core.EventDone))
+}
+
+func publishGoalUpdate(bus *core.Bus, update core.GoalUpdate) {
+	if bus == nil {
+		return
+	}
+	event := core.NewEvent(core.EventGoalUpdate)
+	g := update
+	event.Goal = &g
+	switch {
+	case g.Satisfied:
+		event.Message = "goal satisfied: " + g.Condition
+	case g.Impossible:
+		event.Message = "goal judged impossible: " + g.Condition
+	case g.Active:
+		event.Message = "goal pending: " + g.Condition
+	default:
+		event.Message = "goal closed: " + g.Condition
+	}
+	bus.Publish(event)
 }
 
 func publishContext(bus *core.Bus, snapshot core.ContextSnapshot) {
