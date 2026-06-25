@@ -47,3 +47,38 @@ func TestWriteFileConfinedToWorkspace(t *testing.T) {
 		t.Fatalf("nested in-workspace write should succeed: %+v", res)
 	}
 }
+
+func TestReadToolsConfinedToWorkspace(t *testing.T) {
+	ws := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "in.txt"), []byte("inside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("TOPSECRET"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := artifact.NewStore(ws)
+
+	read := NewReadFileTool(ws, store, nil)
+	// In-workspace read works.
+	if res := read.Run(context.Background(), core.ToolInput{"path": "in.txt"}); res.Error != "" {
+		t.Fatalf("in-workspace read should succeed: %+v", res)
+	}
+	// Absolute out-of-workspace read is rejected (no host-file exfiltration).
+	if res := read.Run(context.Background(), core.ToolInput{"path": secret}); res.Error == "" {
+		t.Fatalf("read_file should reject out-of-workspace absolute path: %+v", res)
+	}
+	// .. traversal rejected.
+	if res := read.Run(context.Background(), core.ToolInput{"path": "../" + filepath.Base(outside) + "/secret.txt"}); res.Error == "" {
+		t.Fatal("read_file should reject ../ traversal")
+	}
+
+	list := NewListDirTool(ws, store, nil)
+	if res := list.Run(context.Background(), core.ToolInput{"path": "."}); res.Error != "" {
+		t.Fatalf("in-workspace list should succeed: %+v", res)
+	}
+	if res := list.Run(context.Background(), core.ToolInput{"path": outside}); res.Error == "" {
+		t.Fatal("list_dir should reject an out-of-workspace absolute path")
+	}
+}

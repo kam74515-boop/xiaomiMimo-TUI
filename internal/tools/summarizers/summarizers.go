@@ -894,8 +894,8 @@ func artifactReadSummary(result core.ToolResult, budget tools.BudgetLevel) strin
 		maxChars = 1000
 	}
 
-	if len(content) <= maxChars {
-		return content
+	if r := []rune(content); len(r) > maxChars {
+		return string(r[:maxChars]) + "..."
 	}
-	return content[:maxChars] + "..."
+	return content
 }

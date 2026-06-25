@@ -283,13 +283,16 @@ func (m *Manager) snapshotLocked() core.ContextSnapshot {
 	items := m.activeItemsLocked()
 	totals := totalsFor(m.windowTokens, items)
 
-	// Collect active compression records (those whose artifact is still in the map).
+	// Collect active compression records (those whose artifact is still in the
+	// map), sorted by ID for deterministic snapshots (IDs are "compressed:<ns>",
+	// so this is chronological and avoids map-iteration flicker in the UI).
 	records := make([]core.CompressionRecord, 0, len(m.compressionRecords))
 	for id, record := range m.compressionRecords {
 		if _, ok := m.items[id]; ok {
 			records = append(records, record)
 		}
 	}
+	sort.Slice(records, func(i, j int) bool { return records[i].ID < records[j].ID })
 
 	return core.ContextSnapshot{
 		WindowTokens:       m.windowTokens,
@@ -446,7 +449,13 @@ func (m *Manager) AutoBudget() AutoBudgetResult {
 		if m.windowTokens > 0 {
 			pct = (totals.UsedTokens) * 100 / m.windowTokens
 		}
-		result.Warning = formatBudgetWarning(pct, len(result.Evicted))
+		if len(result.Evicted) == 0 {
+			// Over capacity but nothing is evictable (all pinned/Anchor): the
+			// model context is genuinely over budget — surface it loudly.
+			result.Warning = fmt.Sprintf("context over window (%d%%) and nothing is evictable; unpin or compress items", pct)
+		} else {
+			result.Warning = formatBudgetWarning(pct, len(result.Evicted))
+		}
 	} else if risk == PollutionWarning {
 		pct := 0
 		if m.windowTokens > 0 {

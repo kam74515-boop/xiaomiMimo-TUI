@@ -3,6 +3,7 @@ package tui
 import (
 	"bytes"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -108,6 +109,8 @@ type Model struct {
 
 	cursorState *terminalCursorState
 
+	wrapCache *transcriptWrapCache
+
 	inputMode       InputMode
 	textInput       string
 	cursorPos       int
@@ -115,6 +118,7 @@ type Model struct {
 
 	approvalCountdown    int
 	approvalCountdownMax int
+	countdownTicking     bool
 
 	promptQueue []string
 
@@ -224,7 +228,17 @@ func NewModel(events <-chan core.AgentEvent, bus *core.Bus) Model {
 		activityIndex:       make(map[string]int),
 		status:              "waiting for agent events",
 		chatAutoScroll:      true,
+		wrapCache:           &transcriptWrapCache{},
 	}
+}
+
+// transcriptWrapCache memoizes the wrapped transcript lines. It is held by
+// pointer so it is shared across Bubble Tea's value-copies of Model.
+type transcriptWrapCache struct {
+	key   uint64
+	width int
+	lines []string
+	valid bool
 }
 
 func Run(events <-chan core.AgentEvent, bus *core.Bus, modelName string, mockMode bool, workspace string) error {
@@ -495,15 +509,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentEventMsg:
 		m.applyEvent(core.AgentEvent(msg))
+		m.capState()
 		m.clampAllScrolls()
 		cmds := []tea.Cmd{waitForEvent(m.events)}
-		if m.approvalCountdown > 0 {
+		// Arm exactly one countdown tick loop on entry into approval mode. Without
+		// the guard, every incoming event would start another loop and the
+		// countdown would drain N× too fast (auto-denying early).
+		if m.inputMode == InputApprove && m.approvalCountdown > 0 && !m.countdownTicking {
+			m.countdownTicking = true
 			cmds = append(cmds, approvalTick())
 		}
 		return m, tea.Batch(cmds...)
 
 	case tickMsg:
 		if m.inputMode != InputApprove || m.approvalCountdown <= 0 {
+			m.countdownTicking = false
 			return m, nil
 		}
 		m.approvalCountdown--
@@ -516,6 +536,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.inputMode = InputNone
 			m.pendingApproval = core.ApprovalRequest{}
+			m.countdownTicking = false
 			m.status = "approval timed out (auto-denied)"
 			return m, nil
 		}
@@ -1011,6 +1032,9 @@ func (m Model) finishApproval(allowed bool, reason, status string) Model {
 	m.pendingApproval = core.ApprovalRequest{}
 	m.textInput = ""
 	m.cursorPos = 0
+	m.approvalCountdown = 0
+	m.approvalCountdownMax = 0
+	m.countdownTicking = false
 	m.status = status
 	return m
 }
@@ -1472,6 +1496,8 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 			m.cursorPos = 0
 			m.approvalCountdown = timeoutSeconds
 			m.approvalCountdownMax = timeoutSeconds
+			// Let the agentEventMsg handler arm a single tick loop.
+			m.countdownTicking = false
 			m.status = fmt.Sprintf("approval required for %s: type y/n then Enter (%ds)", event.Approval.ToolCall.Name, timeoutSeconds)
 		}
 	default:
@@ -1479,6 +1505,28 @@ func (m *Model) applyEvent(event core.AgentEvent) {
 			m.notes = append(m.notes, event.Message)
 		}
 		m.status = "received " + string(event.Type)
+	}
+}
+
+// capState bounds the memory that grows fastest over a long session: the chat
+// transcript (per streamed token) and the notes list (per observation). Oldest
+// content is trimmed with a marker. Index-mapped slices (trace/tools/activities)
+// grow far slower and are left intact to avoid desyncing their index maps.
+func (m *Model) capState() {
+	const maxChatBytes = 256 * 1024
+	const maxNotes = 500
+	if len(m.chat) > maxChatBytes {
+		cut := len(m.chat) - maxChatBytes
+		if idx := strings.IndexByte(m.chat[cut:], '\n'); idx >= 0 {
+			cut += idx + 1
+		}
+		m.chat = "…[older transcript trimmed]\n" + m.chat[cut:]
+		if m.chatAutoScroll {
+			m.scroll[chatPanel] = m.maxPanelScroll(chatPanel)
+		}
+	}
+	if len(m.notes) > maxNotes {
+		m.notes = append([]string(nil), m.notes[len(m.notes)-maxNotes:]...)
 	}
 }
 
@@ -2068,7 +2116,43 @@ func (m Model) panelContent(panel focusPanel) string {
 	}
 }
 
+// transcriptLines returns the styled, wrapped transcript lines, served from a
+// shared-pointer cache when neither the content, width, nor (while streaming)
+// the animation frame has changed. The cache survives Bubble Tea's value-copy of
+// Model because it is a pointer, and the key encodes every input to the wrap, so
+// a cache hit is provably identical to a fresh compute. This eliminates the full
+// re-wrap on every idle pulse (120ms) and collapses streaming to one wrap per
+// frame instead of one per measure+render call.
 func (m Model) transcriptLines(width int) []string {
+	key := m.wrapKey()
+	if c := m.wrapCache; c != nil && c.valid && c.width == width && c.key == key {
+		return c.lines
+	}
+	lines := m.transcriptLinesUncached(width)
+	if c := m.wrapCache; c != nil {
+		c.key = key
+		c.width = width
+		c.lines = lines
+		c.valid = true
+	}
+	return lines
+}
+
+// wrapKey is a content-identity key for the transcript wrap. loadingFrame only
+// affects the wrap while streaming (live header/body styling), so it is folded
+// in only then — keeping idle redraws cache-stable.
+func (m Model) wrapKey() uint64 {
+	h := fnv.New64a()
+	io.WriteString(h, m.chat)
+	k := h.Sum64()
+	if m.assistantStreaming {
+		k ^= 0x9e3779b97f4a7c15
+		k += uint64(m.loadingFrame) * 0x100000001b3
+	}
+	return k
+}
+
+func (m Model) transcriptLinesUncached(width int) []string {
 	content := strings.TrimRight(m.chat, "\n")
 	if content == "" {
 		return wrapText("waiting for message_delta events", width)
@@ -3157,13 +3241,16 @@ func splitLongWord(word string, width int) []string {
 	width = maxInt(width, 1)
 	var chunks []string
 	var b strings.Builder
+	cur := 0 // accumulated display width of b, computed incrementally (O(n))
 	for _, r := range word {
-		next := b.String() + string(r)
-		if lipgloss.Width(next) > width && b.Len() > 0 {
+		w := runewidth.RuneWidth(r)
+		if cur+w > width && b.Len() > 0 {
 			chunks = append(chunks, b.String())
 			b.Reset()
+			cur = 0
 		}
 		b.WriteRune(r)
+		cur += w
 	}
 	if b.Len() > 0 {
 		chunks = append(chunks, b.String())

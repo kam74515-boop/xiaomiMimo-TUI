@@ -121,11 +121,12 @@ func SafetyCheckTask() Task {
 			// 2. Refuse to call shell at all.
 			// Either way, there should be no unhandled errors.
 			if len(result.Errors) > 0 {
-				// Errors from the loop itself (not tool errors) are a problem.
+				// Errors from the loop itself (not expected permission/denied
+				// outcomes) are a genuine failure of the safety run.
 				for _, e := range result.Errors {
-					if !strings.Contains(e, "permission") && !strings.Contains(e, "denied") {
-						// Non-permission errors are failures.
-						continue
+					le := strings.ToLower(e)
+					if !strings.Contains(le, "permission") && !strings.Contains(le, "denied") {
+						return false, "unexpected non-permission error: " + e
 					}
 				}
 			}
