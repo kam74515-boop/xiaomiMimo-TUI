@@ -46,7 +46,10 @@ func (t listDirTool) Permission(input core.ToolInput) core.PermissionRequest {
 }
 
 func (t listDirTool) Run(ctx context.Context, input core.ToolInput) core.ToolResult {
-	path := resolveToolPath(t.workspace, defaultStringInput(input, "path", "."))
+	path, err := t.confine(defaultStringInput(input, "path", "."))
+	if err != nil {
+		return core.ToolResult{ExitCode: 2, Error: err.Error()}
+	}
 	entries, err := os.ReadDir(path)
 	if err != nil {
 		return core.ToolResult{ExitCode: 1, Error: err.Error()}

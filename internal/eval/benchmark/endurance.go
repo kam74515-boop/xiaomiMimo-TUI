@@ -126,8 +126,10 @@ func RunEndurance(client core.ModelClient, workspace string, cfg EnduranceConfig
 			history,
 		)
 
-		// Wait for events from this prompt.
+		// Wait for events from this prompt, then unsubscribe so the shared bus
+		// does not accumulate a subscriber/buffer per prompt.
 		events := <-promptEvents
+		bus.Unsubscribe(eventCh)
 		allEvents = append(allEvents, events...)
 		result.EventCount += len(events)
 

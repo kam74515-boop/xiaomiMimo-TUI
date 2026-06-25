@@ -1116,7 +1116,7 @@ func runGateAccept(cfg config.Config, opts cliOptions, registry *model.Registry)
 	fmt.Printf("Model %q promoted to default channel.\n", modelID)
 
 	// Persist the updated registry to project-level .mimo/models.toml.
-	if err := config.SaveModelsConfig(registry); err != nil {
+	if err := config.SaveModelsConfig(registry, cfg.Runtime.Workspace); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to persist model registry: %v\n", err)
 	} else {
 		fmt.Println("Model registry saved to .mimo/models.toml")

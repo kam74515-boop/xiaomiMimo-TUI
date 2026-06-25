@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"mimo-tui/internal/artifact"
 	"mimo-tui/internal/core"
@@ -42,15 +43,11 @@ func (t baseTool) path(input core.ToolInput) (string, error) {
 	return filepath.Join(t.workspace, path), nil
 }
 
-// confinedPath resolves the input path and rejects anything that escapes the
-// workspace (absolute paths or ".." traversal). Workspace-mutating tools use
-// this so a sub-agent's worktree provides real filesystem isolation, not just
-// git-level isolation.
-func (t baseTool) confinedPath(input core.ToolInput) (string, error) {
-	raw := strings.TrimSpace(stringInput(input, "path"))
-	if raw == "" {
-		return "", fmt.Errorf("path is required")
-	}
+// confine resolves raw against the workspace and rejects anything that escapes
+// it (absolute paths or ".." traversal). Both read and write tools use this so a
+// sub-agent's worktree provides real filesystem isolation, not just git-level
+// isolation, and so the agent cannot read arbitrary host files into context.
+func (t baseTool) confine(raw string) (string, error) {
 	ws := t.workspace
 	if ws == "" {
 		ws = "."
@@ -69,6 +66,15 @@ func (t baseTool) confinedPath(input core.ToolInput) (string, error) {
 		return "", fmt.Errorf("path %q escapes the workspace", raw)
 	}
 	return target, nil
+}
+
+// confinedPath confines the input "path" (required) to the workspace.
+func (t baseTool) confinedPath(input core.ToolInput) (string, error) {
+	raw := strings.TrimSpace(stringInput(input, "path"))
+	if raw == "" {
+		return "", fmt.Errorf("path is required")
+	}
+	return t.confine(raw)
 }
 
 func (t baseTool) writeArtifact(req artifact.WriteRequest) (string, error) {
@@ -134,10 +140,15 @@ func (t shellTool) SummarizeWithBudget(result core.ToolResult, budget BudgetLeve
 func (t shellTool) runCommand(ctx context.Context, toolName, command string, args []string, input core.ToolInput) core.ToolResult {
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Dir = t.workspace
+	// Run the command in its own process group so that, on cancellation, we can
+	// kill the whole group — otherwise a backgrounded grandchild that inherited
+	// the stdout pipe keeps Wait blocked past the deadline, making the agent
+	// un-interruptible.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err := cmd.Run()
+	err := runWithGroupKill(ctx, cmd)
 	exitCode := exitCode(err)
 
 	// Redact secrets from output before storing as artifact.
@@ -205,7 +216,11 @@ func (t rgTool) Run(ctx context.Context, input core.ToolInput) core.ToolResult {
 	}
 	args := []string{"rg", "--line-number", "--color", "never", pattern}
 	if path := strings.TrimSpace(stringInput(input, "path")); path != "" {
-		args = append(args, path)
+		confined, err := t.confine(path)
+		if err != nil {
+			return core.ToolResult{ExitCode: 2, Error: err.Error()}
+		}
+		args = append(args, confined)
 	}
 
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
@@ -271,7 +286,7 @@ func (t readFileTool) Permission(input core.ToolInput) core.PermissionRequest {
 }
 
 func (t readFileTool) Run(ctx context.Context, input core.ToolInput) core.ToolResult {
-	path, err := t.path(input)
+	path, err := t.confinedPath(input)
 	if err != nil {
 		return core.ToolResult{ExitCode: 2, Error: err.Error()}
 	}
@@ -348,7 +363,7 @@ func (t writeFileTool) Run(ctx context.Context, input core.ToolInput) core.ToolR
 		Kind:     "content",
 		ExitCode: 0,
 		Inputs:   redactInput(input),
-		Payloads: []artifact.Payload{{Name: "content.txt", Data: []byte(content)}},
+		Payloads: []artifact.Payload{{Name: "content.txt", Data: redactSecrets([]byte(content))}},
 	})
 	if artifactErr != nil {
 		return core.ToolResult{ExitCode: 1, Error: artifactErr.Error()}
@@ -414,7 +429,7 @@ func (t applyPatchTool) Run(ctx context.Context, input core.ToolInput) core.Tool
 		ExitCode: code,
 		Inputs:   map[string]any{"patch_bytes": len(patch)},
 		Payloads: []artifact.Payload{
-			{Name: "patch.diff", Data: []byte(patch)},
+			{Name: "patch.diff", Data: redactSecrets([]byte(patch))},
 			{Name: "stdout.txt", Data: stdout.Bytes()},
 			{Name: "stderr.txt", Data: stderr.Bytes()},
 		},
@@ -542,6 +557,28 @@ func (t runTestTool) SummarizeWithBudget(result core.ToolResult, budget BudgetLe
 		return t.summarizer.Summarize(result, budget)
 	}
 	return summarizeResult("run_test", result, core.TierArtifact)
+}
+
+// runWithGroupKill starts cmd and waits for it, killing the entire process
+// group on context cancellation so an inherited-fd grandchild cannot keep Wait
+// blocked. cmd must have SysProcAttr.Setpgid set.
+func runWithGroupKill(ctx context.Context, cmd *exec.Cmd) error {
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			if cmd.Process != nil {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // negative pid => kill the group
+			}
+		case <-done:
+		}
+	}()
+	err := cmd.Wait()
+	close(done)
+	return err
 }
 
 func newBase(name, workspace string, store *artifact.Store, s Summarizer) baseTool {

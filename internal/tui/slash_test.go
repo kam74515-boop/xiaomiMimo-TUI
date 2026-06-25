@@ -234,6 +234,93 @@ func TestSlashSkillUnknown(t *testing.T) {
 	}
 }
 
+func TestTranscriptWrapCacheMatchesFresh(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.chat = "MIMO\n  hello world this is a deliberately long assistant line that must wrap\n\n■ a user prompt here\n\nTOOL shell [done]\n  ran something\n"
+
+	// For any (width, streaming, frame), the cached result must equal a fresh
+	// compute — the cache must never return stale/wrong output.
+	for _, w := range []int{20, 40, 80} {
+		for _, streaming := range []bool{false, true} {
+			for _, frame := range []int{0, 1, 5} {
+				m.assistantStreaming = streaming
+				m.loadingFrame = frame
+				fresh := m.transcriptLinesUncached(w)
+				got := m.transcriptLines(w) // may hit or miss; must match fresh
+				if strings.Join(got, "\n") != strings.Join(fresh, "\n") {
+					t.Fatalf("cache mismatch at width=%d streaming=%v frame=%d", w, streaming, frame)
+				}
+			}
+		}
+	}
+
+	// Content change must invalidate.
+	m.assistantStreaming = false
+	before := m.transcriptLines(40)
+	m.chat += "\nMIMO\n  a brand new answer block\n"
+	after := m.transcriptLines(40)
+	if strings.Join(before, "\n") == strings.Join(after, "\n") {
+		t.Fatal("cache not invalidated after content change")
+	}
+	if strings.Join(after, "\n") != strings.Join(m.transcriptLinesUncached(40), "\n") {
+		t.Fatal("post-change cache does not match fresh compute")
+	}
+}
+
+func TestTranscriptWrapCacheStableWhenIdle(t *testing.T) {
+	// When NOT streaming, the animation frame must not affect the wrap, so idle
+	// pulses hit the cache (the key omits loadingFrame).
+	m := NewModel(nil, nil)
+	m.chat = "MIMO\n  some completed answer\n"
+	m.assistantStreaming = false
+	a := m.transcriptLines(40)
+	m.loadingFrame += 7
+	b := m.transcriptLines(40)
+	if strings.Join(a, "\n") != strings.Join(b, "\n") {
+		t.Fatal("idle frame change should not change the wrapped transcript")
+	}
+}
+
+func TestApprovalCountdownSingleTickLoop(t *testing.T) {
+	m := NewModel(nil, nil)
+	m.width, m.height = 80, 24
+
+	req := core.ApprovalRequest{ToolCall: core.ToolCall{Name: "shell"}, TimeoutSeconds: 8, Response: make(chan core.ApprovalDecision, 1)}
+	m = updateModel(t, m, agentEventMsg(core.AgentEvent{Type: core.EventApprovalNeeded, Approval: &req}))
+	if m.inputMode != InputApprove || m.approvalCountdown != 8 {
+		t.Fatalf("approval not entered: mode=%d countdown=%d", m.inputMode, m.approvalCountdown)
+	}
+	if !m.countdownTicking {
+		t.Fatal("entering approval should arm exactly one tick loop")
+	}
+
+	// Other events during the wait must NOT re-arm or drain the countdown.
+	for i := 0; i < 3; i++ {
+		m = updateModel(t, m, agentEventMsg(core.AgentEvent{
+			Type:     core.EventActivityUpdate,
+			Activity: &core.ActivityEvent{ID: "a1", Kind: core.ActivityTool, Name: "x", Status: core.ActivityRunning},
+		}))
+	}
+	if m.approvalCountdown != 8 {
+		t.Fatalf("countdown drained by non-tick events: %d (concurrent tick loops)", m.approvalCountdown)
+	}
+	if !m.countdownTicking {
+		t.Fatal("should still have its single tick loop")
+	}
+
+	// A single tick decrements by exactly one.
+	m = updateModel(t, m, tickMsg{})
+	if m.approvalCountdown != 7 {
+		t.Fatalf("one tick should decrement by 1, got %d", m.approvalCountdown)
+	}
+
+	// Answering clears the countdown state so no stray ticks re-arm.
+	m = m.finishApproval(true, "ok", "approved")
+	if m.countdownTicking || m.approvalCountdown != 0 {
+		t.Fatalf("finishApproval should clear countdown state: ticking=%v countdown=%d", m.countdownTicking, m.approvalCountdown)
+	}
+}
+
 func TestSlashTimelineEmptyAndPopulated(t *testing.T) {
 	m := NewModel(nil, nil)
 	m = m.handleSlashCommand("/timeline")

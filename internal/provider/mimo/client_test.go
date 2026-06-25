@@ -954,12 +954,20 @@ func TestMalformedToolArguments(t *testing.T) {
 
 	// Also test accumulated malformed arguments through tool call state.
 	s := toolCallState{id: "x", name: "y", arguments: `{broken}`}
-	tc := s.toolCall()
+	tc := s.toolCall(0)
 	if tc.Input != nil {
 		t.Fatalf("toolCall with malformed accumulated arguments: Input should be nil, got %v", tc.Input)
 	}
 	if tc.Raw != `{broken}` {
 		t.Fatalf("toolCall Raw = %q, want {broken}", tc.Raw)
+	}
+	if tc.ID != "x" {
+		t.Fatalf("toolCall should keep provided id, got %q", tc.ID)
+	}
+
+	// A missing id is synthesized from the index so the history stays valid.
+	if got := (toolCallState{name: "y"}).toolCall(3); got.ID != "call_3" {
+		t.Fatalf("empty id should synthesize call_<index>, got %q", got.ID)
 	}
 
 	// Now test through SSE stream with malformed arguments.

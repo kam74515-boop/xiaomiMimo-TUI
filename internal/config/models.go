@@ -66,10 +66,13 @@ func LoadModelsConfig() (*model.Registry, error) {
 	return r, nil
 }
 
-// SaveModelsConfig persists the given registry to .mimo/models.toml in the
-// current working directory (project-level).
-func SaveModelsConfig(r *model.Registry) error {
-	return r.SaveToFile(filepath.Join(".mimo", "models.toml"))
+// SaveModelsConfig persists the given registry to <workspace>/.mimo/models.toml
+// (project-level). An empty workspace defaults to the current directory.
+func SaveModelsConfig(r *model.Registry, workspace string) error {
+	if workspace == "" {
+		workspace = "."
+	}
+	return r.SaveToFile(filepath.Join(workspace, ".mimo", "models.toml"))
 }
 
 // mergeRegistry applies all entries from src into dst. For each model in src:

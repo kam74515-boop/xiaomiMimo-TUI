@@ -230,7 +230,7 @@ func Loop(
 			return messages, err
 		}
 
-		var assistantContent string
+		var assistantBuf strings.Builder
 		var toolCalls []core.ToolCall
 
 	streamLoop:
@@ -261,7 +261,7 @@ func Loop(
 					return messages, event.Err
 				}
 				if event.Delta != "" {
-					assistantContent += event.Delta
+					assistantBuf.WriteString(event.Delta)
 					publishMessageDelta(bus, event.Delta)
 				}
 				for _, toolCall := range event.ToolCalls {
@@ -284,7 +284,7 @@ func Loop(
 			// continue the conversation across turns.
 			messages = append(messages, core.Message{
 				Role:    "assistant",
-				Content: assistantContent,
+				Content: assistantBuf.String(),
 			})
 
 			// Goal gate: before allowing the loop to stop, let an independent
@@ -361,7 +361,7 @@ func Loop(
 		// Append the assistant message with tool calls to the history.
 		messages = append(messages, core.Message{
 			Role:      "assistant",
-			Content:   assistantContent,
+			Content:   assistantBuf.String(),
 			ToolCalls: toolCalls,
 		})
 

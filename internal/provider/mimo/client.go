@@ -459,15 +459,22 @@ func (a *toolCallAccumulator) complete() []core.ToolCall {
 		if state == nil || strings.TrimSpace(state.name) == "" {
 			continue
 		}
-		out = append(out, state.toolCall())
+		out = append(out, state.toolCall(index))
 	}
 	a.calls = make(map[int]*toolCallState)
 	return out
 }
 
-func (s toolCallState) toolCall() core.ToolCall {
+func (s toolCallState) toolCall(index int) core.ToolCall {
+	id := s.id
+	if strings.TrimSpace(id) == "" {
+		// Synthesize a stable id when the provider omits it, so the assistant
+		// tool_call and its tool result share a matching id on the next turn
+		// (OpenAI-compatible endpoints reject empty/mismatched ids).
+		id = fmt.Sprintf("call_%d", index)
+	}
 	return core.ToolCall{
-		ID:    s.id,
+		ID:    id,
 		Name:  s.name,
 		Input: parseToolInput(s.arguments),
 		Raw:   s.arguments,

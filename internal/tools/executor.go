@@ -190,11 +190,18 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 		}
 	}
 
-	// Capture a rollback snapshot before mutating tools.
+	// Capture a rollback snapshot before mutating tools. If the snapshot fails,
+	// surface it: the mutation proceeds unprotected and the user should know.
 	var rollbackArtifactID string
 	if tool.Safety(call.Input) != core.SafetyReadOnly {
 		if id, err := e.captureRollbackSnapshot(call.Name); err == nil {
 			rollbackArtifactID = id
+		} else if e.bus != nil {
+			e.bus.Publish(core.AgentEvent{
+				Type:        core.EventObservation,
+				Time:        time.Now(),
+				Observation: &core.Observation{Summary: fmt.Sprintf("rollback snapshot unavailable for %s (%v); proceeding without rollback", call.Name, err)},
+			})
 		}
 	}
 

@@ -2,6 +2,7 @@ package context
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -109,6 +110,7 @@ func (m *Manager) ActiveCompressionRecords() []core.CompressionRecord {
 			records = append(records, record)
 		}
 	}
+	sort.Slice(records, func(i, j int) bool { return records[i].ID < records[j].ID })
 	return records
 }
 

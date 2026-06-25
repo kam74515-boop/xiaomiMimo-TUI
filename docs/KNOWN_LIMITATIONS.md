@@ -5,6 +5,27 @@ These are documented so users know what to expect and what is planned for future
 
 ---
 
+## Deferred Performance / Robustness Items
+
+Surfaced by the deep-optimization audit and consciously deferred (with the
+reasoning recorded here) rather than fixed under-verified:
+
+- **TUI transcript re-wrap.** The wrapped transcript is now memoized in a
+  shared-pointer cache keyed by content+width (+animation frame while streaming),
+  so idle pulses no longer re-wrap and a streaming frame wraps once instead of
+  once per measure/render call; the transcript is also capped (~256KB). What
+  remains is `panelSize` re-rendering the header/status/footer/input bar purely
+  to measure their heights on each call — a minor, bounded cost (single-line,
+  width-bounded strings) left as-is to avoid coupling to layout assumptions.
+
+- **Rollback does not capture untracked/staged files.** `captureRollbackSnapshot`
+  uses `git diff` (unstaged tracked changes), so a tool that creates a new file
+  cannot be rolled back by reverse-applying the snapshot. A correct fix changes
+  the rollback model (capture untracked + staged) and was deferred to avoid
+  regressing the existing rollback flow. Snapshot *failures* are now surfaced.
+
+---
+
 ## MCP / Sub-Agent Support
 
 **Status:** MCP stdio transport functional; sub-agent execution functional

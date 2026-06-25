@@ -58,6 +58,59 @@ func SessionPath(workspace, sessionID string) (string, error) {
 	return filepath.Join(workspace, SessionsDir, name), nil
 }
 
+// scanSessionMeta reads only the metadata ListSessions needs (event count and
+// first/last timestamps + last event type) without decoding full event bodies,
+// so listing stays cheap as session logs grow.
+func scanSessionMeta(path string) (count int, started, last time.Time, lastType core.EventType, err error) {
+	f, openErr := os.Open(path)
+	if openErr != nil {
+		return 0, time.Time{}, time.Time{}, "", openErr
+	}
+	defer f.Close()
+
+	type meta struct {
+		Type core.EventType `json:"type"`
+		Time time.Time      `json:"time"`
+	}
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	var lastLine []byte
+	first := true
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		// Detect corruption cheaply (no full event decode) so corrupt logs are
+		// still surfaced with an error, matching the full-decode contract.
+		if !json.Valid(line) {
+			return count, started, last, lastType, fmt.Errorf("replay: malformed JSON line in %s", path)
+		}
+		count++
+		if first {
+			var m meta
+			if json.Unmarshal(line, &m) == nil && !m.Time.IsZero() {
+				started = m.Time
+			}
+			first = false
+		}
+		lastLine = append(lastLine[:0], line...) // keep a copy of the last non-empty line
+	}
+	if err = scanner.Err(); err != nil {
+		return count, started, last, lastType, err
+	}
+	if len(lastLine) > 0 {
+		var m meta
+		if json.Unmarshal(lastLine, &m) == nil {
+			lastType = m.Type
+			if !m.Time.IsZero() {
+				last = m.Time
+			}
+		}
+	}
+	return count, started, last, lastType, nil
+}
+
 func ListSessions(workspace string) ([]SessionInfo, error) {
 	if workspace == "" {
 		workspace = "."
@@ -89,22 +142,16 @@ func ListSessions(workspace string) ([]SessionInfo, error) {
 		}
 		session.Size = fileInfo.Size()
 		session.ModTime = fileInfo.ModTime()
-		events, err := ReadFile(path)
-		if err != nil {
-			session.Err = err
+		count, started, last, lastType, scanErr := scanSessionMeta(path)
+		if scanErr != nil {
+			session.Err = scanErr
 			sessions = append(sessions, session)
 			continue
 		}
-		session.EventCount = len(events)
-		for _, event := range events {
-			if session.StartedAt.IsZero() && !event.Time.IsZero() {
-				session.StartedAt = event.Time
-			}
-			if !event.Time.IsZero() {
-				session.LastEventAt = event.Time
-			}
-			session.LastEventType = event.Type
-		}
+		session.EventCount = count
+		session.StartedAt = started
+		session.LastEventAt = last
+		session.LastEventType = lastType
 		sessions = append(sessions, session)
 	}
 
