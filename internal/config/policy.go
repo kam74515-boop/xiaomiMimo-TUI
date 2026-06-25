@@ -14,11 +14,37 @@ import (
 
 // PolicyConfig mirrors the .mimo/policy.toml structure.
 type PolicyConfig struct {
-	Defaults        Defaults      `toml:"defaults"`
-	Allowlist       []PolicyEntry `toml:"allowlist"`
-	Denylist        []PolicyEntry `toml:"denylist"`
-	RequireConfirm  []PolicyEntry `toml:"require_confirm"`
-	ApprovalTimeout int           `toml:"approval_timeout"` // seconds; 0 means default 30s
+	Defaults         Defaults      `toml:"defaults"`
+	Allowlist        []PolicyEntry `toml:"allowlist"`
+	Denylist         []PolicyEntry `toml:"denylist"`
+	RequireConfirm   []PolicyEntry `toml:"require_confirm"`
+	ApprovalTimeout  int           `toml:"approval_timeout"`  // seconds; 0 means default 30s
+	ApprovalTimeouts GradeTimeouts `toml:"approval_timeouts"` // per-safety-grade overrides (seconds)
+}
+
+// GradeTimeouts holds per-safety-grade approval timeouts in seconds (0 = unset:
+// falls back to the global approval_timeout, then the built-in default).
+type GradeTimeouts struct {
+	ReadOnly          int `toml:"read_only"`
+	WorkspaceMutation int `toml:"workspace_mutation"`
+	ShellMutation     int `toml:"shell_mutation"`
+	Destructive       int `toml:"destructive"`
+}
+
+// TimeoutForGrade returns the configured per-grade approval timeout in seconds,
+// or 0 when none is set for that grade.
+func (c PolicyConfig) TimeoutForGrade(grade core.SafetyGrade) int {
+	switch grade {
+	case core.SafetyReadOnly:
+		return c.ApprovalTimeouts.ReadOnly
+	case core.SafetyWorkspaceMutation:
+		return c.ApprovalTimeouts.WorkspaceMutation
+	case core.SafetyShellMutation:
+		return c.ApprovalTimeouts.ShellMutation
+	case core.SafetyDestructive:
+		return c.ApprovalTimeouts.Destructive
+	}
+	return 0
 }
 
 // Defaults maps safety grades to default permission behaviors.

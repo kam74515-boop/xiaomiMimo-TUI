@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -111,11 +112,12 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 	e.publishActivity(call, tool, core.ActivityRunning, "Tool started", "", "", nil)
 
 	// Evaluate permission: policy.toml overrides tool's default if configured.
+	grade := tool.Safety(call.Input)
 	permission := tool.Permission(call.Input)
 	if e.policyConfig != nil {
-		grade := tool.Safety(call.Input)
 		permission = config.EvaluatePolicy(*e.policyConfig, call.Name, call.Input, grade)
 	}
+	approvalTimeout := e.approvalTimeout(grade) // per-safety-grade, then global, then default
 
 	// If the tool asks for permission, there is an approval channel, and the tool
 	// is not already whitelisted, request user approval via the channel.
@@ -123,7 +125,7 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 		req := core.ApprovalRequest{
 			ToolCall:       call,
 			Permission:     permission,
-			TimeoutSeconds: int(e.approvalTimeout() / time.Second),
+			TimeoutSeconds: int(approvalTimeout / time.Second),
 			Response:       make(chan core.ApprovalDecision, 1),
 		}
 		select {
@@ -162,8 +164,8 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 				return result, observation
 			}
 		// Approved: fall through to normal execution.
-		case <-time.After(e.approvalTimeout()):
-			timeout := e.approvalTimeout()
+		case <-time.After(approvalTimeout):
+			timeout := approvalTimeout
 			result := core.ToolResult{
 				Content:  fmt.Sprintf("tool %s approval timed out", tool.Name()),
 				ExitCode: permissionDeniedExitCode,
@@ -190,11 +192,26 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 		}
 	}
 
-	// Capture a rollback snapshot before mutating tools. If the snapshot fails,
-	// surface it: the mutation proceeds unprotected and the user should know.
+	// Capture pre-tool state for mutating tools: the tracked-file diff and the
+	// set of untracked files. The rollback artifact is written AFTER the tool so
+	// we can record exactly the files this tool created (precise, not a broad
+	// "anything untracked now" set that could delete unrelated files/artifacts).
+	mutating := tool.Safety(call.Input) != core.SafetyReadOnly
+	var preDiff []byte
+	var preUntracked map[string]bool
+	var preErr error
+	if mutating {
+		preDiff, preUntracked, preErr = e.capturePreRollback()
+	}
+
+	result := tool.Run(ctx, call.Input)
+	e.publishResult(call, result)
+
+	// Now that the tool has run, write the rollback artifact recording the
+	// tracked-file diff and the exact files the tool created.
 	var rollbackArtifactID string
-	if tool.Safety(call.Input) != core.SafetyReadOnly {
-		if id, err := e.captureRollbackSnapshot(call.Name); err == nil {
+	if mutating {
+		if id, err := e.writeRollback(call.Name, preDiff, preUntracked, preErr); err == nil {
 			rollbackArtifactID = id
 		} else if e.bus != nil {
 			e.bus.Publish(core.AgentEvent{
@@ -205,8 +222,6 @@ func (e *Executor) Execute(ctx context.Context, call core.ToolCall) (core.ToolRe
 		}
 	}
 
-	result := tool.Run(ctx, call.Input)
-	e.publishResult(call, result)
 	e.publishActivityResult(call, tool, result, rollbackArtifactID)
 
 	observation := SummarizeTool(tool, result, e.currentBudget())
@@ -223,9 +238,14 @@ func (e *Executor) currentBudget() BudgetLevel {
 	return e.budgetProvider()
 }
 
-func (e *Executor) approvalTimeout() time.Duration {
-	if e != nil && e.policyConfig != nil && e.policyConfig.ApprovalTimeout > 0 {
-		return time.Duration(e.policyConfig.ApprovalTimeout) * time.Second
+func (e *Executor) approvalTimeout(grade core.SafetyGrade) time.Duration {
+	if e != nil && e.policyConfig != nil {
+		if s := e.policyConfig.TimeoutForGrade(grade); s > 0 {
+			return time.Duration(s) * time.Second
+		}
+		if e.policyConfig.ApprovalTimeout > 0 {
+			return time.Duration(e.policyConfig.ApprovalTimeout) * time.Second
+		}
 	}
 	return 30 * time.Second
 }
@@ -471,11 +491,12 @@ func shortActivityText(text string) string {
 	return string(runes[:limit-3]) + "..."
 }
 
-func (e *Executor) captureRollbackSnapshot(toolName string) (string, error) {
+// capturePreRollback records pre-tool state: the tracked-file diff and the set
+// of untracked files. Called before a mutating tool runs.
+func (e *Executor) capturePreRollback() (diff []byte, untracked map[string]bool, err error) {
 	if e.store == nil {
-		return "", fmt.Errorf("artifact store not available for rollback")
+		return nil, nil, fmt.Errorf("artifact store not available for rollback")
 	}
-
 	cmd := exec.Command("git", "diff")
 	if e.workspace != "" {
 		cmd.Dir = e.workspace
@@ -483,35 +504,82 @@ func (e *Executor) captureRollbackSnapshot(toolName string) (string, error) {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err := cmd.Run()
-
-	// git diff exits 1 when there are changes (expected), 0 when clean, other on error.
-	exitCode := 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
+	runErr := cmd.Run()
+	if runErr != nil {
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			if exitErr.ExitCode() > 1 { // 0 clean, 1 dirty, >1 real error
+				return nil, nil, fmt.Errorf("git diff exited %d: %s", exitErr.ExitCode(), stderr.String())
+			}
 		} else {
-			return "", err
+			return nil, nil, runErr
 		}
 	}
+	return stdout.Bytes(), e.untrackedSet(), nil
+}
 
-	// Accept exit code 0 (clean) or 1 (dirty); anything else is a failure.
-	if exitCode > 1 {
-		return "", fmt.Errorf("git diff exited %d: %s", exitCode, stderr.String())
+// writeRollback writes the rollback artifact after the tool has run, recording
+// the pre-tool diff and exactly the files this tool created (untracked files that
+// appeared since the snapshot, excluding the agent's own .mimo bookkeeping dir).
+func (e *Executor) writeRollback(toolName string, preDiff []byte, preUntracked map[string]bool, preErr error) (string, error) {
+	if preErr != nil {
+		return "", preErr
 	}
+	if e.store == nil {
+		return "", fmt.Errorf("artifact store not available for rollback")
+	}
+	var created []string
+	for f := range e.untrackedSet() {
+		if preUntracked[f] {
+			continue
+		}
+		if f == ".mimo" || strings.HasPrefix(f, ".mimo/") {
+			continue // never roll back the agent's own artifact/session dir
+		}
+		created = append(created, f)
+	}
+	sort.Strings(created)
 
+	exitCode := 0
+	if len(preDiff) > 0 {
+		exitCode = 1
+	}
 	record, err := e.store.Write(artifact.WriteRequest{
 		Tool:     toolName,
 		Kind:     "rollback",
 		ExitCode: exitCode,
 		Inputs:   map[string]any{"tool": toolName},
 		Payloads: []artifact.Payload{
-			{Name: "pre_state.diff", Data: stdout.Bytes()},
-			{Name: "stderr.txt", Data: stderr.Bytes()},
+			{Name: "pre_state.diff", Data: preDiff},
+			{Name: "created_files.txt", Data: []byte(strings.Join(created, "\n"))},
 		},
 	})
 	if err != nil {
 		return "", err
 	}
 	return record.ID, nil
+}
+
+// untrackedSet returns the workspace's current untracked files as a set.
+func (e *Executor) untrackedSet() map[string]bool {
+	set := map[string]bool{}
+	for _, f := range strings.Split(gitUntrackedFiles(e.workspace), "\n") {
+		if s := strings.TrimSpace(f); s != "" {
+			set[s] = true
+		}
+	}
+	return set
+}
+
+// gitUntrackedFiles returns the workspace's untracked files (one per line) at
+// call time, or "" on error. Used to snapshot pre-tool state for rollback.
+func gitUntrackedFiles(workspace string) string {
+	cmd := exec.Command("git", "ls-files", "--others", "--exclude-standard")
+	if workspace != "" {
+		cmd.Dir = workspace
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return string(out)
 }

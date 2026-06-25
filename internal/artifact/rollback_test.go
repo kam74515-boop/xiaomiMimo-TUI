@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -151,6 +152,64 @@ func TestRollbackListShowApply(t *testing.T) {
 		t.Fatalf("unexpected empty apply output: %q", applyEmpty)
 	}
 	t.Log("Empty diff rollback OK")
+}
+
+func TestRollbackDeletesCreatedFiles(t *testing.T) {
+	dir := t.TempDir()
+	gitInit(t, dir)
+	seed := filepath.Join(dir, "seed.txt")
+	if err := os.WriteFile(seed, []byte("seed\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitAddCommit(t, dir, seed, "init")
+
+	// Snapshot records the exact file the tool created (empty tracked diff).
+	store := NewStore(dir)
+	record, err := store.Write(WriteRequest{
+		Tool: "write_file", Kind: "rollback", ExitCode: 0,
+		Inputs: map[string]any{"tool": "write_file"},
+		Payloads: []Payload{
+			{Name: "pre_state.diff", Data: []byte{}},
+			{Name: "created_files.txt", Data: []byte("created.go")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("write rollback: %v", err)
+	}
+
+	// The created (untracked) file is present on disk.
+	created := filepath.Join(dir, "created.go")
+	if err := os.WriteFile(created, []byte("package x\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Dry-run should report the deletion without performing it.
+	dry, err := ApplyRollback(dir, record.ID, true)
+	if err != nil {
+		t.Fatalf("dry-run: %v", err)
+	}
+	if !strings.Contains(dry, "created.go") {
+		t.Fatalf("dry-run should mention the created file: %q", dry)
+	}
+	if _, err := os.Stat(created); err != nil {
+		t.Fatal("dry-run must not delete the file")
+	}
+
+	// Apply: the created file must be removed.
+	out, err := ApplyRollback(dir, record.ID, false)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !strings.Contains(out, "deleted") {
+		t.Fatalf("apply output should note deletion: %q", out)
+	}
+	if _, err := os.Stat(created); !os.IsNotExist(err) {
+		t.Fatal("rollback did not delete the tool-created file")
+	}
+	// The seed (pre-existing) must be untouched.
+	if _, err := os.Stat(seed); err != nil {
+		t.Fatal("rollback wrongly removed a pre-existing file")
+	}
 }
 
 func TestListRollbacksEmpty(t *testing.T) {
