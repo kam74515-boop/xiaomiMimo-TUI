@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -77,35 +78,94 @@ func ShowRollback(workspace, id string) (string, error) {
 	return gitApplyStat(workspace, diffData)
 }
 
-// ApplyRollback applies a rollback artifact by reverse-applying the stored git diff.
-// When dryRun is true it only prints what would change via "git apply --reverse --stat".
+// ApplyRollback applies a rollback artifact by reverse-applying the stored git
+// diff (undoing tracked-file modifications) and deleting files the tool created
+// (files that became untracked since the pre-tool snapshot). When dryRun is true
+// it only reports what would change.
 func ApplyRollback(workspace, id string, dryRun bool) (string, error) {
 	diffData, err := readRollbackDiff(workspace, id)
 	if err != nil {
 		return "", err
 	}
-	if len(diffData) == 0 {
-		return "(empty diff — nothing to rollback)", nil
-	}
+	newFiles := rollbackCreatedFiles(workspace, id)
 
 	if dryRun {
-		stat, err := gitApplyStat(workspace, diffData)
-		if err != nil {
-			return "", err
+		var parts []string
+		if len(diffData) > 0 {
+			stat, err := gitApplyStat(workspace, diffData)
+			if err != nil {
+				return "", err
+			}
+			parts = append(parts, stat)
 		}
-		return "(dry-run, not applied) " + stat, nil
+		if len(newFiles) > 0 {
+			parts = append(parts, fmt.Sprintf("delete %d created file(s): %s", len(newFiles), strings.Join(newFiles, ", ")))
+		}
+		if len(parts) == 0 {
+			return "(empty diff — nothing to rollback)", nil
+		}
+		return "(dry-run, not applied) " + strings.Join(parts, "; "), nil
 	}
 
-	// Apply the reverse diff.
-	cmd := exec.Command("git", "apply", "--reverse")
-	cmd.Dir = workspace
-	cmd.Stdin = bytes.NewReader(diffData)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("git apply --reverse failed: %s", strings.TrimSpace(stderr.String()))
+	// Reverse-apply the tracked-file diff, if any.
+	if len(diffData) > 0 {
+		cmd := exec.Command("git", "apply", "--reverse")
+		cmd.Dir = workspace
+		cmd.Stdin = bytes.NewReader(diffData)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			return "", fmt.Errorf("git apply --reverse failed: %s", strings.TrimSpace(stderr.String()))
+		}
 	}
-	return "rollback applied successfully", nil
+
+	// Delete files created since the snapshot (tool-created new files).
+	var deleted []string
+	for _, f := range newFiles {
+		if err := os.Remove(filepath.Join(workspace, f)); err == nil {
+			deleted = append(deleted, f)
+		}
+	}
+
+	if len(diffData) == 0 && len(deleted) == 0 {
+		return "(empty diff — nothing to rollback)", nil
+	}
+	msg := "rollback applied successfully"
+	if len(deleted) > 0 {
+		msg += fmt.Sprintf("; deleted %d created file(s)", len(deleted))
+	}
+	return msg, nil
+}
+
+// rollbackCreatedFiles returns the exact files the tool created, as recorded in
+// the snapshot at capture time (post-tool minus pre-tool untracked, excluding
+// the agent's own .mimo dir). Returns nil when none were recorded.
+func rollbackCreatedFiles(workspace, id string) []string {
+	data, ok := readRollbackPayload(workspace, id, "created_files")
+	if !ok {
+		return nil
+	}
+	var files []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if s := strings.TrimSpace(line); s != "" {
+			files = append(files, s)
+		}
+	}
+	return files
+}
+
+func readRollbackPayload(workspace, id, name string) ([]byte, bool) {
+	store := NewStore(workspace)
+	payloads, err := store.ReadPayloads(id)
+	if err != nil {
+		return nil, false
+	}
+	for _, p := range payloads {
+		if p.Metadata.Name == name {
+			return p.Data, true
+		}
+	}
+	return nil, false
 }
 
 // readRollbackDiff returns the pre_state.diff payload from a rollback artifact.

@@ -18,11 +18,12 @@ reasoning recorded here) rather than fixed under-verified:
   to measure their heights on each call — a minor, bounded cost (single-line,
   width-bounded strings) left as-is to avoid coupling to layout assumptions.
 
-- **Rollback does not capture untracked/staged files.** `captureRollbackSnapshot`
-  uses `git diff` (unstaged tracked changes), so a tool that creates a new file
-  cannot be rolled back by reverse-applying the snapshot. A correct fix changes
-  the rollback model (capture untracked + staged) and was deferred to avoid
-  regressing the existing rollback flow. Snapshot *failures* are now surfaced.
+- **Rollback covers tracked modifications and tool-created files; staged-only
+  changes are a minor gap.** The snapshot now also records the pre-tool untracked
+  set, and `ApplyRollback` deletes files that became untracked since (i.e. files
+  the tool created) in addition to reverse-applying the tracked-file diff.
+  Snapshot failures are surfaced. Remaining edge: changes a tool explicitly
+  `git add`s (the built-in tools do not) are captured by the unstaged diff only.
 
 ---
 
@@ -161,15 +162,22 @@ responses.
 
 ---
 
-## Approval Timeout is Global
+## Approval Timeout
 
-**Status:** Current implementation.
+**Status:** Per-safety-grade timeouts supported; per-tool not yet.
 
-The `approval_timeout` in `policy.toml` applies to all tool approvals. There is
-no per-tool or per-safety-grade timeout configuration.
+`policy.toml` supports a global `approval_timeout` plus per-safety-grade overrides
+under `[approval_timeouts]` (`read_only` / `workspace_mutation` /
+`shell_mutation` / `destructive`, in seconds). Resolution order is per-grade →
+global → built-in default (30s). Per-individual-tool timeouts are not yet
+configurable.
 
-**Impact:** Destructive operations and read-only operations share the same
-timeout window.
+```toml
+approval_timeout = 30
+[approval_timeouts]
+destructive = 10
+shell_mutation = 20
+```
 
 ---
 
