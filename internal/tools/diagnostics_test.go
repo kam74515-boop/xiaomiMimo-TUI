@@ -229,7 +229,7 @@ func TestFormatDiagnosticsSummary(t *testing.T) {
 
 func TestDiagnosticsToolRunUnsupportedLanguage(t *testing.T) {
 	tool := NewDiagTool(t.TempDir(), nil, nil)
-	result := tool.Run(context.Background(), core.ToolInput{"language": "rust"})
+	result := tool.Run(context.Background(), core.ToolInput{"language": "cobol"})
 
 	if result.ExitCode != 2 {
 		t.Fatalf("exit code = %d, want 2", result.ExitCode)
@@ -239,36 +239,33 @@ func TestDiagnosticsToolRunUnsupportedLanguage(t *testing.T) {
 	}
 }
 
-func TestDiagnosticsToolRunNodePlaceholder(t *testing.T) {
-	workspace := t.TempDir()
+func TestDiagnosticsToolNodeGracefulWhenNoProject(t *testing.T) {
+	workspace := t.TempDir() // no package.json/tsconfig => not a node project
 	store := newTestStore(t, workspace)
 	tool := NewDiagTool(workspace, store, nil)
 
 	result := tool.Run(context.Background(), core.ToolInput{"language": "node"})
 
 	if result.ExitCode != 0 {
-		t.Fatalf("exit code = %d, want 0 for placeholder", result.ExitCode)
+		t.Fatalf("exit code = %d, want 0 (graceful, no project)", result.ExitCode)
 	}
-	if !strings.Contains(result.Content, "0 errors, 0 warnings") {
-		t.Fatalf("content = %q, want placeholder summary", result.Content)
-	}
-	if !strings.Contains(result.Content, "node") {
-		t.Fatalf("content = %q, should mention node", result.Content)
+	if !strings.Contains(result.Content, "0 errors, 0 warnings") || !strings.Contains(result.Content, "node") {
+		t.Fatalf("content = %q, want graceful node summary", result.Content)
 	}
 	if result.ArtifactID == "" {
-		t.Fatal("expected an artifact ID for placeholder result")
+		t.Fatal("expected an artifact ID for graceful result")
 	}
 }
 
-func TestDiagnosticsToolRunPythonPlaceholder(t *testing.T) {
-	workspace := t.TempDir()
+func TestDiagnosticsToolPythonGracefulWhenNoProject(t *testing.T) {
+	workspace := t.TempDir() // no pyproject/setup.py/requirements => not a python project
 	store := newTestStore(t, workspace)
 	tool := NewDiagTool(workspace, store, nil)
 
 	result := tool.Run(context.Background(), core.ToolInput{"language": "python"})
 
 	if result.ExitCode != 0 {
-		t.Fatalf("exit code = %d, want 0 for placeholder", result.ExitCode)
+		t.Fatalf("exit code = %d, want 0 (graceful, no project)", result.ExitCode)
 	}
 	if !strings.Contains(result.Content, "python") {
 		t.Fatalf("content = %q, should mention python", result.Content)

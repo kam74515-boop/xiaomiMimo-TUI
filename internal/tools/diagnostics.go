@@ -46,10 +46,11 @@ func NewDiagTool(workspace string, store *artifact.Store, s Summarizer) core.Too
 func (t diagnosticsTool) Schema() core.JSONSchema {
 	return objectSchema(
 		"Run language diagnostics (compile errors, type errors, lint warnings) on the project. "+
-			"Defaults to Go (go vet + go build). Returns structured issues and a compressed summary.",
+			"Auto-detects the language from project markers when not given; supports go (go vet+build), "+
+			"node (tsc), python (ruff/pyflakes), rust (cargo check). Returns structured issues and a summary.",
 		map[string]any{
 			"project_path": stringSchema("Optional project root path. Defaults to the workspace."),
-			"language":     stringSchema("Language to check: 'go' (default), 'node', 'python'. Node/Python are placeholders."),
+			"language":     stringSchema("Language to check: go, node, python, rust. Auto-detected when omitted."),
 		},
 	)
 }
@@ -66,26 +67,33 @@ func (t diagnosticsTool) Permission(input core.ToolInput) core.PermissionRequest
 }
 
 func (t diagnosticsTool) Run(ctx context.Context, input core.ToolInput) core.ToolResult {
-	lang := strings.TrimSpace(stringInput(input, "language"))
-	if lang == "" {
-		lang = "go"
-	}
-
 	projectPath := strings.TrimSpace(stringInput(input, "project_path"))
 	if projectPath == "" {
 		projectPath = t.workspace
 	}
 
+	lang := strings.TrimSpace(stringInput(input, "language"))
+	if lang == "" {
+		if detected := detectLanguage(projectPath); detected != "" {
+			lang = detected
+		} else {
+			lang = "go"
+		}
+	}
+
 	switch lang {
 	case "go":
 		return t.runGoDiagnostics(ctx, projectPath, input)
-	case "node", "python":
-		// Placeholder: return a helpful message until implemented.
-		return t.placeholderResult(lang, input)
+	case "node":
+		return t.runLangDiagnostics(ctx, projectPath, "node", parseTSCDiagnostics, input)
+	case "python":
+		return t.runLangDiagnostics(ctx, projectPath, "python", parsePythonDiagnostics, input)
+	case "rust":
+		return t.runLangDiagnostics(ctx, projectPath, "rust", parseCargoDiagnostics, input)
 	default:
 		return core.ToolResult{
 			ExitCode: 2,
-			Error:    fmt.Sprintf("unsupported language %q; supported: go, node (placeholder), python (placeholder)", lang),
+			Error:    fmt.Sprintf("unsupported language %q; supported: go, node, python, rust", lang),
 		}
 	}
 }
@@ -145,27 +153,6 @@ func (t diagnosticsTool) runGoDiagnostics(ctx context.Context, projectPath strin
 		ExitCode:   exitCode,
 		ArtifactID: artifactID,
 		Error:      errMsg,
-	}
-}
-
-func (t diagnosticsTool) placeholderResult(lang string, input core.ToolInput) core.ToolResult {
-	msg := fmt.Sprintf("Diagnostics for %s is not yet implemented. Only Go is supported in this MVP.", lang)
-	artifactID, artifactErr := t.writeArtifact(artifact.WriteRequest{
-		Tool:     t.Name(),
-		Kind:     "diagnostics",
-		ExitCode: 0,
-		Inputs:   redactInput(input),
-		Payloads: []artifact.Payload{
-			{Name: "diagnostics.txt", Data: []byte(msg)},
-		},
-	})
-	if artifactErr != nil {
-		return core.ToolResult{ExitCode: 1, Error: artifactErr.Error()}
-	}
-	return core.ToolResult{
-		Content:    fmt.Sprintf("Diagnostics: 0 errors, 0 warnings (language: %s, placeholder)", lang),
-		ExitCode:   0,
-		ArtifactID: artifactID,
 	}
 }
 
