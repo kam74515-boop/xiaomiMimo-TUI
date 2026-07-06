@@ -83,17 +83,21 @@ stable, then expand to other languages.
 
 ---
 
-## No Node.js / Python / Rust Diagnostics
+## Node.js / Python / Rust Diagnostics
 
-**Status:** Not implemented.
+**Status:** Implemented (toolchain-gated), no LSP.
 
-Beyond the absence of LSP support, there are no language-specific diagnostic
-tools for Node.js (TypeScript compiler, ESLint), Python (mypy, pylint), or
-Rust (cargo check). The `run_test` tool can execute test commands, but inline
-diagnostics are not available.
+The `diagnostics` tool now runs language-specific checks and parses them into
+structured issues: Go (`go vet`+`go build`), Node/TypeScript (`tsc --noEmit`),
+Python (`ruff` or `pyflakes`), and Rust (`cargo check`). The language is
+auto-detected from project markers (go.mod / tsconfig.json|package.json /
+pyproject.toml|setup.py|requirements.txt / Cargo.toml) when not specified. When
+the project marker or the toolchain is absent, it degrades gracefully (0 issues,
+exit 0) instead of failing — so it is safe to call anywhere.
 
-**Impact:** Agent must rely on test output and manual inspection for error
-detection in non-Go projects.
+**Impact:** These are batch (run-and-parse) diagnostics, not a persistent LSP, so
+they lack incremental/editor-grade intelligence and code actions. Per-language
+behavior depends on the chosen tool's output format.
 
 ---
 
